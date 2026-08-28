@@ -1,0 +1,63 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Ambientes virtuais
+.venv/
+venv/
+env/
+ENV/
+
+# Build e distribuição
+build/
+dist/
+*.spec
+*.egg-info/
+*.zip
+*.7z
+
+# Configurações locais do aplicativo
+Dublaskizon_interface.json
+voz_config.json
+revisao_config.json
+revisao_estado.json
+*.env
+.env*
+*.key
+*.pem
+*.p12
+*.pfx
+ferramentas_audio/
+
+# Dados de projetos e saídas de usuário
+WAV ORIGINAIS/
+TXT TEXTO PORTUGUES/
+TXT TEXTO ORIGINAL/
+TXT TEXTO do WAV TRANSCRITO e TRADUZIDO/
+OUTRAS TRADUÇÕES/
+dublado/
+revisoes/
+REDIMENSIONAR ÁUDIO PARA CLONAR/
+AUDIO FORMATOS CONVERTIDOS/
+AUDIO CONVERTIDO/
+AUDIO CONVERTIDO ..MAIOR.. DURAÇÃO/
+AUDIO CONVERTIDO ..MENOR.. DURAÇÃO/
+AUDIO CONVERTIDO ..IGUAL.. DURAÇÃO/
+ConversionMap.txt
+
+# Arquivos temporários e logs locais
+*.tmp
+*.temp
+*.bak
+*.backup
+*.log
+*.lof
+.DS_Store
+Thumbs.db
