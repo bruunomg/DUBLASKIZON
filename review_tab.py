@@ -21,6 +21,8 @@ um plugin ou configurar API dentro dele.
 from __future__ import annotations
 
 import json
+import queue
+from generation_progress import run_observed
 import os
 import shutil
 import subprocess
@@ -70,6 +72,7 @@ ROOT = Path(_PROJECT_ROOT).resolve() if _PROJECT_ROOT else Path(__file__).resolv
 AUDIO_DIR = ROOT / "WAV ORIGINAIS"
 TEXT_DIR = ROOT / "TXT TEXTO PORTUGUES"
 OUTPUT_DIR = ROOT / "dublado"
+CUSTOM_OUTPUT_DIR = ROOT / "dublados personalizados"
 REVISIONS_DIR = ROOT / "revisoes"
 ORIGINAL_TEXT_DIR = ROOT / "TXT TEXTO ORIGINAL"
 TRANSCRIBED_TRANSLATED_TEXT_DIR = ROOT / "TXT TEXTO do WAV TRANSCRITO e TRADUZIDO"
@@ -82,12 +85,13 @@ REFERENCE_AUDIO_EXTENSIONS = {".wav", ".wave", ".waw", ".mp3", ".ogg", ".flac", 
 
 
 def configure_project_root(project_root: Path) -> None:
-    global ROOT, AUDIO_DIR, TEXT_DIR, OUTPUT_DIR, REVISIONS_DIR, ORIGINAL_TEXT_DIR, TRANSCRIBED_TRANSLATED_TEXT_DIR, OTHER_TRANSLATIONS_DIR, STATE_FILE, CONFIG_FILE
+    global ROOT, AUDIO_DIR, TEXT_DIR, OUTPUT_DIR, CUSTOM_OUTPUT_DIR, REVISIONS_DIR, ORIGINAL_TEXT_DIR, TRANSCRIBED_TRANSLATED_TEXT_DIR, OTHER_TRANSLATIONS_DIR, STATE_FILE, CONFIG_FILE
     ROOT = Path(project_root).expanduser().resolve()
     os.environ["DUBLASKIZON_PROJECT_ROOT"] = str(ROOT)
     AUDIO_DIR = ROOT / "WAV ORIGINAIS"
     TEXT_DIR = ROOT / "TXT TEXTO PORTUGUES"
     OUTPUT_DIR = ROOT / "dublado"
+    CUSTOM_OUTPUT_DIR = ROOT / "dublados personalizados"
     REVISIONS_DIR = ROOT / "revisoes"
     ORIGINAL_TEXT_DIR = ROOT / "TXT TEXTO ORIGINAL"
     TRANSCRIBED_TRANSLATED_TEXT_DIR = ROOT / "TXT TEXTO do WAV TRANSCRITO e TRADUZIDO"
@@ -205,40 +209,24 @@ def open_audio_pair(original: Path, dubbed: Path, stem: str, config: dict) -> st
 
 
 def scene_audio_files() -> dict[str, Path]:
-    files: dict[str, Path] = {}
-    if not AUDIO_DIR.is_dir():
-        return files
-    for path in sorted(AUDIO_DIR.rglob("*"), key=lambda item: str(item).casefold()):
-        if (
-            is_internal_omnivoice_backup(path)
-            or is_format_archive_dir(path.parent)
-            or not path.is_file()
-            or path.suffix.lower() not in AUDIO_EXTENSIONS
-        ):
-            continue
-        key = relative_scene_key(path, AUDIO_DIR)
-        current = files.get(key)
-        if current is None or path.suffix.lower() == ".wav":
-            files[key] = path
-    return files
+    try:from .batch_tab import find_audio_by_stem
+    except ImportError:from batch_tab import find_audio_by_stem
+    return find_audio_by_stem(AUDIO_DIR)
 
 
 def scene_text_files() -> dict[str, Path]:
-    if not TEXT_DIR.is_dir():
-        return {}
-    return {
-        relative_scene_key(path, TEXT_DIR): path
-        for path in sorted(TEXT_DIR.rglob("*"), key=lambda item: str(item).casefold())
-        if path.is_file() and path.suffix.lower() == ".txt"
-    }
+    try:from .batch_tab import find_text_by_stem
+    except ImportError:from batch_tab import find_text_by_stem
+    return find_text_by_stem(TEXT_DIR)
 
 
-def original_text_files() -> dict[str, Path]:
-    if not ORIGINAL_TEXT_DIR.is_dir():
+def original_text_files(directory=None) -> dict[str, Path]:
+    directory = directory or ORIGINAL_TEXT_DIR
+    if not directory.is_dir():
         return {}
     return {
-        relative_scene_key(path, ORIGINAL_TEXT_DIR): path
-        for path in sorted(ORIGINAL_TEXT_DIR.rglob("*"), key=lambda item: str(item).casefold())
+        relative_scene_key(path, directory): path
+        for path in sorted(directory.rglob("*"), key=lambda item: str(item).casefold())
         if path.is_file() and path.suffix.lower() == ".txt"
     }
 
@@ -274,6 +262,13 @@ def other_translation_folders(directory: Path | None = None) -> list[Path]:
         for path in sorted(directory.iterdir(), key=lambda item: item.name.casefold())
         if path.is_dir()
     ]
+
+
+def scene_text_folders(directory, stem):
+    """Only version roots with this scene's complete relative path."""
+    if not stem: return []
+    return [folder for folder in other_translation_folders(directory)
+            if (folder / (stem + '.txt')).is_file()]
 
 
 def _revision_scene_dir(stem: str) -> Path:
@@ -320,6 +315,8 @@ class ReviewApp:
         neutral_fgs = {"#1F2937", "#334155", "#475569", "#555", "#64748B", "#6B7280"}
         def visit(widget):
             try:
+                if hasattr(widget, 'apply_folder_theme'):
+                    widget.apply_folder_theme(theme)
                 cls = widget.winfo_class()
                 if cls == "TFrame":
                     widget.configure(style="TFrame")
@@ -383,7 +380,7 @@ class ReviewApp:
             self.audio_player.apply_theme(theme)
         self._apply_other_audio_window_theme(theme)
 
-    def __init__(self, root: Tk, embedded=False, batch_callback=None, project_actions=None):
+    def __init__(self, root: Tk, embedded=False, batch_callback=None, project_actions=None, prompt_missing_text=True, scene_index=None):
         self.root = root
         self.embedded = embedded
         self.batch_callback = batch_callback
@@ -402,20 +399,16 @@ class ReviewApp:
         self.config = merged
 
         self.state = load_json(STATE_FILE, {})
-        self.audio_by_stem = scene_audio_files()
-        self.text_by_stem = scene_text_files()
+        self.audio_by_stem = dict(scene_index[0]) if scene_index is not None else scene_audio_files()
+        self.text_by_stem = dict(scene_index[1]) if scene_index is not None else scene_text_files()
         missing_text = sorted(set(self.audio_by_stem) - set(self.text_by_stem), key=str.casefold)
-        if missing_text and messagebox.askyesno(
-            "Áudios sem TXT",
-            f"Foram encontrados {len(missing_text)} áudio(s) sem TXT acompanhante.\n\nDeseja gerar os TXT em branco agora?",
+        if missing_text and prompt_missing_text:
+            messagebox.showinfo(
+            "Dublagem sem texto em português",
+            "Você pode dublar sem TXT de texto português: o Dublaskizon também transcreve o áudio, traduz e depois dubla.\n\nAtive e configure a transcrição/tradução em Clonagem + Dublagem, ou solicite esse recurso ao redublar em Ouvir cena.",
             parent=self.root,
-        ):
-            TEXT_DIR.mkdir(parents=True, exist_ok=True)
-            for stem in missing_text:
-                target = TEXT_DIR / f"{stem}.txt"
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.touch(exist_ok=True)
-            self.text_by_stem = scene_text_files()
+            )
+        self.original_text_dir = ORIGINAL_TEXT_DIR
         self.original_text_by_stem = original_text_files()
         self.transcribed_translated_text_by_stem = transcribed_translated_text_files()
         configured_other_dir = str(self.config.get("other_translation_dir", "")).strip()
@@ -446,6 +439,10 @@ class ReviewApp:
         self.current_index = 0
         self.busy = False
         self.request_r_var = StringVar(value="1" if bool(self.config.get("ask_r_pronunciation", True)) else "0")
+        self.request_character_var = StringVar(value="0")
+        self.request_translation_var = StringVar(value="0")
+        self.align_original_var = StringVar(value='0')
+        self.translate_missing_var = StringVar(value='0')
         self.regen_r_override: str | None = None
         self.regen_stem: str | None = None
         self.regen_progress_callback = None
@@ -457,10 +454,16 @@ class ReviewApp:
         self.transcribed_unlocked = False
         self.audio_player = AudioPlayerManager(self.root, ROOT, status_callback=lambda text: (self.status_var.set(text), self._log_central(text, "info")))
         self.audio_player.set_scene_text_integration(self.load_scene_text_for_player, self.save_scene_text_from_player)
+        self.audio_player.part_context_provider = self.part_generation_context
+        self.audio_player.translation_controller = self
 
         self.status_var = StringVar(value="Pronto")
         self.audio_player.set_review_preferences({
+            "align_original_var": self.align_original_var,
+            "translate_missing_var": self.translate_missing_var,
             "auto_open_var": self.auto_open_var if hasattr(self, "auto_open_var") else None,
+            "request_character_var": self.request_character_var,
+            "request_translation_var": self.request_translation_var,
             "request_r_var": self.request_r_var,
             "request_r_command": self.toggle_r_request,
         })
@@ -474,6 +477,8 @@ class ReviewApp:
         self.scene_var = StringVar(value="Nenhuma cena selecionada")
         self.path_var = StringVar(value="")
         self.meta_var = StringVar(value="")
+        self.audio_source_var = StringVar(value="Dublados")
+        self.audio_source_mode = "normal"
         self.scene_count_var = StringVar(value=f"DUBLADOS ({len(self.stems)} áudios)")
         self.regen_elapsed_var = StringVar(value="Refazer decorrido: 00:00:00")
         self.regen_eta_var = StringVar(value="Restante: 00:00:00")
@@ -488,7 +493,11 @@ class ReviewApp:
         self.audio_player.set_review_snapshot_provider(self.player_review_snapshot)
         self.audio_player.set_review_preferences({
             "auto_open_var": self.auto_open_var,
+            "align_original_var": self.align_original_var,
+            "translate_missing_var": self.translate_missing_var,
             "auto_open_command": self.toggle_auto_open,
+            "request_character_var": self.request_character_var,
+            "request_translation_var": self.request_translation_var,
             "request_r_var": self.request_r_var,
             "request_r_command": self.toggle_r_request,
         })
@@ -525,14 +534,24 @@ class ReviewApp:
         self.main_pane = ttk.PanedWindow(main, orient="horizontal")
         self.main_pane.pack(fill="both", expand=True)
 
-        left = ttk.Frame(self.main_pane, padding=8, width=220)
+        self.initial_scene_divider_set = False
+        self._scene_divider_job = None
+        self.main_pane.bind("<Map>", self.schedule_initial_scene_divider, add="+")
+        self.main_pane.bind("<Configure>", self.schedule_initial_scene_divider, add="+")
+        self.main_pane.bind("<ButtonPress-1>", self.keep_scene_divider, add="+")
+        left = ttk.Frame(self.main_pane, padding=8, width=360)
         self.main_pane.add(left, weight=1)
         right = ttk.Frame(self.main_pane, padding=8)
         self.main_pane.add(right, weight=4)
 
         scene_list_header = ttk.Frame(left)
         scene_list_header.pack(fill="x")
-        ttk.Label(scene_list_header, textvariable=self.scene_count_var, font=("Segoe UI", 10, "bold")).pack(side="left", anchor="w")
+        self.audio_source_combo = ttk.Combobox(
+            scene_list_header, textvariable=self.audio_source_var,
+            values=("Dublados", "Dublados personalizados"), state="readonly", width=24,
+        )
+        self.audio_source_combo.pack(fill="x", pady=(0, 5))
+        self.audio_source_combo.bind("<<ComboboxSelected>>", self._on_audio_source_selected)
         self.scene_sort_var = StringVar(value="Padrão")
         self.scene_sort_combo = ttk.Combobox(
             scene_list_header,
@@ -541,8 +560,9 @@ class ReviewApp:
             state="readonly",
             width=25,
         )
-        self.scene_sort_combo.pack(side="right", padx=(5, 0))
+        self.scene_sort_combo.pack(fill="x", pady=(0, 6))
         self.scene_sort_combo.bind("<<ComboboxSelected>>", self._on_scene_sort_selected)
+        ttk.Label(scene_list_header, textvariable=self.scene_count_var, font=("Segoe UI", 10, "bold"), wraplength=210).pack(fill="x", anchor="w")
         ttk.Label(left, text="Organizar DUBLADOS", font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(2, 0))
         list_frame = ttk.Frame(left)
         list_frame.pack(fill="both", expand=True, pady=(6, 0))
@@ -600,15 +620,19 @@ class ReviewApp:
         other_header = ttk.Frame(other_panel)
         other_header.pack(fill="x")
         ttk.Label(other_header, text="OUTRAS TRADUÇÕES").pack(side="left", anchor="w")
-        self.other_translation_folders_bar = ttk.Frame(other_header)
-        self.other_translation_folders_bar.pack(side="left", fill="x", expand=True, padx=(10, 0))
-        self.refresh_other_translation_folder_buttons()
         other_meta = ttk.Frame(other_header)
         other_meta.pack(side="right", padx=(6, 0))
-        self.other_translation_check = ttk.Checkbutton(other_meta, text="Usar na REFAZER CENA", variable=self.use_other_translation_var, onvalue="1", offvalue="0", command=self.on_other_translation_toggle)
+        self.other_translation_check = ttk.Checkbutton(other_meta, text="Usar no redublar", variable=self.use_other_translation_var, onvalue="1", offvalue="0", command=self.on_other_translation_toggle)
         self.other_translation_check.pack(side="right")
         self.other_translation_status_label = ttk.Label(other_meta, textvariable=self.other_translation_status_var, foreground="#64748B", anchor="e")
         self.other_translation_status_label.pack(side="right", padx=(0, 8))
+        try:
+            from .ui_theme import horizontal_folder_strip
+        except ImportError:
+            from ui_theme import horizontal_folder_strip
+        folder_strip, self.other_translation_folders_bar = horizontal_folder_strip(other_panel, getattr(self, 'theme', {}))
+        folder_strip.pack(fill='x', pady=(3, 0))
+        self.refresh_other_translation_folder_buttons()
         self.other_translation_box = Text(other_panel, height=8, wrap="word", state="disabled", font=("Segoe UI", 11), background="#F0FDFA")
         other_text_scrollbar = ttk.Scrollbar(other_panel, orient="vertical", command=self.other_translation_box.yview)
         self.other_translation_box.configure(yscrollcommand=other_text_scrollbar.set)
@@ -624,6 +648,9 @@ class ReviewApp:
         self.original_save_button.pack(side="right", padx=(4, 0))
         self.original_lock_button = Button(original_header, text="DESTRAVAR", command=lambda: self.toggle_reference_edit("original"), bg="#64748B", activebackground="#475569", fg="white", activeforeground="white", relief="flat", font=("Segoe UI", 8, "bold"), padx=7, pady=3, cursor="hand2")
         self.original_lock_button.pack(side="right", padx=(4, 0))
+        original_strip, self.original_folders_bar = horizontal_folder_strip(original_panel, getattr(self, 'theme', {}))
+        original_strip.pack(fill="x", pady=(3, 0))
+        self.refresh_original_folder_buttons()
         original_text_frame = ttk.Frame(original_panel)
         original_text_frame.pack(fill="both", expand=True, pady=(5, 0))
         self.original_text_box = Text(original_text_frame, height=8, wrap="word", state="disabled", font=("Segoe UI", 10), background="#F2F2F2")
@@ -700,15 +727,22 @@ class ReviewApp:
         regen_style.configure("RegenDub.Horizontal.TProgressbar", troughcolor="#E2E8F0", background="#9B7BC5", lightcolor="#9B7BC5", darkcolor="#9B7BC5")
         regen_bars = ttk.Frame(history_right)
         regen_bars.pack(fill="x", pady=(4, 2))
+        stop_controls = ttk.Frame(regen_bars)
+        stop_controls.pack(side='right', padx=(8, 0))
+        for label, after_scene, role in [('PARAR APÓS CENA', True, 'warning'), ('CANCELAR', False, 'danger')]:
+            button = Button(stop_controls, text=label, command=lambda after=after_scene: self.control_generation(after),
+                            relief='flat', font=('Segoe UI', 8, 'bold'), padx=6, pady=3)
+            apply_button_style(button, getattr(self, 'theme', {}), role)
+            button.pack(fill='x', pady=1)
         clone_column = ttk.Frame(regen_bars)
         clone_column.pack(side="left", fill="x", expand=True, padx=(0, 5))
         ttk.Label(clone_column, text="CLONANDO REFERÊNCIA", font=("Segoe UI", 8, "bold")).pack(anchor="w")
-        self.regen_clone_bar = ttk.Progressbar(clone_column, orient="horizontal", mode="determinate", style="RegenClone.Horizontal.TProgressbar", maximum=100, variable=self.regen_clone_progress)
+        self.regen_clone_bar = ttk.Progressbar(clone_column, length=110, orient="horizontal", mode="determinate", style="RegenClone.Horizontal.TProgressbar", maximum=100, variable=self.regen_clone_progress)
         self.regen_clone_bar.pack(fill="x", pady=(2, 0))
         dub_column = ttk.Frame(regen_bars)
         dub_column.pack(side="left", fill="x", expand=True, padx=(5, 0))
         ttk.Label(dub_column, text="DUBLANDO CENA", font=("Segoe UI", 8, "bold")).pack(anchor="w")
-        self.regen_dub_bar = ttk.Progressbar(dub_column, orient="horizontal", mode="determinate", style="RegenDub.Horizontal.TProgressbar", maximum=100, variable=self.regen_dub_progress)
+        self.regen_dub_bar = ttk.Progressbar(dub_column, length=110, orient="horizontal", mode="determinate", style="RegenDub.Horizontal.TProgressbar", maximum=100, variable=self.regen_dub_progress)
         self.regen_dub_bar.pack(fill="x", pady=(2, 0))
         ttk.Label(history_right, textvariable=self.regen_phase_var, foreground="#475569", font=("Segoe UI", 8)).pack(anchor="w", pady=(2, 2))
         self.regen_log_box = Text(history_right, height=4, wrap="word", state="disabled", font=("Consolas", 8), background="#F8FAFC")
@@ -721,6 +755,7 @@ class ReviewApp:
         folder_bar.pack(fill="x")
         self.make_folder_button(folder_bar, "WAV ORIGINAL", AUDIO_DIR, "#2F75B5").pack(side="left", padx=(0, 3))
         self.make_folder_button(folder_bar, "WAV DUBLADO", OUTPUT_DIR, "#9B7BC5").pack(side="left", padx=3)
+        self.make_folder_button(folder_bar, "DUBLADOS PERSONALIZADOS", CUSTOM_OUTPUT_DIR, "#8B5CF6").pack(side="left", padx=3)
         self.make_folder_button(folder_bar, "REVISÕES", REVISIONS_DIR, "#3A7D44").pack(side="left", padx=3)
         self.make_folder_button(folder_bar, "TXT PT", TEXT_DIR, "#D97706").pack(side="left", padx=3)
         self.make_folder_button(folder_bar, "TXT ORIGINAL", ORIGINAL_TEXT_DIR, "#475569").pack(side="left", padx=3)
@@ -736,6 +771,30 @@ class ReviewApp:
         footer = ttk.Frame(self.root, padding=(12, 0, 12, 8))
         footer.pack(fill="x")
         ttk.Label(footer, textvariable=self.status_var).pack(side="left")
+
+    def keep_scene_divider(self, _event=None):
+        # An explicit drag always wins over the pending startup layout.
+        self.initial_scene_divider_set = True
+
+    def schedule_initial_scene_divider(self, _event=None):
+        if self.initial_scene_divider_set or self._scene_divider_job is not None:
+            return
+        self._scene_divider_job = self.root.after(150, self.set_initial_scene_divider)
+
+    def set_initial_scene_divider(self):
+        self._scene_divider_job = None
+        if self.initial_scene_divider_set:
+            return
+        try:
+            if not self.main_pane.winfo_ismapped():
+                return
+            width = self.main_pane.winfo_width()
+            if width < 640:
+                return
+            self.main_pane.sashpos(0, min(440, max(320, int(width * .30))))
+            self.initial_scene_divider_set = True
+        except Exception:
+            return
 
     def schedule_initial_text_divider(self, _event=None) -> None:
         """Centraliza depois que a aba e a escala terminarem de calcular a largura."""
@@ -788,22 +847,16 @@ class ReviewApp:
         if not self.busy or self.regen_started_at is None:
             return
         elapsed = max(0.0, time.monotonic() - self.regen_started_at)
-        if elapsed < 2.0:
-            clone = min(95.0, elapsed / 2.0 * 95.0)
-            dub = 0.0
-            self.regen_phase_var.set("CLONANDO REFERÊNCIA...")
-        else:
-            clone = 100.0
-            dub = min(95.0, 5.0 + (elapsed - 2.0) * 8.0)
-            self.regen_phase_var.set("DUBLANDO CENA...")
-        self.regen_clone_progress.set(clone)
-        self.regen_dub_progress.set(dub)
-        total_progress = (clone + dub) / 2.0
-        if total_progress > 1.0:
-            remaining = max(0.0, elapsed * (100.0 - total_progress) / total_progress)
-            self.regen_eta_var.set(f"Restante: {format_duration(remaining)}")
-        else:
-            self.regen_eta_var.set("Restante: calculando...")
+        events=getattr(self,'regen_stage_events',None)
+        if events is not None:
+            while True:
+                try:clone,dub,phase=events.get_nowait()
+                except queue.Empty:break
+                self.regen_clone_progress.set(max(self.regen_clone_progress.get(),clone))
+                self.regen_dub_progress.set(max(self.regen_dub_progress.get(),dub))
+                self.regen_phase_var.set(phase)
+        clone=self.regen_clone_progress.get();dub=self.regen_dub_progress.get()
+        self.regen_eta_var.set("Progresso por etapas; percentual quando informado pelo gerador")
         self.regen_elapsed_var.set(f"Refazer decorrido: {format_duration(elapsed)}")
         self._notify_regen_progress(clone, dub, self.regen_phase_var.get())
         self.regen_tick_id = self.root.after(250, self.update_regen_clock)
@@ -871,7 +924,7 @@ class ReviewApp:
         text = self.original_text_box.get("1.0", "end-1c").strip()
         try:
             ORIGINAL_TEXT_DIR.mkdir(parents=True, exist_ok=True)
-            path = ORIGINAL_TEXT_DIR / f"{stem}.txt"
+            path = getattr(self, 'original_text_dir', ORIGINAL_TEXT_DIR) / f"{stem}.txt"
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text + "\n", encoding="utf-8")
             self.original_text_by_stem[stem] = path
@@ -882,6 +935,40 @@ class ReviewApp:
         except OSError as exc:
             messagebox.showerror("Texto original", f"Não foi possível salvar o texto original:\n{exc}", parent=self.root)
             return False
+
+    def refresh_original_folder_buttons(self):
+        bar = self.original_folders_bar
+        for child in bar.winfo_children():
+            child.destroy()
+        folders = [ORIGINAL_TEXT_DIR] + scene_text_folders(ORIGINAL_TEXT_DIR, self.current_stem())
+        # Keep every folder in the horizontally scrollable row.
+        for index, folder in enumerate(folders):
+            button = Button(bar, text='PRINCIPAL' if folder == ORIGINAL_TEXT_DIR else folder.name,
+                            command=lambda path=folder: self.select_original_text_folder(path),
+                            relief='flat', font=('Segoe UI', 8, 'bold'), padx=7, pady=3)
+            apply_button_style(button, getattr(self, 'theme', {}),
+                               'accent' if folder == self.original_text_dir else 'secondary')
+            button.grid(row=0, column=index, sticky='w', padx=(0, 4), pady=2)
+
+    def select_original_text_folder(self, folder):
+        selected = Path(folder).resolve()
+        if not selected.is_relative_to(ORIGINAL_TEXT_DIR.resolve()):
+            return
+        if getattr(self, 'original_unlocked', False):
+            if not self.save_original_text():
+                return
+        self.original_text_dir = selected
+        self.original_text_by_stem = original_text_files(selected)
+        self.refresh_original_folder_buttons()
+        path = self.original_text_by_stem.get(self.current_stem())
+        try:
+            text = path.read_text(encoding='utf-8-sig').strip() if path else '[Texto original não encontrado nesta pasta]'
+        except (OSError, UnicodeError):
+            text = '[Não foi possível ler o texto original]'
+        self.original_text_box.configure(state='normal')
+        self.original_text_box.delete('1.0', END)
+        self.original_text_box.insert('1.0', text)
+        self.set_reference_edit_state('original', False)
 
     def save_transcribed_text(self) -> bool:
         if not self.transcribed_unlocked:
@@ -922,12 +1009,9 @@ class ReviewApp:
             return
 
         root_dir = self.other_translation_root_dir
-        folders = other_translation_folders(root_dir)
+        folders = scene_text_folders(root_dir, self.current_stem())
         # Também oferece a pasta principal como botão quando ela contém TXT diretamente.
-        if root_dir.is_dir() and any(
-            path.is_file() and path.suffix.lower() == ".txt"
-            for path in root_dir.iterdir()
-        ):
+        if self.current_stem() and (root_dir / (self.current_stem()+'.txt')).is_file():
             folders.insert(0, root_dir)
 
         if not folders:
@@ -1028,9 +1112,9 @@ class ReviewApp:
             messagebox.showwarning("Outras traduções", "Nenhum TXT correspondente à cena atual foi encontrado.", parent=self.root)
             return
         if self.use_other_translation_var.get() == "1":
-            self.status_var.set(f"REFAZER CENA usará: {self.selected_other_translation_file.name}")
+            self.status_var.set(f"REDUBLAR usará: {self.selected_other_translation_file.name}")
         else:
-            self.status_var.set("REFAZER CENA usará o Texto em português")
+            self.status_var.set("REDUBLAR usará o Texto em português")
 
     def open_batch(self):
         if self.batch_callback is not None:
@@ -1147,9 +1231,13 @@ class ReviewApp:
 
     def run_audio_review_action(self, stem: str | None, action: str) -> None:
         """Executa uma ação da Revisão na cena mostrada em OUVIR CENA."""
+        if stem not in self.stems and stem in self.audio_by_stem:
+            self.stems.append(stem)
+            if stem not in self.default_stems:self.default_stems.append(stem)
+            self.refresh_scene_list(stem)
         if stem in self.stems:
             self.select_scene(self.stems.index(stem))
-        elif not self.current_stem():
+        else:
             return
         audio_window = getattr(self.audio_player, "window", None)
         callbacks = {
@@ -1183,7 +1271,7 @@ class ReviewApp:
             return
         # Só a cena escolhida é validada agora. Os vizinhos usam o caminho de
         # dublado esperado e são resolvidos quando ANTERIOR/PRÓXIMO for acionado.
-        playlist = [OUTPUT_DIR / f"{scene_stem}.wav" for scene_stem in self.stems]
+        playlist = [self.current_output_dir() / f"{scene_stem}.wav" for scene_stem in self.stems]
         playlist[index] = path
         self.audio_player.play_one(path, f"OUVIR CENA — {stem}", playlist=playlist, index=index, scene_key=stem, scene_keys=self.stems)
 
@@ -1208,7 +1296,7 @@ class ReviewApp:
             rank = {"aprovada": 0, "rejeitada": 1, "pendente": 2}
         else:
             return sorted(base, key=str.casefold)
-        return sorted(base, key=lambda stem: (rank.get(self.state.get(stem, {}).get("status", "pendente"), 2), str(stem).casefold()))
+        return sorted(base, key=lambda stem: (rank.get(self.state.get(self.review_state_key(stem), {}).get("status", "pendente"), 2), str(stem).casefold()))
 
     def _on_scene_sort_selected(self, _event=None) -> None:
         selected_label = self.scene_sort_var.get()
@@ -1223,19 +1311,67 @@ class ReviewApp:
             self.select_scene(self.stems.index(selected_stem))
         self.status_var.set(f"Organização aplicada: {selected_label}.")
 
+    def register_completed_scene(self, stem, original, text, source='normal'):
+        """Called on the UI thread after final publication; no filesystem scan."""
+        self.audio_by_stem[stem] = Path(original)
+        self.text_by_stem[stem] = Path(text)
+        if source != getattr(self, 'audio_source_mode', 'normal'):
+            return
+        if stem in self.stems:
+            return  # Never reopen a player/editor that may have unsaved changes.
+        import bisect
+        previous = self.current_stem()
+        view = self.scene_list.yview()
+        mode = getattr(self, 'scene_sort_mode', 'default')
+        ranks = {'approved_first': {'aprovada':0, 'pendente':1, 'rejeitada':2},
+                 'rejected_first': {'rejeitada':0, 'pendente':1, 'aprovada':2},
+                 'decided_first': {'aprovada':0, 'rejeitada':1, 'pendente':2}}
+        def key(value):
+            rank = ranks.get(mode)
+            return (rank.get(self.state.get(self.review_state_key(value), {}).get('status', 'pendente'), 2) if rank else 0, value.casefold())
+        index = bisect.bisect_left(self.stems, key(stem), key=key)
+        self.stems.insert(index, stem)
+        if stem not in self.default_stems:
+            self.default_stems.append(stem)
+        status = self.state.get(self.review_state_key(stem), {}).get('status', 'pendente')
+        marker = {'aprovada':'[OK]', 'rejeitada':'[REFAZER]'}.get(status, '[ ]')
+        dark = getattr(self, 'theme', {}).get('root') != '#F5F6FA'
+        color = {'aprovada':'#60A5FA' if dark else '#0057B8', 'rejeitada':'#F87171' if dark else '#C00000'}.get(status, '#F8FAFC' if dark else '#333333')
+        row = (f'{marker} {self.scene_display_name(stem)}', color)
+        self.scene_list.insert(index, row[0])
+        self.scene_list.itemconfig(index, foreground=color)
+        if getattr(self, '_scene_rows', None) is not None:
+            self._scene_rows.insert(index, row)
+        self.scene_count_var.set(f'{self.audio_source_var.get().upper()} ({len(self.stems)} áudios)')
+        if previous is not None:
+            self.current_index = self.stems.index(previous)
+            self.scene_list.yview_moveto(view[0])
+        elif not getattr(self, 'busy', False):
+            self.select_scene(index)
+
     def refresh_scene_list(self, preserve_stem: str | None = None) -> None:
         if preserve_stem is None and getattr(self, "stems", None) and 0 <= getattr(self, "current_index", -1) < len(self.stems):
             preserve_stem = self.stems[self.current_index]
         self.stems = self._ordered_scene_stems()
-        self.scene_count_var.set(f"DUBLADOS ({len(self.stems)} áudios)")
-        self.scene_list.delete(0, END)
+        self.scene_count_var.set(f"{self.audio_source_var.get().upper()} ({len(self.stems)} áudios)")
+        rows=[]
         dark = getattr(self, "theme", {}).get("root") != "#F5F6FA"
         for index, stem in enumerate(self.stems):
-            status = self.state.get(stem, {}).get("status", "pendente")
+            status = self.state.get(self.review_state_key(stem), {}).get("status", "pendente")
             marker = {"aprovada": "[OK]", "rejeitada": "[REFAZER]"}.get(status, "[ ]")
             color = {"aprovada": "#60A5FA" if dark else "#0057B8", "rejeitada": "#F87171" if dark else "#C00000"}.get(status, "#F8FAFC" if dark else "#333333")
-            self.scene_list.insert(END, f"{marker} {self.scene_display_name(stem)}")
-            self.scene_list.itemconfig(index, foreground=color)
+            rows.append((f"{marker} {self.scene_display_name(stem)}",color))
+        previous=getattr(self,'_scene_rows',None)
+        if rows!=previous:
+            if previous is not None and len(previous)==len(rows) and [r[0].split('] ',1)[-1] for r in rows]==[r[0].split('] ',1)[-1] for r in previous]:
+                for index,(row,old) in enumerate(zip(rows,previous)):
+                    if row!=old:
+                        self.scene_list.delete(index);self.scene_list.insert(index,row[0]);self.scene_list.itemconfig(index,foreground=row[1])
+            else:
+                self.scene_list.delete(0,END)
+                if rows:self.scene_list.insert(END,*(row[0] for row in rows))
+                for index,row in enumerate(rows):self.scene_list.itemconfig(index,foreground=row[1])
+            self._scene_rows=rows
         if self.stems:
             if preserve_stem in self.stems:
                 self.current_index = self.stems.index(preserve_stem)
@@ -1268,8 +1404,81 @@ class ReviewApp:
             return None
         return self.stems[self.current_index]
 
+    def review_state_key(self, stem: str) -> str:
+        return f"personalizado::{stem}" if getattr(self, "audio_source_mode", "normal") == "custom" else stem
+
+    def current_output_dir(self) -> Path:
+        return CUSTOM_OUTPUT_DIR if getattr(self, "audio_source_mode", "normal") == "custom" else OUTPUT_DIR
+
     def current_output(self, stem: str) -> Path:
-        return OUTPUT_DIR / f"{stem}.wav"
+        return self.current_output_dir() / f"{stem}.wav"
+
+    def _custom_available_stems(self) -> list[str]:
+        if not CUSTOM_OUTPUT_DIR.is_dir():
+            return []
+        found = []
+        for path in CUSTOM_OUTPUT_DIR.rglob("*.wav"):
+            if path.is_file():
+                try:
+                    key = path.relative_to(CUSTOM_OUTPUT_DIR).with_suffix("").as_posix()
+                except ValueError:
+                    continue
+                if key in self.audio_by_stem and key in self.text_by_stem:
+                    found.append(key)
+        return sorted(set(found), key=str.casefold)
+
+    def _on_audio_source_selected(self, _event=None) -> None:
+        self.audio_source_mode = "custom" if self.audio_source_var.get() == "Dublados personalizados" else "normal"
+        if hasattr(self.audio_player, "set_dubbed_folder_name"):
+            self.audio_player.set_dubbed_folder_name("dublados personalizados" if self.audio_source_mode == "custom" else "dublado")
+        self.refresh_audio_sources(select_custom=self.audio_source_mode == "custom")
+
+    def refresh_audio_sources(self, select_custom: bool = False) -> None:
+        preserve = self.current_stem()
+        if select_custom:
+            self.audio_source_mode = "custom"
+            self.audio_source_var.set("Dublados personalizados")
+            self.default_stems = self._custom_available_stems()
+        else:
+            self.audio_source_mode = "normal"
+            self.audio_source_var.set("Dublados")
+            self.default_stems = sorted(set(self.audio_by_stem) & set(self.text_by_stem), key=str.casefold)
+        if hasattr(self.audio_player, "set_dubbed_folder_name"):
+            self.audio_player.set_dubbed_folder_name("dublados personalizados" if self.audio_source_mode == "custom" else "dublado")
+        self.stems = list(self.default_stems)
+        self.refresh_scene_list(preserve)
+        if self.stems:
+            self.select_scene(self.stems.index(preserve) if preserve in self.stems else 0)
+        else:
+            self.scene_var.set("Nenhuma cena selecionada")
+            self.path_var.set("")
+            self.meta_var.set("")
+        self.status_var.set(f"Fonte de revisão: {self.audio_source_var.get()}.")
+
+    def part_generation_context(self, stem):
+        reference = self._custom_model_for_stem(stem) if self.audio_player.dubbed_folder_name == "dublados personalizados" else self.audio_by_stem.get(stem)
+        from audio_translation import settings, synthesis_settings
+        config=dict(self.config)
+        model_provider=getattr(self,'voice_model_provider',None)
+        if callable(model_provider):config['model']=model_provider()
+        provider=getattr(self,'speech_language_provider',None)
+        if callable(provider):config['language']=settings({'language':provider()})['tts_language']
+        config['model'],config['instruct']=synthesis_settings(config['language'],config['model'],config['instruct'])
+        return {"reference": reference, "config": config, "r_mode": self._fixed_r_pronunciation() if config['language'] in ('pt','Portuguese') else 'unchanged'}
+
+    def _custom_model_for_stem(self, stem: str) -> Path | None:
+        manifest = CUSTOM_OUTPUT_DIR / "_manifesto_personalizado.json"
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            raw = str(data.get(stem, {}).get("voice_model", "")).strip()
+            if not raw:
+                return None
+            path = Path(raw).expanduser()
+            if not path.is_absolute():
+                path = ROOT / path
+            return path.resolve() if path.is_file() else None
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return None
 
     def review_audio(self, stem: str) -> Path:
         output = self.current_output(stem)
@@ -1279,11 +1488,15 @@ class ReviewApp:
         stem = self.current_stem()
         if not stem:
             return
-        text_file = self.text_by_stem[stem]
+        self.refresh_original_folder_buttons()
+        self.refresh_other_translation_folder_buttons()
+        text_file = self.text_by_stem.get(stem) or (TEXT_DIR / f"{stem}.txt")
         try:
             text = text_file.read_text(encoding="utf-8-sig").strip()
         except UnicodeDecodeError:
             text = "[TXT não está em UTF-8]"
+        except OSError:
+            text = ""
 
         original_file = self.original_text_by_stem.get(stem)
         if original_file:
@@ -1301,10 +1514,10 @@ class ReviewApp:
                 transcribed_text = "[TXT transcrito/traduzido não está em UTF-8]"
         else:
             transcribed_text = f"[TXT transcrito e traduzido não encontrado em:\n{TRANSCRIBED_TRANSLATED_TEXT_DIR}]"
-        record = self.state.get(stem, {})
+        record = self.state.get(self.review_state_key(stem), {})
         status = record.get("status", "pendente")
         self.scene_var.set(f"Cena: {stem}")
-        self.meta_var.set(f"Status: {status} | Referência: {self.audio_by_stem[stem].name}")
+        self.meta_var.set(f"Status: {status} | Fonte: {self.audio_source_var.get()} | Referência: {self.audio_by_stem[stem].name}")
         self.path_var.set(f"Inglês: {self.audio_by_stem[stem]} | Português: {self.current_output(stem)}")
         self.text_box.delete("1.0", END)
         self.text_box.insert("1.0", text)
@@ -1324,7 +1537,7 @@ class ReviewApp:
         self.set_action_state()
 
     def update_history(self, stem: str) -> None:
-        record = self.state.get(stem, {})
+        record = self.state.get(self.review_state_key(stem), {})
         lines = [
             f"Cena: {stem}",
             f"Status: {record.get('status', 'pendente')}",
@@ -1400,6 +1613,10 @@ class ReviewApp:
 
     def player_review_snapshot(self, stem: str | None = None) -> dict:
         """Retorna apenas os dados necessários para a área lateral do player."""
+        provider=getattr(self,"batch_progress_provider",None)
+        if callable(provider) and not self.busy and getattr(self,"audio_source_mode","normal")=="normal":
+            progress=provider(stem)
+            if progress is not None:return progress
         current = stem or getattr(self, "current_stem", lambda: None)()
         snapshot = {
             "history": "",
@@ -1533,8 +1750,25 @@ class ReviewApp:
     def _redub_with_r_request(self, dialog_parent=None) -> None:
         if self.busy:
             return
+        requested=getattr(self,"request_character_var",None)
+        if requested is not None and requested.get()=="1":
+            parent=dialog_parent or self.root
+            picker=getattr(self,"voice_model_picker",None)
+            if picker is None:
+                try:
+                    from .personalized_dubbing_tab import choose_personalized_voice
+                except ImportError:
+                    from personalized_dubbing_tab import choose_personalized_voice
+                picker=lambda owner:choose_personalized_voice(owner,self.theme,ROOT)
+            self.alternate_reference_audio=None
+            model=picker(parent)
+            if model is None:
+                self.player_text_override=None
+                return
+            self.alternate_reference_audio=model
         self.regen_r_override = self._choose_r_override(dialog_parent)
-        self.regenerate_scene()
+        try:self.regenerate_scene()
+        finally:self.alternate_reference_audio=None
 
     def _redub_other_with_r_request(self, dialog_parent=None) -> None:
         if self.busy:
@@ -1622,6 +1856,7 @@ class ReviewApp:
     def _close_other_audio_window(self, clear_r_override: bool = True) -> None:
         if clear_r_override:
             self.regen_r_override = None
+            self.player_text_override = None
         window = self.other_audio_window
         self.other_audio_window = None
         self.other_audio_list = None
@@ -1756,8 +1991,13 @@ class ReviewApp:
         if text_file is None and key:
             candidate = TEXT_DIR / f"{key}.txt"
             text_file = candidate if candidate.is_file() else None
+        use_var=getattr(self,'use_other_translation_var',None)
+        alternative=getattr(self,'other_translation_by_stem',{}).get(key)
+        if use_var is not None and use_var.get()=='1' and alternative is not None:
+            text_file=alternative
         audio = self.audio_by_stem.get(key) if key else None
         title = f"Áudio: {audio.name if audio is not None else (Path(key).name if key else 'não selecionado')}"
+        if text_file is not None:title += f" — {text_file.parent.name}/{text_file.name}"
         if text_file is None:
             return {"text": "", "path": None, "title": title}
         try:
@@ -1773,7 +2013,10 @@ class ReviewApp:
             return False, "Nenhuma cena selecionada."
         if not new_text:
             return False, "Digite algum texto antes de salvar a alteração."
-        text_file = self.text_by_stem.get(key) or (TEXT_DIR / f"{key}.txt")
+        use_var=getattr(self,'use_other_translation_var',None)
+        alternative=getattr(self,'other_translation_by_stem',{}).get(key)
+        using_alternative=use_var is not None and use_var.get()=='1' and alternative is not None
+        text_file = alternative if using_alternative else (self.text_by_stem.get(key) or (TEXT_DIR / f"{key}.txt"))
         try:
             old_text = text_file.read_text(encoding="utf-8-sig") if text_file.is_file() else ""
             if old_text.strip() != new_text and old_text:
@@ -1783,6 +2026,10 @@ class ReviewApp:
                 backup.write_text(old_text, encoding="utf-8")
             text_file.parent.mkdir(parents=True, exist_ok=True)
             text_file.write_text(new_text + "\n", encoding="utf-8")
+            if using_alternative:
+                self.selected_other_translation_file=text_file;self.selected_other_translation_text=new_text
+                self.refresh_other_translation_text(key)
+                return True,f"Tradução alternativa salva em {text_file.name}; principal preservada."
             self.text_by_stem[key] = text_file
             current = getattr(self, "current_stem", lambda: None)()
             if key == current and hasattr(self, "text_box"):
@@ -1817,7 +2064,8 @@ class ReviewApp:
         return self.text_box.get("1.0", "end-1c").strip() != self.loaded_text.strip()
 
     def update_record(self, stem: str, status: str, reason: str = "") -> None:
-        record = self.state.setdefault(stem, {})
+        self.state.update(load_json(STATE_FILE, {}))
+        record = self.state.setdefault(self.review_state_key(stem), {})
         record.update({"status": status, "reason": reason, "updated_at": now_text()})
         save_json(STATE_FILE, self.state)
         self.refresh_scene_list()
@@ -1891,20 +2139,57 @@ class ReviewApp:
     def next_scene(self) -> None:
         self.select_scene(self.current_index + 1)
 
+    def needs_missing_translation(self, stem):
+        flag = getattr(self, 'translate_missing_var', None)
+        if flag is None or flag.get() != '1': return False
+        displayed = getattr(self, 'player_text_override', None)
+        if displayed is not None and displayed[0] == stem:
+            return not displayed[1].strip()
+        if self.use_other_translation_var.get() == '1' and self.selected_other_translation_file:
+            return not self.selected_other_translation_text.strip()
+        path = self.text_by_stem.get(stem)
+        return path is None or not path.is_file() or not path.read_text(encoding='utf-8-sig').strip()
+
     def regenerate_scene(self) -> None:
         if self.busy:
             return
         stem = self.current_stem()
         if not stem:
             return
+        translation_config=None
+        requested=getattr(self,"request_translation_var",None)
+        if (requested is not None and requested.get()=="1") or self.needs_missing_translation(stem):
+            from audio_translation import choose_settings, translation_python
+            provider=getattr(self,"translation_settings_provider",None)
+            translation_config=choose_settings(self.audio_player.window or self.root,provider() if callable(provider) else {})
+            if translation_config is None:return
+            try:translation_python()
+            except Exception as exc:
+                messagebox.showerror("Transcrição / tradução",str(exc),parent=self.root);return
+        model_provider=getattr(self,'voice_model_provider',None)
+        self.regen_voice_model=model_provider() if callable(model_provider) else self.config['model']
+        self.regen_translation_settings=translation_config
+        from audio_translation import settings
+        language_provider=getattr(self,'speech_language_provider',None)
+        self.regen_speech_language=settings({'language':language_provider()})['tts_language'] if callable(language_provider) else str(self.config['language'])
+        alignment = getattr(self, 'align_original_var', None)
+        provider = getattr(self, 'alignment_settings_provider', None)
+        self.regen_alignment_settings = (dict(provider()) if callable(provider) else {'pauses':False, 'max_change':25}) if alignment is not None and alignment.get() == '1' else None
+        self.regen_translation_result=None
         pending_r_mode = self.regen_r_override
         self.regen_r_override = None
         valid_r_modes = {mode_id for _label, mode_id in R_PRONUNCIATION_CHOICES}
         r_mode = pending_r_mode if pending_r_mode in valid_r_modes else self._fixed_r_pronunciation()
         use_other = self.use_other_translation_var.get() == "1" and bool(self.selected_other_translation_file)
-        reference_audio = getattr(self, "alternate_reference_audio", None) or self.audio_by_stem[stem]
+        displayed=getattr(self,'player_text_override',None)
+        self.player_text_override=None
+        if displayed is not None and displayed[0]!=stem:displayed=None
+        reference_audio = getattr(self, "alternate_reference_audio", None)
+        if reference_audio is None and getattr(self, "audio_source_mode", "normal") == "custom":
+            reference_audio = self._custom_model_for_stem(stem)
+        reference_audio = reference_audio or self.audio_by_stem[stem]
         self.alternate_reference_audio = None
-        if not use_other and self.text_has_unsaved_changes():
+        if translation_config is None and displayed is None and not use_other and self.text_has_unsaved_changes():
             answer = messagebox.askyesno(
                 "Texto não salvo",
                 "O texto foi alterado, mas ainda não foi salvo no TXT.\n\nSalvar agora e continuar com a regeneração?",
@@ -1913,7 +2198,7 @@ class ReviewApp:
             if not answer or not self.save_text_changes():
                 return
 
-        source_label = self.selected_other_translation_file.name if use_other else f"{stem}.txt em TXT TEXTO PORTUGUES"
+        source_label = ("Nova transcrição do ORIGINAL + tradução para "+translation_config["language"]) if translation_config else (self.selected_other_translation_file.name if use_other else f"{stem}.txt em TXT TEXTO PORTUGUES")
         current = self.current_output(stem)
         destination_note = "A versão atual será preservada em revisoes antes da substituição." if current.exists() else "A nova versão será criada em dublado; não há dublado anterior para arquivar."
         r_label = i18n.tr(self._r_mode_label(r_mode))
@@ -1925,7 +2210,11 @@ class ReviewApp:
             return
 
         try:
-            if use_other:
+            if translation_config is not None:
+                text="(transcrição será gerada do áudio original)"
+            elif displayed is not None:
+                text=displayed[1].strip()
+            elif use_other:
                 text = self.selected_other_translation_text.strip()
             else:
                 text = self.text_by_stem[stem].read_text(encoding="utf-8-sig").strip()
@@ -1936,9 +2225,11 @@ class ReviewApp:
             messagebox.showwarning("TXT vazio", f"O arquivo {stem}.txt está vazio.")
             return
 
-        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        self.current_output_dir().mkdir(parents=True, exist_ok=True)
         target = current
         self.busy = True
+        self.regen_cancel_requested = False
+        self.regen_stage_events = queue.SimpleQueue()
         self.regen_started_at = time.monotonic()
         self.regen_stem = stem
         self.regen_clone_progress.set(0.0)
@@ -1956,60 +2247,178 @@ class ReviewApp:
         self.set_action_state()
         self.status_var.set(f"Regenerando {stem}...")
         self.update_regen_clock()
+        self.audio_player.stop(announce=False)
         thread = threading.Thread(target=self._run_generation, args=(stem, text, target, current, reference_audio, r_mode), daemon=True)
         thread.start()
 
-    def _run_generation(self, stem: str, text: str, target: Path, current: Path, reference_audio: Path, r_mode: str = "unchanged") -> None:
-        infer_prefix = find_omnivoice_command()
-        if not infer_prefix:
-            self.root.after(0, lambda: self._generation_failed(stem, "Não encontrei o OmniVoice. Instale o pacote ou defina OMNIVOICE_INFER."))
+    def control_generation(self, after_scene=False):
+        if self.busy:
+            if after_scene:
+                self.status_var.set('A cena atual será concluída; a redublagem individual termina após esta cena.')
+            else:
+                self.regen_cancel_requested = True
+                self.status_var.set('Cancelamento da redublagem solicitado…')
             return
-        target.parent.mkdir(parents=True, exist_ok=True)
-        temporary_target = target.with_name(f".{target.stem}.__dublaskizon_tmp_{os.getpid()}_{threading.get_ident()}.wav")
+        callback = self.project_actions.get('control_dubbing')
+        if callback:
+            callback(getattr(self, 'audio_source_mode', 'normal'), after_scene)
+
+    def _run_cancellable_generation(self, command, **kwargs):
+        process = subprocess.Popen(command, **kwargs)
+        while process.poll() is None:
+            if getattr(self, 'regen_cancel_requested', False):
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                raise RuntimeError('Redublagem cancelada; áudio anterior preservado.')
+            time.sleep(.1)
+        return subprocess.CompletedProcess(command, process.returncode)
+
+    def _run_generation(self, stem: str, text: str, target: Path, current: Path, reference_audio: Path, r_mode: str = "unchanged") -> None:
         backup_path = None
-        command = [
-            *infer_prefix,
-            "--model",
-            str(self.config["model"]),
-            "--text",
-            apply_r_pronunciation(text, r_mode),
-            "--language",
-            str(self.config["language"]),
-            "--instruct",
-            str(self.config["instruct"]),
-            "--ref_audio",
-            str(reference_audio),
-            "--output",
-            str(temporary_target),
-        ]
+        temporary_target = None
         try:
-            result = subprocess.run(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, **hidden_process_kwargs())
+            from batch_tab import find_voice_command
+            selected_model=getattr(self,'regen_voice_model',self.config['model'])
+            # Preserve legacy discovery hooks for OmniVoice installations.
+            from f5_backend import MODEL as F5_MODEL, validate
+            infer_prefix = find_voice_command(selected_model) if selected_model == F5_MODEL else find_omnivoice_command()
+            if not infer_prefix:
+                self.root.after(0, lambda: self._generation_failed(stem, "Não encontrei o OmniVoice. Instale o pacote ou defina OMNIVOICE_INFER."))
+                return
+            target.parent.mkdir(parents=True, exist_ok=True)
+            work_dir=REVISIONS_DIR / "_intermediarios" / ("personalizados" if target.is_relative_to(CUSTOM_OUTPUT_DIR) else "dublados") / Path(stem).parent
+            work_dir.mkdir(parents=True,exist_ok=True)
+            temporary_target = work_dir / f".{target.stem}.__dublaskizon_tmp_{os.getpid()}_{threading.get_ident()}_{time.time_ns()}.wav"
+            language=getattr(self,'regen_speech_language',str(self.config["language"]))
+            translation_config=getattr(self,"regen_translation_settings",None)
+            if translation_config:
+                from audio_translation import generate_text
+                text,language=generate_text(self.audio_by_stem[stem],TEXT_DIR / f"{stem}.txt",ROOT,stem,translation_config,
+                    lambda value:self.regen_stage_events.put((0,0,str(value)[-250:])),force=True,
+                    cancelled=lambda:getattr(self, 'regen_cancel_requested', False),
+                    on_result=lambda value,path:self._generated_text_ready(stem,value,path))
+            from audio_translation import synthesis_settings
+            voice_model, instruction=synthesis_settings(language,str(selected_model),str(self.config['instruct']))
+            if voice_model == F5_MODEL:validate(language)
+            if language not in ('pt','Portuguese'):r_mode='unchanged'
+            command = [
+                *infer_prefix,
+                "--model",
+                voice_model,
+                "--text",
+                apply_r_pronunciation(text, r_mode),
+                "--language",
+                language,
+                "--instruct",
+                instruction,
+                "--ref_audio",
+                str(reference_audio),
+                "--output",
+                str(temporary_target),
+            ]
+            result = run_observed(command, lambda c,d,p: self.regen_stage_events.put((c,d,p)),
+                                  runner=self._run_cancellable_generation, text=True, stderr=subprocess.STDOUT, **hidden_process_kwargs())
             if result.returncode != 0 or not temporary_target.exists():
                 details = (result.stdout or "").strip()
                 suffix = f"\n\n{details[-2000:]}" if details else ""
-                raise RuntimeError(f"OmniVoice terminou com código {result.returncode}.{suffix}")
+                backend_name='F5-TTS Russian' if voice_model == F5_MODEL else 'OmniVoice'
+                raise RuntimeError(f"{backend_name} terminou com código {result.returncode}.{suffix}")
+            if getattr(self, 'regen_alignment_settings', None):
+                from batch_tab import BatchApp
+                from types import SimpleNamespace
+                helper = SimpleNamespace(run_alignment_settings=self.regen_alignment_settings,
+                                         cancel_requested=getattr(self, 'regen_cancel_requested', False), current_process=None)
+                BatchApp.align_generated_audio(helper, temporary_target, self.audio_by_stem[stem])
+            elif target.is_relative_to(CUSTOM_OUTPUT_DIR):
+                if hasattr(self,"regen_stage_events"):self.regen_stage_events.put((100,99,"Aplicando ritmo / pausas do original"))
+                try:
+                    try:
+                        from .personalized_dubbing_tab import match_original_expression
+                    except ImportError:
+                        from personalized_dubbing_tab import match_original_expression
+                    expressive_target = temporary_target.with_name(temporary_target.stem + ".__expressao.wav")
+                    match_original_expression(temporary_target, self.audio_by_stem[stem], expressive_target)
+                    temporary_target.unlink(missing_ok=True)
+                    temporary_target = expressive_target
+                except Exception as exc:
+                    self.root.after(0, lambda err=str(exc): self.append_regen_log(f"Aviso: não foi possível reaplicar ritmo/pausas do original: {err}"))
+            if getattr(self, 'regen_cancel_requested', False):
+                raise RuntimeError('Redublagem cancelada; áudio anterior preservado.')
             if current.exists():
                 revision_dir = _revision_scene_dir(stem)
                 revision_dir.mkdir(parents=True, exist_ok=True)
                 backup_path = revision_dir / f"{_scene_basename(stem)}_v{next_version(stem):02d}.wav"
                 shutil.copy2(current, backup_path)
-            os.replace(temporary_target, target)
+            if target.is_relative_to(CUSTOM_OUTPUT_DIR):
+                try:
+                    from .personalized_dubbing_tab import _safe_replace_file
+                except ImportError:
+                    from personalized_dubbing_tab import _safe_replace_file
+                _safe_replace_file(temporary_target, target)
+                try:
+                    from pathlib import Path as _Path
+                    manifest_path=CUSTOM_OUTPUT_DIR / "_manifesto_personalizado.json"
+                    data=json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+                    record=data.setdefault(stem,{})
+                    reference=_Path(reference_audio).resolve()
+                    record["voice_model"]=reference.relative_to(ROOT).as_posix() if reference.is_relative_to(ROOT) else str(reference)
+                    record["generated_at"]=time.strftime("%Y-%m-%d %H:%M:%S")
+                    temporary_manifest=manifest_path.with_suffix(".tmp.json")
+                    temporary_manifest.write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding="utf-8")
+                    os.replace(temporary_manifest,manifest_path)
+                except Exception as exc:
+                    self.root.after(0,lambda err=str(exc):self.append_regen_log("Áudio salvo; não foi possível registrar o modelo escolhido: "+err))
+            else:
+                os.replace(temporary_target, target)
             self.root.after(0, lambda: self._generation_done(stem, target, backup_path))
         except Exception as exc:
             try:
-                temporary_target.unlink(missing_ok=True)
+                if temporary_target is not None:
+                    temporary_target.unlink(missing_ok=True)
             except OSError:
                 pass
-            if backup_path is not None:
-                try:
-                    backup_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            self.root.after(0, lambda: self._generation_failed(stem, str(exc)))
+            # Preserva o backup mesmo se a substituição do WAV falhar.
+            error = str(exc)
+            self.root.after(0, lambda error=error: self._generation_failed(stem, error))
+
+    def _generated_text_ready(self, stem, text, path):
+        self.regen_translation_result=(text,path)
+        def show():
+            self._show_generated_translation(stem,text,path)
+            callback=self.project_actions.get('refresh_review')
+            if callable(callback):callback()
+        self.root.after(0,show)
+
+    def _show_generated_translation(self, stem, text, path):
+        path = Path(path)
+        self.original_text_by_stem = original_text_files(getattr(self, 'original_text_dir', ORIGINAL_TEXT_DIR))
+        relative = Path(stem + '.txt')
+        folder = path
+        for _part in relative.parts: folder = folder.parent
+        self.other_translation_root_dir = OTHER_TRANSLATIONS_DIR
+        self.other_translation_dir = folder
+        self.other_translation_var.set(str(folder))
+        self.refresh_original_folder_buttons()
+        self.refresh_other_translation_folder_buttons()
+        self.append_regen_log("TRADUÇÃO GERADA (TXT principal preservado):\n"+text)
+        self.other_translation_by_stem=other_translation_text_files(folder)
+        self.selected_other_translation_file=path
+        self.selected_other_translation_text=text
+        self.use_other_translation_var.set("1")
+        player=self.audio_player
+        if getattr(player,"current_context_key",None)==stem:
+            player._refresh_scene_translation_folders()
+            player._refresh_scene_text()
+        callback = getattr(self, 'player_refresh_callback', None)
+        if callable(callback): callback(stem)
 
     def _generation_done(self, stem: str, target: Path, backup_path: Path | None = None) -> None:
         self.busy = False
-        self.append_regen_log(f"CONCLUÍDO: novo áudio salvo em dublado/{target.relative_to(OUTPUT_DIR) if target.is_relative_to(OUTPUT_DIR) else target.name}")
+        self.append_regen_log(f"CONCLUÍDO: novo áudio salvo em {self.current_output_dir().name}/{target.relative_to(self.current_output_dir()) if target.is_relative_to(self.current_output_dir()) else target.name}")
         if backup_path is not None:
             self.append_regen_log(f"VERSÃO ANTERIOR PRESERVADA: {backup_path.relative_to(REVISIONS_DIR) if backup_path.is_relative_to(REVISIONS_DIR) else backup_path.name}")
         self.finish_regen_clock(True)
@@ -2017,7 +2426,7 @@ class ReviewApp:
         if backup_path is not None:
             record_text += f" Versão anterior preservada em {backup_path.name}."
         self.update_record(stem, "pendente", record_text)
-        self.status_var.set(f"Novo áudio salvo em dublado: {target.name}")
+        self.status_var.set(f"Novo áudio salvo em {self.current_output_dir().name}: {target.name}")
         try:
             self.audio_player.refresh_current_scene(stem)
         except Exception:
@@ -2030,6 +2439,8 @@ class ReviewApp:
                 pass
         self.set_action_state()
         self.update_details()
+        generated=getattr(self,"regen_translation_result",None)
+        if generated:self._show_generated_translation(stem,*generated)
         if bool(self.config.get("auto_open_after_generate", True)):
             try:
                 open_audio_pair(self.audio_by_stem[stem], self.current_output(stem), stem, self.config)
@@ -2038,6 +2449,8 @@ class ReviewApp:
 
     def _generation_failed(self, stem: str, error: str) -> None:
         self.busy = False
+        generated=getattr(self, 'regen_translation_result', None)
+        if generated:self._show_generated_translation(stem,*generated)
         self.append_regen_log(f"ERRO: {error}")
         self.finish_regen_clock(False)
         self.set_action_state()

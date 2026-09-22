@@ -6,6 +6,9 @@ Usa FFplay, distribuído com o FFmpeg, ou o reprodutor padrão do Windows, confo
 from __future__ import annotations
 
 import os
+import math
+import json
+import hashlib
 import shutil
 import subprocess
 import sys
@@ -16,7 +19,12 @@ import wave
 from pathlib import Path
 
 try:
-    from tkinter import Button, Canvas, DoubleVar, END, Frame, Label, Menu, Scrollbar, StringVar, Text, Toplevel, messagebox, ttk
+    from .audio_clip_timeline import AudioClip, split_clip, move_clip, move_clip_group, render_clips, paste_clip
+except ImportError:
+    from audio_clip_timeline import AudioClip, split_clip, move_clip, move_clip_group, render_clips, paste_clip
+
+try:
+    from tkinter import Button, Canvas, DoubleVar, END, Frame, Label, Menu, Scrollbar, StringVar, Text, Toplevel, filedialog, messagebox, ttk
 except ModuleNotFoundError:
     TK_AVAILABLE = False
     ttk = None  # type: ignore
@@ -147,6 +155,141 @@ def find_ffplay(project_root: Path | None = None) -> str | None:
     return None
 
 
+def process_scene_volume(track, decibels):
+    """Uniform float64 PCM gain, capped at -1 dBFS sample peak; no compressor.
+
+    Retains rate, channels, sample width, frame count and independent clip IDs.
+    No noise/dither or lossy encoding is introduced; final PCM is rounded once.
+    """
+    import numpy as np
+    decibels=float(decibels)
+    if not math.isfinite(decibels) or not -24 <= decibels <= 24:
+        raise ValueError("Ajuste de volume inválido.")
+    width=int(track['sample_width']);channels=int(track['channels'])
+    raw=track['frames']
+    if width not in (1,2,3,4) or channels<1 or len(raw)%(width*channels):
+        raise ValueError("Formato PCM inválido para ajustar volume.")
+    if not raw:raise ValueError("Áudio vazio.")
+    if width==1:
+        samples=np.frombuffer(raw,dtype=np.uint8).astype(np.float64)-128
+    elif width==3:
+        packed=np.frombuffer(raw,dtype=np.uint8).reshape(-1,3).astype(np.int32)
+        values=packed[:,0] | (packed[:,1]<<8) | (packed[:,2]<<16)
+        samples=((values ^ 0x800000)-0x800000).astype(np.float64)
+    else:
+        samples=np.frombuffer(raw,dtype='<i'+str(width)).astype(np.float64)
+    peak=float(np.max(np.abs(samples)))
+    ceiling=math.floor(((1 << (width*8-1))-1)*10**(-1/20))
+    requested=10**(decibels/20)
+    gain=min(requested,max(1.0,ceiling/peak)) if decibels>0 and peak else requested
+    applied=20*math.log10(gain) if peak else 0.0
+    if peak==0 or abs(applied)<1e-9:
+        return raw,tuple(track.get('clips') or (AudioClip(1,0,raw),)),0.0
+    values=np.rint(samples*gain)
+    if width==1:
+        result=(values+128).astype(np.uint8).tobytes()
+    elif width==3:
+        values=values.astype(np.int32)
+        packed=np.empty((len(values),3),dtype=np.uint8)
+        for byte in range(3):packed[:,byte]=(values>>(8*byte)) & 255
+        result=packed.tobytes()
+    else:
+        result=values.astype('<i'+str(width)).tobytes()
+    result,clips=preserve_processed_clips(track,result)
+    return result,clips,applied
+
+
+def process_scene_audio(track: dict, project_root, duration_factor=None, preserve_clips=False):
+    """Processa uma cópia PCM com os mesmos métodos do conversor de duração."""
+    try:
+        from .duration_converter_tab import DurationConverterApp
+    except ImportError:
+        from duration_converter_tab import DurationConverterApp
+    converter = DurationConverterApp.__new__(DurationConverterApp)
+    converter.project_root = project_root
+    converter.append_log = lambda _text: None
+    codecs = {1: "pcm_u8", 2: "pcm_s16le", 3: "pcm_s24le", 4: "pcm_s32le"}
+    codec = codecs[track["sample_width"]]
+    converter.output_format_args = lambda _format: ["-c:a", codec, "-ar", str(track["sample_rate"]), "-ac", str(track["channels"])]
+    if duration_factor is not None and preserve_clips:
+        if not math.isfinite(duration_factor) or not 0.5 <= duration_factor <= 2:
+            raise ValueError("A duração deve ficar entre 50% e 200% da base deste ajuste.")
+        frame_bytes=track['channels']*track['sample_width']
+        if abs(duration_factor-1.0)<1e-10:
+            return track['frames'],tuple(track.get('clips') or (AudioClip(1,0,track['frames']),))
+        updated=[]
+        total=round(len(track['frames'])/frame_bytes*duration_factor)
+        silence=bytes([128])*frame_bytes if track['sample_width']==1 else bytes(frame_bytes)
+        for clip in track.get('clips') or (AudioClip(1,0,track['frames']),):
+            start=round(clip.start*duration_factor)
+            end=round(clip.end(frame_bytes)*duration_factor)
+            count=end-start
+            if count<1:raise ValueError("Um trecho ficaria menor que uma amostra.")
+            single=dict(track,frames=clip.pcm);single.pop('clips',None)
+            # Exactly the converter's 'maior' engine, once per independent clip.
+            raw=process_scene_audio(single,project_root,duration_factor,preserve_clips=False)
+            raw=raw[:count*frame_bytes]
+            raw+=silence*(count-len(raw)//frame_bytes)
+            updated.append(AudioClip(clip.id,start,raw))
+        return render_clips(updated,frame_bytes,track['sample_width'],total,max(total*frame_bytes,1)),tuple(updated)
+    with tempfile.TemporaryDirectory(prefix="dublaskizon_scene_") as folder:
+        folder = Path(folder)
+        source = folder / "entrada.wav"
+        with wave.open(str(source), "wb") as output:
+            output.setnchannels(track["channels"])
+            output.setsampwidth(track["sample_width"])
+            output.setframerate(track["sample_rate"])
+            output.writeframes(track["frames"])
+        trim_start = 0
+        if duration_factor is None:
+            if preserve_clips:
+                start, end = converter.detect_start_end_silence(source)
+                frame_bytes = track["channels"] * track["sample_width"]
+                trim_start = max(0, round(start * track["sample_rate"]))
+                trim_end = min(len(track["frames"]) // frame_bytes, round(end * track["sample_rate"]))
+                raw = track["frames"][trim_start*frame_bytes:trim_end*frame_bytes]
+                if not raw:
+                    raise ValueError("O corte retornou áudio vazio; a edição foi preservada.")
+                return preserve_processed_clips(track, raw, trim_start=trim_start)
+            target = converter.silence_trim(source, folder)
+        else:
+            duration = len(track["frames"]) / track["sample_width"] / track["channels"] / track["sample_rate"]
+            if duration <= 0 or not 0.5 <= duration_factor <= 2:
+                raise ValueError("Áudio vazio ou ajuste de duração inválido.")
+            target = folder / "saida.wav"
+            converter.convert_longer(source, target, duration * duration_factor, duration, folder, "wav")
+        with wave.open(str(target), "rb") as result:
+            if (result.getnchannels(), result.getsampwidth(), result.getframerate()) != (track["channels"], track["sample_width"], track["sample_rate"]):
+                raise ValueError("O processamento alterou o formato PCM do áudio.")
+            raw = result.readframes(result.getnframes())
+        if not raw:
+            raise ValueError("O processamento retornou áudio vazio; a edição foi preservada.")
+        if preserve_clips:
+            return preserve_processed_clips(track, raw, stretch=True)
+        return raw
+
+
+def preserve_processed_clips(track, raw, trim_start=0, stretch=False):
+    """Reposiciona limites sem juntar IDs; mantém os intervalos como silêncio PCM."""
+    frame_bytes = track["channels"] * track["sample_width"]
+    total = len(raw) // frame_bytes
+    original_total = len(track["frames"]) // frame_bytes
+    ratio = total / original_total if stretch else 1.0
+    clips = track.get("clips") or (AudioClip(1, 0, track["frames"]),)
+    updated = []
+    for clip in clips:
+        start = max(0, min(total, round(clip.start * ratio) - trim_start))
+        end = max(0, min(total, round(clip.end(frame_bytes) * ratio) - trim_start))
+        if end > start:
+            updated.append(AudioClip(clip.id, start, raw[start*frame_bytes:end*frame_bytes]))
+        elif stretch:
+            raise ValueError("Um trecho ficaria menor que uma amostra. A edição foi preservada.")
+    if not updated:
+        raise ValueError("Nenhum trecho permaneceu após o corte. A edição foi preservada.")
+    result = render_clips(updated, frame_bytes, track["sample_width"], total, max(len(raw), 1))
+    return result, tuple(updated)
+
+
 class AudioPlayerManager:
     def __init__(self, parent, project_root: Path | None = None, status_callback=None):
         self.parent = parent
@@ -176,6 +319,7 @@ class AudioPlayerManager:
         self._ffplay_path: str | None = None
         self.playback_mode = "ffplay"
         self.current_source_kind = "unknown"
+        self.dubbed_folder_name = "dublado"
         self.current_index = -1
         self.stop_button = None
         self.close_button = None
@@ -202,6 +346,11 @@ class AudioPlayerManager:
         self.review_top_panel = None
         self.waveform_duration_labels = {}
         self.waveform_reference_duration = 0.0
+        self.waveform_zoom = 1.0
+        self.waveform_scroll = 0.0
+        self.waveform_zoom_var = None
+        self.waveform_zoom_status = None
+        self.waveform_scrollbar = None
         self.waveform_progress = {"original": 0.0, "dubbed": 0.0}
         self.waveform_active_kind: str | None = None
         self.waveform_active_path: Path | None = None
@@ -210,6 +359,8 @@ class AudioPlayerManager:
         self.waveform_active_duration = 0.0
         self.waveform_active_offset = 0.0
         self.waveform_progress_after_id = None
+        self.selected_clip_ids = set()
+        self.clip_selection_anchor = None
         self.audio_edit_mode = False
         self.audio_edit_dirty = False
         self.audio_edit_status_var = None
@@ -220,6 +371,9 @@ class AudioPlayerManager:
         self.waveform_drag_kind: str | None = None
         self.waveform_drag_start_x = 0.0
         self.audio_edit_button = None
+        self.audio_split_button = None
+        self.clip_timeline_canvas = None
+        self.clip_drag = None
         self.audio_undo_button = None
         self.audio_redo_button = None
         self.audio_cut_button = None
@@ -227,8 +381,8 @@ class AudioPlayerManager:
         self.audio_copy_button = None
         self.audio_paste_button = None
         self.audio_save_button = None
-        self.audio_edit_undo_stack: list[tuple[str, bytes]] = []
-        self.audio_edit_redo_stack: list[tuple[str, bytes]] = []
+        self.audio_edit_undo_stack: list[tuple[str, dict]] = []
+        self.audio_edit_redo_stack: list[tuple[str, dict]] = []
         self.audio_edit_base_frames: dict[str, bytes] = {}
         self.audio_edit_preview_path: Path | None = None
         self.audio_paused_kind: str | None = None
@@ -254,6 +408,14 @@ class AudioPlayerManager:
         self.current_context_key: str | None = None
         self.playback_id = 0
         self.theme = {"mode": "claro", "surface": "#FFFFFF", "text": "#1F2937"}
+
+    def set_dubbed_folder_name(self, folder_name: str) -> None:
+        """Define qual pasta representa a faixa DUBLADO na janela OUVIR CENA."""
+        name = str(folder_name or "dublado").strip() or "dublado"
+        if name != self.dubbed_folder_name:
+            self.dubbed_folder_name = name
+            self._project_audio_index.clear()
+            self.apply_theme({})
 
     def set_scene_integration(self, selection_callback=None, review_actions=None) -> None:
         """Configura sincronização da lista e ações opcionais de Revisão."""
@@ -285,6 +447,7 @@ class AudioPlayerManager:
                 pass
         self._refresh_scene_text()
         self._refresh_waveforms()
+        self._update_audio_edit_buttons()
         self._update_mode_buttons()
         self._refresh_review_snapshot()
         if had_window:
@@ -404,17 +567,38 @@ class AudioPlayerManager:
         auto_command = self.review_preferences.get("auto_open_command")
         request_r_var = self.review_preferences.get("request_r_var")
         request_r_command = self.review_preferences.get("request_r_command")
-        if auto_var is None and request_r_var is None:
+        request_character_var=self.review_preferences.get("request_character_var")
+        request_translation_var=self.review_preferences.get("request_translation_var")
+        if auto_var is None and request_r_var is None and request_character_var is None and request_translation_var is None:
             return
         try:
+            basic_row=container
+            request_row=container
+            container.columnconfigure(0, weight=1)
+            container.columnconfigure(1, weight=1)
+            container.columnconfigure(2, weight=1)
             if auto_var is not None:
-                widget = ttk.Checkbutton(container, text=i18n.tr("Abrir Audacity após redublar"), variable=auto_var, command=auto_command)
-                widget.pack(side="left", anchor="w", padx=(0, 14))
+                widget = ttk.Checkbutton(basic_row, text=i18n.tr("Abrir Audacity após redublar"), variable=auto_var, command=auto_command)
+                widget.grid(row=0, column=0, sticky='w', padx=(0, 18), pady=(2, 4))
                 self.review_preference_widgets.append(widget)
             if request_r_var is not None:
-                widget = ttk.Checkbutton(container, text=i18n.tr("Pedido de alterar pronúncia do R"), variable=request_r_var, command=request_r_command)
-                widget.pack(side="left", anchor="w")
+                widget = ttk.Checkbutton(basic_row, text=i18n.tr("Pedido de alterar pronúncia do R"), variable=request_r_var, command=request_r_command)
+                widget.grid(row=0, column=1, sticky='w', pady=(2, 4))
                 self.review_preference_widgets.append(widget)
+            if request_character_var is not None:
+                widget=ttk.Checkbutton(request_row,text=i18n.tr("Pedido para alterar personagem da dublagem personalizada"),variable=request_character_var,onvalue="1",offvalue="0")
+                widget.grid(row=1, column=0, sticky='w', padx=(0, 12), pady=(2, 4))
+                self.review_preference_widgets.append(widget)
+            if request_translation_var is not None:
+                widget=ttk.Checkbutton(request_row,text=i18n.tr("Pedido para transcrever e traduzir o original"),variable=request_translation_var,onvalue="1",offvalue="0")
+                widget.grid(row=1, column=1, sticky='w', pady=(2, 4))
+                self.review_preference_widgets.append(widget)
+            for column, (name, label) in enumerate((('align_original_var', 'Alinhar ritmo e duração ao original'), ('translate_missing_var', 'Transcrever e traduzir quando faltar TXT'))):
+                variable = self.review_preferences.get(name)
+                if variable is not None:
+                    widget = ttk.Checkbutton(container, text=i18n.tr(label), variable=variable, onvalue='1', offvalue='0')
+                    widget.grid(row=column, column=2, sticky='w', padx=(12,0), pady=(2,4))
+                    self.review_preference_widgets.append(widget)
             container.pack(fill="x", pady=(0, 4), before=controls)
         except Exception:
             pass
@@ -431,6 +615,11 @@ class AudioPlayerManager:
         callback = self.review_actions.get(action_name)
         if not callable(callback):
             return
+        controller=getattr(self,'translation_controller',None)
+        if controller is not None and getattr(self, 'show_original_text', False):
+            controller.player_text_override = None
+        if controller is not None and action_name in {'redub','redub_other','redub_personalized'} and self.scene_text_box is not None and not getattr(self, 'show_original_text', False):
+            controller.player_text_override=(self.current_context_key,self.scene_text_box.get('1.0','end-1c'))
         try:
             callback(self.current_context_key)
         except TypeError:
@@ -645,6 +834,11 @@ class AudioPlayerManager:
         self.review_top_panel = None
         self.waveform_duration_labels = {}
         self.waveform_reference_duration = 0.0
+        self.waveform_zoom = 1.0
+        self.waveform_scroll = 0.0
+        self.waveform_zoom_var = None
+        self.waveform_zoom_status = None
+        self.waveform_scrollbar = None
         self.waveform_progress = {"original": 0.0, "dubbed": 0.0}
         self.waveform_active_kind = None
         self.waveform_active_path = None
@@ -663,6 +857,9 @@ class AudioPlayerManager:
         self.waveform_drag_kind = None
         self.waveform_drag_start_x = 0.0
         self.audio_edit_button = None
+        self.audio_split_button = None
+        self.clip_timeline_canvas = None
+        self.clip_drag = None
         self.audio_undo_button = None
         self.audio_redo_button = None
         self.audio_cut_button = None
@@ -826,6 +1023,9 @@ class AudioPlayerManager:
                 "comptype": params.comptype,
                 "compname": params.compname,
             }
+            if kind == "dubbed":
+                self._load_clip_layout(track)
+            track["saved_clips"] = self._track_clips(track)
             self.audio_edit_working[kind] = track
             return track
         except (OSError, EOFError, wave.Error, ValueError):
@@ -843,22 +1043,99 @@ class AudioPlayerManager:
     def _update_audio_edit_dirty(self) -> None:
         self.audio_edit_dirty = any(
             bytes(track.get("frames", b"")) != self.audio_edit_base_frames.get(kind, bytes(track.get("frames", b"")))
+            or self._track_clips(track) != track.get("saved_clips", (AudioClip(1, 0, self.audio_edit_base_frames.get(kind, bytes(track.get("frames", b"")))),))
             for kind, track in self.audio_edit_working.items()
         )
 
-    def _set_edit_frames(self, kind: str, track: dict, raw: bytes, record_history: bool = True) -> None:
+    def _clip_layout_location(self, track):
+        target = Path(track["path"]).resolve()
+        root = self.project_root or target.parent
+        try:
+            key = target.relative_to(root).as_posix()
+        except ValueError:
+            key = str(target)
+        return Path(root) / "revisoes" / ".dublaskizon_trechos.json", key
+
+    def _load_clip_layout(self, track):
+        try:
+            path, key = self._clip_layout_location(track)
+            records = json.loads(path.read_text(encoding="utf-8"))
+            record = records.get(key, {}) if isinstance(records, dict) else {}
+            if not isinstance(record, dict) or record.get("format") != [track["channels"], track["sample_width"], track["sample_rate"]]:
+                return
+            if record.get("sha256") != hashlib.sha256(track["frames"]).hexdigest():
+                return
+            frame_bytes = self._edit_frame_bytes(track)
+            total = len(track["frames"]) // frame_bytes
+            clips = []
+            end = 0
+            ids = set()
+            for identifier, start, stop in record["clips"]:
+                if not all(isinstance(v, int) for v in (identifier, start, stop)) or identifier in ids or not end <= start < stop <= total:
+                    return
+                ids.add(identifier)
+                clips.append(AudioClip(identifier, start, track["frames"][start*frame_bytes:stop*frame_bytes]))
+                end = stop
+            if clips:
+                # Metadados externos nunca podem omitir áudio audível da faixa.
+                rendered = render_clips(clips, frame_bytes, track["sample_width"], total, max(len(track["frames"]), 1))
+                if rendered == track["frames"]:
+                    track["clips"] = tuple(clips)
+        except (OSError, ValueError, KeyError, TypeError, MemoryError):
+            pass
+
+    def _save_clip_layout(self, track):
+        path, key = self._clip_layout_location(track)
+        records = {}
+        if path.exists():
+            try:
+                records = json.loads(path.read_text(encoding="utf-8"))
+                if not isinstance(records, dict):
+                    records = {}
+            except (ValueError, OSError):
+                records = {}
+        frame_bytes = self._edit_frame_bytes(track)
+        records[key] = {"format": [track["channels"], track["sample_width"], track["sample_rate"]], "sha256": hashlib.sha256(track["frames"]).hexdigest(), "clips": [[c.id, c.start, c.end(frame_bytes)] for c in self._track_clips(track)]}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(f".{os.getpid()}.tmp")
+        try:
+            temporary.write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _track_clips(self, track):
+        return track.get("clips") or (AudioClip(1, 0, bytes(track.get("frames", b""))),)
+
+    def _track_snapshot(self, track):
+        return {"frames": bytes(track.get("frames", b"")), "clips": self._track_clips(track), "duration_base": track.get("duration_base"), "duration_ratio": track.get("duration_ratio",1.0)}
+
+    def _restore_track_snapshot(self, kind, track, state):
+        if isinstance(state, bytes):
+            state = {"frames": state, "clips": (AudioClip(1, 0, state),)}
+        self._set_edit_frames(kind, track, state["frames"], record_history=False, clips=state["clips"])
+        if state.get('duration_base') is not None:
+            track['duration_base']=state['duration_base'];track['duration_ratio']=state.get('duration_ratio',1.0)
+
+    def _set_edit_frames(self, kind: str, track: dict, raw: bytes, record_history: bool = True, clips=None) -> None:
         current = bytes(track.get("frames", b""))
         updated = bytes(raw)
-        if current == updated:
+        if clips is None and current == updated:
+            return
+        updated_clips = tuple(clips) if clips is not None else (AudioClip(1, 0, updated),)
+        if current == updated and self._track_clips(track) == updated_clips:
             return
         # Nunca deixamos um preview antigo continuar tocando enquanto a faixa
         # editável muda; isso evita ouvir o WAV anterior depois de uma colagem.
         self.stop(announce=False)
         self._remove_audio_edit_preview()
         if record_history:
-            self.audio_edit_undo_stack.append((kind, current))
+            self.audio_edit_undo_stack.append((kind, self._track_snapshot(track)))
             self.audio_edit_redo_stack.clear()
+        self.selected_clip_ids=set();self.clip_selection_anchor=None
+        track.pop('duration_base',None);track.pop('duration_ratio',None)
         track["frames"] = updated
+        track["clips"] = updated_clips
         self.audio_edit_working[kind] = track
         self._update_audio_edit_dirty()
         self.waveform_selection_ranges[kind] = None
@@ -877,8 +1154,8 @@ class AudioPlayerManager:
         if track is None:
             self._set_audio_edit_status("A faixa da alteração não está disponível nesta cena.")
             return "break"
-        self.audio_edit_redo_stack.append((kind, bytes(track.get("frames", b""))))
-        self._set_edit_frames(kind, track, previous, record_history=False)
+        self.audio_edit_redo_stack.append((kind, self._track_snapshot(track)))
+        self._restore_track_snapshot(kind, track, previous)
         self._set_audio_edit_status("Última alteração de áudio desfeita. Use REFAZER ou Ctrl+Y para reaplicar.")
         return "break"
 
@@ -893,8 +1170,8 @@ class AudioPlayerManager:
         if track is None:
             self._set_audio_edit_status("A faixa da alteração não está disponível nesta cena.")
             return "break"
-        self.audio_edit_undo_stack.append((kind, bytes(track.get("frames", b""))))
-        self._set_edit_frames(kind, track, next_frames, record_history=False)
+        self.audio_edit_undo_stack.append((kind, self._track_snapshot(track)))
+        self._restore_track_snapshot(kind, track, next_frames)
         self._set_audio_edit_status("Última alteração de áudio refeita. Use Ctrl+Z para desfazer.")
         return "break"
 
@@ -922,7 +1199,7 @@ class AudioPlayerManager:
             return 0.0
         width = max(180, int(canvas.winfo_width()))
         plot_width = self._waveform_plot_width(kind, width)
-        click_x = max(2.0, min(float(x), 2.0 + plot_width))
+        click_x = max(2.0, min(self._audio_canvas_x(canvas, x), 2.0 + plot_width))
         return duration * (click_x - 2.0) / max(1.0, plot_width)
 
     def _on_waveform_press(self, kind: str, event) -> None:
@@ -938,12 +1215,25 @@ class AudioPlayerManager:
         if self._load_edit_track(kind) is None:
             self._set_audio_edit_status("Edição disponível somente para WAV PCM legível.")
             return
+        self.stop(announce=False)
+        if kind=='dubbed' and getattr(event,'state',0) & 5:
+            track=self.audio_edit_working[kind]
+            frame=round(self._waveform_x_to_seconds(kind,event.x)*track['sample_rate'])
+            clip=next((c for c in self._track_clips(track) if c.start<=frame<c.end(self._edit_frame_bytes(track))),None)
+            if clip is not None:self._select_clip(clip,event.state)
+            return
+        self.selected_clip_ids=set();self.clip_selection_anchor=None
+        for other_kind in ("original", "dubbed"):
+            if other_kind != kind:
+                self.waveform_selection_ranges[other_kind] = None
+                self._draw_waveform(other_kind)
         self.waveform_drag_kind = kind
         self.waveform_drag_start_x = float(getattr(event, "x", 0.0))
         start_seconds = self._waveform_x_to_seconds(kind, self.waveform_drag_start_x)
         self.waveform_selection_ranges[kind] = (start_seconds, start_seconds)
         self.waveform_selection_kind = kind
         self._draw_waveform(kind)
+        self._draw_clip_timeline()
         self._update_audio_edit_buttons()
 
     def _on_waveform_motion(self, kind: str, event) -> None:
@@ -954,6 +1244,7 @@ class AudioPlayerManager:
         self.waveform_selection_ranges[kind] = (start_seconds, end_seconds)
         self.waveform_selection_kind = kind
         self._draw_waveform(kind)
+        self._draw_clip_timeline()
 
     def _on_waveform_release(self, kind: str, event) -> None:
         if not self.audio_edit_mode or self.waveform_drag_kind != kind:
@@ -992,10 +1283,38 @@ class AudioPlayerManager:
         return self._toggle_edit_play_pause(event)
 
 
+    def _publish_audio_clip(self):
+        target = getattr(self, "clipboard_target", None)
+        if target is not None and self.audio_clip_buffer:
+            target.audio_clip_buffer = dict(self.audio_clip_buffer)
+            target._update_audio_edit_buttons()
+            target._set_audio_edit_status("Áudio da parte copiado. Em EDITAR, clique no ponto desejado do DUBLADO e use COLAR.")
+
+    def _copy_whole_part(self):
+        if not self.audio_edit_mode:
+            self._toggle_audio_edit()
+        track = self.audio_edit_working.get("dubbed")
+        if not self.audio_edit_mode or track is None:
+            return
+        duration = len(track["frames"]) / self._edit_frame_bytes(track) / track["sample_rate"]
+        self.waveform_selection_kind = "dubbed"
+        self.waveform_selection_ranges["dubbed"] = (0.0, duration)
+        self._draw_waveform("dubbed")
+        self._draw_clip_timeline()
+        self._copy_audio_selection()
+
     def _copy_audio_selection(self, _event=None):
         if not self.audio_edit_mode:
             return None
         kind = self.waveform_selection_kind or self._focused_waveform_kind()
+        clips=self._selected_dubbed_clips() if kind=='dubbed' else []
+        if clips:
+            track=self.audio_edit_working['dubbed']
+            self.audio_clip_buffer={key:track[key] for key in ('channels','sample_width','sample_rate')}
+            self.audio_clip_buffer.update(frames=b''.join(c.pcm for c in clips),source_kind='dubbed')
+            self._publish_audio_clip();self._update_audio_edit_buttons()
+            self._set_audio_edit_status(f'{len(clips)} trecho(s) copiado(s) na ordem da faixa.')
+            return 'break'
         selected = self._edit_selection_frames(kind) if kind else None
         if selected is None:
             self._set_audio_edit_status("Selecione um trecho em ORIGINAL ou DUBLADO para copiar.")
@@ -1013,11 +1332,14 @@ class AudioPlayerManager:
             "sample_rate": track["sample_rate"],
             "source_kind": kind,
         }
+        self._publish_audio_clip()
         self._set_audio_edit_status(f"Trecho copiado de {kind}: {self._format_wave_duration((end_frame - start_frame) / track['sample_rate'])}.")
         self._update_audio_edit_buttons()
         return "break"
 
     def _cut_audio_selection(self, _event=None):
+        if self._selected_dubbed_clips():
+            self._copy_audio_selection();self._delete_selected_clips();return 'break'
         if not self.audio_edit_mode:
             return None
         kind = self.waveform_selection_kind or self._focused_waveform_kind()
@@ -1041,7 +1363,9 @@ class AudioPlayerManager:
             "sample_rate": track["sample_rate"],
             "source_kind": kind,
         }
-        self._set_edit_frames(kind, track, track["frames"][:start_byte] + track["frames"][end_byte:])
+        self._publish_audio_clip()
+        clips = paste_clip(self._track_clips(track), start_frame, end_frame, b"", frame_bytes)
+        self._set_edit_frames(kind, track, track["frames"][:start_byte] + track["frames"][end_byte:], clips=clips)
         self._set_audio_edit_status(f"Trecho cortado de DUBLADO: {self._format_wave_duration((end_frame - start_frame) / track['sample_rate'])}.")
         return "break"
 
@@ -1053,6 +1377,7 @@ class AudioPlayerManager:
         if kind != "dubbed":
             self._set_audio_edit_status("Por segurança, DELETE altera somente a faixa DUBLADO. ORIGINAL é protegido.")
             return "break"
+        if self._delete_selected_clips():return "break"
         selected = self._edit_selection_frames(kind)
         if selected is None:
             self._set_audio_edit_status("Selecione um trecho na onda DUBLADO para excluir.")
@@ -1064,7 +1389,8 @@ class AudioPlayerManager:
         start_byte = start_frame * frame_bytes
         end_byte = end_frame * frame_bytes
         removed_duration = (end_frame - start_frame) / max(1, int(track["sample_rate"]))
-        self._set_edit_frames(kind, track, track["frames"][:start_byte] + track["frames"][end_byte:])
+        clips = paste_clip(self._track_clips(track), start_frame, end_frame, b"", frame_bytes)
+        self._set_edit_frames(kind, track, track["frames"][:start_byte] + track["frames"][end_byte:], clips=clips)
         self._set_audio_edit_status(f"Trecho excluído do DUBLADO: {self._format_wave_duration(removed_duration)}. Use SALVAR para confirmar.")
         return "break"
 
@@ -1096,15 +1422,313 @@ class AudioPlayerManager:
         _track, start_frame, end_frame, _selected_frame_bytes = selected
         start_byte = start_frame * frame_bytes
         end_byte = end_frame * frame_bytes
-        new_frames = target["frames"][:start_byte] + clip["frames"] + target["frames"][end_byte:]
-        self._set_edit_frames("dubbed", target, new_frames)
+        selected_clips=self._selected_dubbed_clips()
+        if len(selected_clips)>1:
+            new_frames=target['frames'];clips=self._track_clips(target)
+            for selected_clip in reversed(selected_clips):
+                end=selected_clip.end(frame_bytes)
+                clips=paste_clip(clips,selected_clip.start,end,b'',frame_bytes)
+                new_frames=new_frames[:selected_clip.start*frame_bytes]+new_frames[end*frame_bytes:]
+            start_frame=selected_clips[0].start;start_byte=start_frame*frame_bytes
+            clips=paste_clip(clips,start_frame,start_frame,clip['frames'],frame_bytes)
+            new_frames=new_frames[:start_byte]+clip['frames']+new_frames[start_byte:]
+        else:
+            new_frames = target["frames"][:start_byte] + clip["frames"] + target["frames"][end_byte:]
+            clips = paste_clip(self._track_clips(target), start_frame, end_frame, clip["frames"], frame_bytes)
+        self._set_edit_frames("dubbed", target, new_frames, clips=clips)
         self._set_audio_edit_status(f"Trecho colado no DUBLADO: {self._format_wave_duration(len(clip['frames']) / frame_bytes / target['sample_rate'])}.")
         return "break"
+
+    def _process_scene_audio_edit(self, duration_factor=None, volume_db=None):
+        if not self.audio_edit_mode or getattr(self, "audio_transform_busy", False):
+            return
+        track = self.audio_edit_working.get("dubbed")
+        if track is None or not track.get("frames"):
+            self._set_audio_edit_status("Não há áudio DUBLADO editável nesta cena.")
+            return
+        self.stop(announce=False)
+        self.audio_transform_busy = True
+        self._update_audio_edit_buttons()
+        self._set_audio_edit_status("Processando DUBLADO…")
+        snapshot = dict(track)
+        clip_snapshot = self._track_clips(track)
+        duration_base=None;duration_ratio=None
+        if duration_factor is not None and volume_db is None:
+            duration_base=track.get('duration_base')
+            if duration_base is None:
+                duration_base=dict(snapshot,clips=clip_snapshot)
+                duration_base.pop('duration_base',None);duration_base.pop('duration_ratio',None)
+            # Add one percentage point of the same base per click; + then - restores it.
+            duration_ratio=round(track.get('duration_ratio',1.0)+(duration_factor-1.0),8)
+        window = self.window
+        outcome = {}
+        done = threading.Event()
+        def work():
+            try:
+                if volume_db is not None:
+                    outcome["frames"],outcome["clips"],outcome["gain_db"]=process_scene_volume(snapshot,volume_db)
+                else:
+                    outcome["frames"], outcome["clips"] = process_scene_audio(duration_base if duration_base is not None else snapshot, self.project_root, duration_ratio if duration_ratio is not None else duration_factor, preserve_clips=True)
+            except Exception as exc:
+                outcome["error"] = str(exc)
+            finally:
+                done.set()
+        def finish():
+            if not done.is_set():
+                self.parent.after(75, finish)
+                return
+            self.audio_transform_busy = False
+            if self.window is not window or not self.audio_edit_mode or self.audio_edit_working.get("dubbed") is not track:
+                self._update_audio_edit_buttons()
+                return
+            if track["frames"] != snapshot["frames"] or self._track_clips(track) != clip_snapshot:
+                self._set_audio_edit_status("O áudio mudou durante o processamento. Repita o ajuste.")
+            elif "error" in outcome:
+                self._set_audio_edit_status("Falha no ajuste: " + outcome["error"])
+                messagebox.showerror("Editar áudio", outcome["error"], parent=self.window)
+            else:
+                if outcome["frames"] != track["frames"]:
+                    self._set_edit_frames("dubbed", track, outcome["frames"], clips=outcome["clips"])
+                if duration_base is not None:
+                    track['duration_base']=duration_base;track['duration_ratio']=duration_ratio
+                if volume_db is not None:
+                    gain=outcome['gain_db']
+                    label=f"Volume do DUBLADO: {gain:+.2f} dB aplicado"
+                    if volume_db>0 and gain<volume_db-0.001:
+                        label+=" (limite seguro atingido ou áudio silencioso)"
+                else:
+                    label = "Silêncio das extremidades removido" if duration_factor is None else f"Duração: {duration_ratio*100:.0f}% da base; método da pasta maior, sem reprocessar cliques anteriores"
+                self._set_audio_edit_status(label + ". Divisões preservadas. Ouça o resultado e use SALVAR. DESFAZER reverte o ajuste.")
+            self._update_audio_edit_buttons()
+        threading.Thread(target=work, daemon=True).start()
+        self.parent.after(75, finish)
+
+    def _split_dubbed_clip(self, _event=None):
+        if not self.audio_edit_mode or getattr(self, "audio_transform_busy", False):
+            return "break"
+        track = self.audio_edit_working.get("dubbed")
+        selection = self.waveform_selection_ranges.get("dubbed")
+        if track is None or selection is None or self.waveform_selection_kind != "dubbed":
+            self._set_audio_edit_status("Clique no ponto desejado da onda DUBLADO e use DIVIDIR ou Ctrl+I.")
+            return "break"
+        try:
+            frame = int(round(selection[1] * track["sample_rate"]))
+            clips = split_clip(self._track_clips(track), frame, self._edit_frame_bytes(track))
+            self._set_edit_frames("dubbed", track, track["frames"], clips=clips)
+            self._set_audio_edit_status("Trecho dividido. Arraste uma barrinha acima da onda para mover. Espaços vazios viram silêncio.")
+        except ValueError as exc:
+            self._set_audio_edit_status(str(exc))
+        return "break"
+
+    def _clip_timeline_seconds(self):
+        return max(0.1, float(self.waveform_reference_duration or 0.0))
+
+    def _selected_dubbed_clips(self):
+        if not self.audio_edit_mode or self.waveform_selection_kind != 'dubbed':return []
+        track=self.audio_edit_working.get('dubbed')
+        ids=getattr(self,'selected_clip_ids',set())
+        return sorted((c for c in self._track_clips(track) if c.id in ids),key=lambda c:c.start) if track else []
+
+    def _select_clip(self,clip,state=0):
+        track=self.audio_edit_working['dubbed'];clips=sorted(self._track_clips(track),key=lambda c:c.start)
+        ids=set(getattr(self,'selected_clip_ids',set()))
+        if state & 1:
+            anchor=getattr(self,'clip_selection_anchor',None)
+            order=[c.id for c in clips]
+            first=order.index(anchor) if anchor in order else order.index(clip.id)
+            last=order.index(clip.id)
+            chosen=set(order[min(first,last):max(first,last)+1])
+            ids=ids|chosen if state & 4 else chosen
+            if anchor not in order:self.clip_selection_anchor=clip.id
+        elif state & 4:
+            ids.symmetric_difference_update({clip.id});self.clip_selection_anchor=clip.id
+        else:
+            ids={clip.id};self.clip_selection_anchor=clip.id
+        self.selected_clip_ids=ids
+        self._sync_clip_selection()
+
+    def _sync_clip_selection(self):
+        self.waveform_selection_kind='dubbed';self.waveform_selection_ranges['original']=None
+        clips=self._selected_dubbed_clips();track=self.audio_edit_working['dubbed']
+        self.waveform_selection_ranges['dubbed']=(clips[0].start/track['sample_rate'],clips[-1].end(self._edit_frame_bytes(track))/track['sample_rate']) if clips else None
+        self.waveform_drag_kind=None;self.clip_drag=None
+        self._draw_waveform('original');self._draw_waveform('dubbed');self._draw_clip_timeline();self._update_audio_edit_buttons()
+        self._set_audio_edit_status(f'{len(clips)} trecho(s) selecionado(s). Ctrl+clique alterna; Shift+clique seleciona intervalo.')
+
+    def _select_all_dubbed_clips(self,event=None):
+        if not self.audio_edit_mode or getattr(self,'audio_transform_busy',False):return None
+        widget=getattr(event,'widget',None)
+        if widget is not None:
+            try:
+                if widget.winfo_class() in {'Text','Entry','TEntry','TCombobox','Spinbox','TSpinbox'}:return None
+            except AttributeError:pass
+        track=self.audio_edit_working.get('dubbed')
+        if track is None:return None
+        clips=sorted(self._track_clips(track),key=lambda c:c.start)
+        self.selected_clip_ids={c.id for c in clips};self.clip_selection_anchor=clips[0].id if clips else None
+        self.stop(announce=False);self._sync_clip_selection()
+        return 'break'
+
+    def _delete_selected_clips(self):
+        selected=self._selected_dubbed_clips()
+        if not selected:return False
+        track=self.audio_edit_working['dubbed'];fb=self._edit_frame_bytes(track)
+        clips=self._track_clips(track);raw=track['frames']
+        for clip in reversed(selected):
+            end=clip.end(fb)
+            clips=paste_clip(clips,clip.start,end,b'',fb)
+            raw=raw[:clip.start*fb]+raw[end*fb:]
+        self._set_edit_frames('dubbed',track,raw,clips=clips)
+        self._set_audio_edit_status(f'{len(selected)} trecho(s) excluído(s). DESFAZER restaura.')
+        return True
+
+    def _clip_is_selected(self, clip, track):
+        if getattr(self,'selected_clip_ids',set()):return clip.id in self.selected_clip_ids and self.waveform_selection_kind=='dubbed'
+        drag = getattr(self, "clip_drag", None)
+        if drag is not None:
+            return clip.id == drag["id"]
+        selected = self.waveform_selection_ranges.get("dubbed")
+        if self.waveform_selection_kind != "dubbed" or selected is None:
+            return False
+        start, end = sorted(round(t * track["sample_rate"]) for t in selected)
+        return start == clip.start and end == clip.end(self._edit_frame_bytes(track))
+
+    @staticmethod
+    def _selection_dark_color(color):
+        try:
+            return "#" + "".join(f"{max(0, int(color[i:i+2], 16) // 2):02x}" for i in (1, 3, 5))
+        except (TypeError, ValueError):
+            return "#064E3B"
+
+    def _draw_clip_timeline(self, clips=None):
+        canvas = getattr(self, "clip_timeline_canvas", None)
+        if canvas is None:
+            return
+        try:
+            self._configure_audio_view(canvas)
+            canvas.delete("all")
+            canvas.configure(bg=self.theme.get("input", "#FFFFFF"))
+            track = self.audio_edit_working.get("dubbed") if self.audio_edit_mode else None
+            if track is None:
+                canvas.create_text(6, 13, text="EDITAR → clique na onda → DIVIDIR (Ctrl+I) → arraste as barras", anchor="w", fill=self.theme.get("muted", "#64748B"), font=("Segoe UI", 8))
+                return
+            clips = self._track_clips(track) if clips is None else clips
+            width = max(180, canvas.winfo_width()) - 4
+            scale = width * getattr(self, "waveform_zoom", 1.0) / self._clip_timeline_seconds() / track["sample_rate"]
+            colors = button_style(self.theme, "success")
+            frame_bytes = self._edit_frame_bytes(track)
+            for index, clip in enumerate(clips):
+                left, right = 2 + clip.start * scale, 2 + clip.end(frame_bytes) * scale
+                tag = "clip_" + str(clip.id)
+                canvas.create_rectangle(left, 3, right, 24, fill=self._selection_dark_color(colors["bg"]) if self._clip_is_selected(clip, track) else colors["bg"], outline=self.theme.get("text", "#1F2937"), width=1, tags=(tag,))
+                if right - left > 40:
+                    canvas.create_text((left+right)/2, 13, text=f"↔ {clip.id}", fill="#FFFFFF" if self._clip_is_selected(clip, track) else colors["fg"], font=("Segoe UI", 8, "bold"), tags=(tag,))
+        except Exception:
+            pass
+
+    def _clip_drag_press(self, event):
+        self.clip_drag = None
+        if not self.audio_edit_mode or getattr(self, "audio_transform_busy", False):
+            return
+        track = self.audio_edit_working.get("dubbed")
+        if track is None:
+            return
+        canvas = self.clip_timeline_canvas
+        canvas.focus_set()
+        width = max(180, canvas.winfo_width()) - 4
+        frames_per_pixel = self._clip_timeline_seconds() * track["sample_rate"] / (width * getattr(self, "waveform_zoom", 1.0))
+        position = (self._audio_canvas_x(canvas, event.x) - 2) * frames_per_pixel
+        clips = self._track_clips(track)
+        selected = next((c for c in clips if c.start <= position < c.end(self._edit_frame_bytes(track))), None)
+        if selected is None:
+            self.selected_clip_ids=set();self.clip_selection_anchor=None
+            self.waveform_selection_ranges["dubbed"] = None
+            self.waveform_selection_kind = None
+            self._draw_clip_timeline()
+            self._draw_waveform("dubbed")
+            self._update_audio_edit_buttons()
+            return
+        if getattr(event,'state',0) & 5 or selected.id not in getattr(self,'selected_clip_ids',set()):
+            self._select_clip(selected,getattr(event,'state',0))
+        if getattr(event,'state',0) & 5:return
+        self.waveform_selection_ranges["original"] = None
+        self._draw_waveform("original")
+        self.waveform_selection_ranges["dubbed"] = (selected.start / track["sample_rate"], selected.end(self._edit_frame_bytes(track)) / track["sample_rate"])
+        self.waveform_selection_kind = "dubbed"
+        self.stop(announce=False)
+        self.clip_drag = {"track": track, "clips": clips, "id": selected.id, "ids": set(getattr(self,"selected_clip_ids",set())) or {selected.id}, "x": event.x, "start": selected.start, "scale": frames_per_pixel, "preview": clips, "frames": track["frames"]}
+        self._draw_clip_timeline()
+        self._draw_waveform("dubbed")
+        self._update_audio_edit_buttons()
+        self._set_audio_edit_status("Trecho selecionado (escuro). DELETE exclui; COPIAR copia. Arraste para mover.")
+
+    def _clip_drag_motion(self, event):
+        drag = getattr(self, "clip_drag", None)
+        if drag is None or not self.audio_edit_mode:
+            return
+        track = drag["track"]
+        if self.audio_edit_working.get("dubbed") is not track or track["frames"] != drag["frames"] or self._track_clips(track) != drag["clips"]:
+            self.clip_drag = None
+            return
+        if not drag.get("moving") and abs(event.x - drag["x"]) < 4:
+            return
+        drag["moving"] = True
+        frame_bytes = self._edit_frame_bytes(track)
+        position = max(0, round(drag["start"] + (event.x - drag["x"]) * drag["scale"]))
+        # Limita a prévia antes de reservar memória para o silêncio.
+        max_bytes = max(256*1024*1024, len(track["frames"]) * 4)
+        if (position * frame_bytes + len(track["frames"])) > max_bytes:
+            self._set_audio_edit_status("Deslocamento muito grande; aproxime o trecho.")
+            return
+        if len(drag.get('ids',()))>1:
+            preview=move_clip_group(drag['clips'],drag['ids'],round((event.x-drag['x'])*drag['scale']),frame_bytes)
+        else:
+            preview = move_clip(drag["clips"], drag["id"], position, frame_bytes)
+        drag["preview"] = preview
+        self._draw_clip_timeline(preview)
+        selected = next(c for c in preview if c.id == drag["id"])
+        self._set_audio_edit_status(f"Trecho em {self._format_wave_duration(selected.start / track['sample_rate'])}. Solte para aplicar; DESFAZER reverte.")
+
+    def _clip_drag_release(self, event):
+        self._clip_drag_motion(event)
+        drag = getattr(self, "clip_drag", None)
+        self.clip_drag = None
+        if drag is None or not self.audio_edit_mode:
+            return
+        track = drag["track"]
+        clips = drag["preview"]
+        if clips == drag["clips"]:
+            self._draw_clip_timeline()
+            return
+        try:
+            frame_bytes = self._edit_frame_bytes(track)
+            raw = render_clips(clips, frame_bytes, track["sample_width"], len(track["frames"]) // frame_bytes, max(256*1024*1024, len(track["frames"])*4))
+            self._set_edit_frames("dubbed", track, raw, clips=clips)
+            self.selected_clip_ids=set(drag.get('ids',{drag['id']}))
+            self.clip_selection_anchor=drag['id']
+            moved = next(c for c in clips if c.id == drag["id"])
+            self.waveform_selection_ranges["dubbed"] = (moved.start / track["sample_rate"], moved.end(frame_bytes) / track["sample_rate"])
+            self.waveform_selection_kind = "dubbed"
+            self._draw_clip_timeline()
+            self._draw_waveform("dubbed")
+            self._update_audio_edit_buttons()
+            self._sync_clip_selection()
+            self._set_audio_edit_status("Trechos reposicionados; espaços vazios são silêncio. Ouça e use SALVAR. DESFAZER reverte.")
+        except (ValueError, MemoryError) as exc:
+            self._set_audio_edit_status("Não foi possível mover o trecho: " + str(exc))
+            self._draw_clip_timeline()
 
     def _update_audio_edit_buttons(self) -> None:
         has_selection = any(selection is not None for selection in self.waveform_selection_ranges.values())
         has_nonempty_selection = any(selection is not None and abs(float(selection[1]) - float(selection[0])) > 0.0001 for selection in self.waveform_selection_ranges.values())
+        transform_enabled = self.audio_edit_mode and bool(self.audio_edit_working.get("dubbed")) and not getattr(self, "audio_transform_busy", False)
         for button, enabled in (
+            (getattr(self, "audio_volume_minus_button", None), transform_enabled),
+            (getattr(self, "audio_volume_plus_button", None), transform_enabled),
+            (getattr(self, "audio_split_button", None), transform_enabled),
+            (getattr(self, "audio_duration_minus_button", None), transform_enabled),
+            (getattr(self, "audio_duration_plus_button", None), transform_enabled),
+            (getattr(self, "audio_trim_silence_button", None), transform_enabled),
             (self.audio_undo_button, self.audio_edit_mode and bool(self.audio_edit_undo_stack)),
             (self.audio_redo_button, self.audio_edit_mode and bool(self.audio_edit_redo_stack)),
             (self.audio_cut_button, self.audio_edit_mode and self.waveform_selection_kind == "dubbed" and has_nonempty_selection),
@@ -1130,13 +1754,14 @@ class AudioPlayerManager:
                 return
             self.stop(announce=False)
             self.audio_edit_mode = True
+            self.selected_clip_ids=set();self.clip_selection_anchor=None
             self.audio_edit_undo_stack = []
             self.audio_edit_redo_stack = []
             self.audio_edit_base_frames = {kind: bytes(track.get("frames", b"")) for kind, track in self.audio_edit_working.items()}
             self.waveform_selection_ranges = {"original": None, "dubbed": None}
             self.waveform_selection_kind = None
             self._refresh_waveforms()
-            self._set_audio_edit_status("Modo EDITAR ativo. Arraste sobre uma onda; ORIGINAL é somente leitura e COLAR aplica no DUBLADO.")
+            self._set_audio_edit_status("EDITAR: clique no DUBLADO e use DIVIDIR/Ctrl+I. Arraste as barras para mover; arraste a onda para selecionar.")
         else:
             if self.audio_edit_dirty:
                 try:
@@ -1267,6 +1892,18 @@ class AudioPlayerManager:
         self._start_paths([path], kind, start_seconds=max(0.0, float(start_seconds or 0.0)))
         return True
 
+    def _edit_selection_start(self, kind):
+        selected = self.waveform_selection_ranges.get(kind)
+        if selected is None:
+            selected = self.waveform_selection_ranges.get(self.waveform_selection_kind)
+        start = max(0.0, min(float(t) for t in selected)) if selected else 0.0
+        track = self.audio_edit_working.get(kind)
+        if track is not None:
+            rate = max(1, track["sample_rate"])
+            frames = len(track.get("frames", b"")) // self._edit_frame_bytes(track)
+            start = min(start, max(0, frames - 1) / rate)
+        return start
+
     def _toggle_edit_play_pause(self, _event=None):
         if not self.audio_edit_mode:
             return None
@@ -1274,14 +1911,15 @@ class AudioPlayerManager:
         if active_kind in {"original", "dubbed"} and self.waveform_active_path is not None:
             elapsed = max(0.0, time.monotonic() - self.waveform_active_started_at)
             paused_at = min(self.waveform_active_duration, self.waveform_active_offset + elapsed)
+            paused_path = self.waveform_active_path
             self.stop(announce=False, clear_pause=False)
             self.audio_paused_kind = active_kind
-            self.audio_paused_path = self.waveform_active_path
+            self.audio_paused_path = paused_path
             self.audio_paused_seconds = paused_at
             self._set_audio_edit_status(f"Pausado em {self._format_wave_duration(paused_at)}. Pressione Espaço para continuar.")
             return "break"
-        kind = self.audio_paused_kind or self._focused_waveform_kind() or "dubbed"
-        start_seconds = self.audio_paused_seconds if self.audio_paused_kind == kind else 0.0
+        kind = self.audio_paused_kind or self.waveform_selection_kind or self._focused_waveform_kind() or "dubbed"
+        start_seconds = self.audio_paused_seconds if self.audio_paused_kind == kind else self._edit_selection_start(kind)
         if self._play_edit_preview(kind, start_seconds):
             self.audio_paused_kind = None
             self.audio_paused_path = None
@@ -1316,6 +1954,13 @@ class AudioPlayerManager:
                     raise wave.Error("quantidade de frames WAV salva não confere")
             backup = self._archive_audio_edit_backup(target)
             os.replace(temporary, target)
+            layout_warning = ""
+            try:
+                self._save_clip_layout(track)
+            except OSError as exc:
+                layout_warning = f" Áudio salvo, mas as divisões não puderam ser registradas: {exc}"
+            for item in self.audio_edit_working.values():
+                item["saved_clips"] = self._track_clips(item)
             preview_path = self.audio_edit_preview_path
             self.audio_edit_preview_path = None
             if preview_path is not None:
@@ -1333,7 +1978,7 @@ class AudioPlayerManager:
             self._refresh_waveforms()
             self._update_mode_buttons()
             suffix = f" Backup: {backup.name}." if backup is not None else ""
-            self._set_audio_edit_status(f"DUBLADO salvo com segurança.{suffix}")
+            self._set_audio_edit_status(f"DUBLADO salvo com segurança.{suffix}{layout_warning}")
             self._update_audio_edit_buttons()
         except (OSError, EOFError, wave.Error, ValueError) as exc:
             try:
@@ -1349,12 +1994,104 @@ class AudioPlayerManager:
         seconds_value, hundredths = divmod(remainder, 100)
         return f"{minutes:02d}:{seconds_value:02d}.{hundredths:02d}"
 
+    @staticmethod
+    def _audio_canvas_x(canvas, x):
+        try:
+            return float(canvas.canvasx(x))
+        except (AttributeError, TypeError, ValueError):
+            return float(x)
+
+    def _audio_view_canvases(self):
+        return list(self.waveform_canvases.values()) + ([self.clip_timeline_canvas] if getattr(self, "clip_timeline_canvas", None) is not None else [])
+
+    def _configure_audio_view(self, canvas):
+        try:
+            width = max(180, canvas.winfo_width())
+            extent = max(width, (width - 4) * getattr(self, "waveform_zoom", 1.0) + 4)
+            canvas.configure(scrollregion=(0, 0, extent, canvas.winfo_height()))
+            fraction = min(max(0, getattr(self, "waveform_scroll", 0.0)), max(0, 1 - width / extent))
+            canvas.xview_moveto(fraction)
+        except (AttributeError, TypeError, ValueError):
+            pass
+
+    def _scroll_audio_views(self, *args):
+        canvases = self._audio_view_canvases()
+        if not canvases:
+            return
+        canvases[0].xview(*args)
+        self.waveform_scroll = canvases[0].xview()[0]
+        for canvas in canvases[1:]:
+            canvas.xview_moveto(self.waveform_scroll)
+        for kind in self.waveform_canvases:
+            self._draw_waveform(kind)
+        self._draw_clip_timeline()
+
+    def _set_waveform_zoom(self, zoom, anchor_canvas=None, anchor_x=None):
+        zoom = min(8.0, max(0.125, float(zoom)))
+        old = getattr(self, "waveform_zoom", 1.0)
+        if abs(zoom-old) < 0.00001:
+            return
+        if getattr(self, "clip_drag", None) is not None or self.waveform_drag_kind is not None:
+            return
+        canvases = self._audio_view_canvases()
+        reference = anchor_canvas or (canvases[0] if canvases else None)
+        left = 0.0
+        if reference is not None:
+            width = max(180, reference.winfo_width())
+            anchor = width/2 if anchor_x is None else float(anchor_x)
+            position = (self._audio_canvas_x(reference, anchor)-2) / ((width-4)*old)
+            extent = max(width,(width-4)*zoom+4)
+            left = max(0, min(1-width/extent, (2+position*(width-4)*zoom-anchor)/extent))
+        self.waveform_zoom = zoom
+        self.waveform_scroll = left
+        variable = getattr(self, "waveform_zoom_var", None)
+        if variable is not None and abs(float(variable.get())-math.log2(zoom)) > 0.001:
+            variable.set(math.log2(zoom))
+        status = getattr(self, "waveform_zoom_status", None)
+        if status is not None:
+            status.set(f"{zoom*100:.0f}%")
+        for kind in self.waveform_canvases:
+            self._draw_waveform(kind)
+        self._draw_clip_timeline()
+        self._draw_zoom_slider()
+
+    def _zoom_audio_wheel(self, event):
+        delta = getattr(event, "delta", 0)
+        steps = max(-4, min(4, delta/120)) if delta else (1 if getattr(event, "num", 0)==4 else -1)
+        self._set_waveform_zoom(getattr(self, "waveform_zoom", 1.0) * 1.25**steps, event.widget, event.x)
+        return "break"
+
+    def _draw_zoom_slider(self):
+        canvas = getattr(self, "waveform_zoom_slider", None)
+        if canvas is None:
+            return
+        width = max(80, canvas.winfo_width())
+        canvas.delete("all")
+        color = button_style(self.theme, "success")["bg"]
+        center = width / 2
+        x = 14 + (math.log2(getattr(self, "waveform_zoom", 1.0)) + 3) / 6 * (width-28)
+        canvas.create_line(14, 13, width-14, 13, fill=self.theme.get("border", "#64748B"), width=4)
+        canvas.create_line(center, 7, center, 19, fill=self.theme.get("muted", "#64748B"), width=1)
+        canvas.create_oval(x-7, 6, x+7, 20, fill=color, outline=self.theme.get("text", "#FFFFFF"), width=1)
+
+    def _zoom_slider_pointer(self, event):
+        event.widget.focus_set()
+        width = max(80, event.widget.winfo_width())
+        fraction = max(0.0, min(1.0, (event.x-14)/(width-28)))
+        self._set_waveform_zoom(2**(-3+6*fraction))
+        return "break"
+
+    def _bind_audio_zoom(self, canvas):
+        canvas.bind("<Control-MouseWheel>", self._zoom_audio_wheel)
+        canvas.bind("<Control-Button-4>", self._zoom_audio_wheel)
+        canvas.bind("<Control-Button-5>", self._zoom_audio_wheel)
+
     def _waveform_plot_width(self, kind: str, width: int) -> float:
         data = self.waveform_data.get(kind) or {}
         duration = max(0.0, float(data.get("duration", 0.0) or 0.0))
         reference_duration = max(duration, float(self.waveform_reference_duration or 0.0))
         duration_ratio = duration / reference_duration if reference_duration > 0 else 1.0
-        return max(8.0, (max(180, int(width)) - 4) * min(1.0, duration_ratio))
+        return max(8.0, (max(180, int(width)) - 4) * getattr(self, "waveform_zoom", 1.0) * min(1.0, duration_ratio))
 
     def _seek_from_waveform(self, kind: str, event) -> None:
         """Inicia a faixa no instante correspondente ao ponto clicado."""
@@ -1375,7 +2112,7 @@ class AudioPlayerManager:
             plot_width = self._waveform_plot_width(kind, width)
             start_x = 2.0
             end_x = start_x + plot_width
-            click_x = max(start_x, min(float(event.x), end_x))
+            click_x = max(start_x, min(self._audio_canvas_x(canvas, event.x), end_x))
             start_seconds = duration * (click_x - start_x) / max(1.0, plot_width)
         except (AttributeError, TypeError, ValueError, tk.TclError):
             return
@@ -1387,9 +2124,11 @@ class AudioPlayerManager:
         if canvas is None:
             return
         try:
+            self._configure_audio_view(canvas)
             canvas.delete("waveform")
             canvas.delete("waveform_selection")
             canvas.delete("waveform_end")
+            canvas.delete("clip_boundary")
             canvas.delete("progress")
             width = max(180, int(canvas.winfo_width()))
             height = max(36, int(canvas.winfo_height()))
@@ -1409,20 +2148,34 @@ class AudioPlayerManager:
             except Exception:
                 color = "#7C3AED" if kind == "original" else "#15803D"
             plot_width = self._waveform_plot_width(kind, width)
-            coords = []
-            for index, value in enumerate(samples):
-                x = 2 + plot_width * index / max(1, len(samples) - 1)
-                coords.extend((x, center - value * amplitude, x, center + value * amplitude))
-            for index in range(0, len(coords), 4):
-                canvas.create_line(coords[index], coords[index + 1], coords[index + 2], coords[index + 3], fill=color, width=1, tags="waveform")
-            end_x = min(width - 2, 2 + plot_width)
+            # Draw only the visible peaks; retain detail at high zoom without thousands of Tk items.
+            view_left = self._audio_canvas_x(canvas, 0)
+            view_right = view_left + width
+            count = max(1, len(samples)-1)
+            first = max(0, int((view_left-2) / max(1, plot_width) * count)-1)
+            last = min(len(samples), int((view_right-2) / max(1, plot_width) * count)+2)
+            stride = max(1, int(len(samples) / max(1, plot_width)))
+            for index in range(first, last, stride):
+                value = max(samples[index:min(index+stride, len(samples))])
+                x = 2 + plot_width * index / count
+                canvas.create_line(x, center-value*amplitude, x, center+value*amplitude, fill=color, width=max(1, plot_width*stride/count), tags="waveform")
+            end_x = 2 + plot_width
             canvas.create_line(end_x, 3, end_x, height - 3, fill=color, width=4, tags="waveform_end")
+            if kind == "dubbed" and self.audio_edit_mode and self.audio_edit_working.get(kind):
+                track = self.audio_edit_working[kind]
+                for clip in self._track_clips(track):
+                    x = 2 + plot_width * (clip.start / track["sample_rate"]) / max(0.0001, data["duration"])
+                    canvas.create_line(x, 1, x, height-1, fill=self.theme.get("text", "#1F2937"), dash=(3, 3), tags="clip_boundary")
             selection = self.waveform_selection_ranges.get(kind) if self.audio_edit_mode else None
-            if selection is not None:
+            selections=[selection] if selection is not None else []
+            if kind=='dubbed' and self._selected_dubbed_clips():
+                track=self.audio_edit_working[kind]
+                selections=[(c.start/track['sample_rate'],c.end(self._edit_frame_bytes(track))/track['sample_rate']) for c in self._selected_dubbed_clips()]
+            for selection in selections:
                 selection_start, selection_end = sorted((float(selection[0]), float(selection[1])))
                 selection_x1 = 2 + plot_width * selection_start / max(0.0001, float(data.get("duration", 0.0) or 0.0))
                 selection_x2 = 2 + plot_width * selection_end / max(0.0001, float(data.get("duration", 0.0) or 0.0))
-                canvas.create_rectangle(selection_x1, 3, selection_x2, height - 3, fill=color, stipple="gray25", outline=color, width=1, tags="waveform_selection")
+                canvas.create_rectangle(selection_x1, 3, selection_x2, height - 3, fill=self._selection_dark_color(color), outline=color, width=1, tags="waveform_selection")
                 canvas.tag_lower("waveform_selection", "waveform")
             if self.waveform_active_kind == kind:
                 progress = min(1.0, max(0.0, float(self.waveform_progress.get(kind, 0.0) or 0.0)))
@@ -1441,13 +2194,16 @@ class AudioPlayerManager:
         for kind, path in paths.items():
             working = self.audio_edit_working.get(kind) if self.audio_edit_mode else None
             if working is not None:
-                self.waveform_data[kind] = self._waveform_from_pcm(working.get("frames", b""), working.get("channels", 1), working.get("sample_width", 2), working.get("sample_rate", 1))
+                self.waveform_data[kind] = self._waveform_from_pcm(working.get("frames", b""), working.get("channels", 1), working.get("sample_width", 2), working.get("sample_rate", 1), points=5600)
             else:
-                self.waveform_data[kind] = self._read_waveform(path)
+                self.waveform_data[kind] = self._read_waveform(path, points=5600)
         self.waveform_reference_duration = max(
             (float((data or {}).get("duration", 0.0) or 0.0) for data in self.waveform_data.values()),
             default=0.0,
         )
+        if self.audio_edit_mode and self.audio_edit_working.get("dubbed"):
+            self.waveform_reference_duration *= 1.25
+        self._draw_clip_timeline()
         for kind in paths:
             data = self.waveform_data.get(kind)
             duration_var = self.waveform_duration_vars.get(kind)
@@ -1467,6 +2223,9 @@ class AudioPlayerManager:
         return path.stem if path is not None else None
 
     def _refresh_scene_text(self) -> None:
+        parts = getattr(self, "scene_parts_ui", None)
+        if parts is not None:
+            parts.refresh()
         if self.scene_text_box is None:
             return
         key = self._scene_text_key()
@@ -1499,6 +2258,12 @@ class AudioPlayerManager:
                         self.scene_text_status_var.set(f"Não foi possível carregar o texto: {exc}")
             else:
                 text_value = ""
+        if getattr(self, 'show_original_text', False) and key:
+            controller = getattr(self, 'translation_controller', None)
+            text_path = getattr(controller, 'original_text_by_stem', {}).get(key)
+            try: text_value = Path(text_path).read_text(encoding='utf-8-sig') if text_path else ''
+            except (OSError, UnicodeError): text_value = ''
+            title = 'TEXTO ORIGINAL — ' + key
         self.scene_text_path = Path(text_path).expanduser().resolve() if text_path else None
         try:
             self.scene_text_title_var.set(title)
@@ -1511,8 +2276,88 @@ class AudioPlayerManager:
                 self.scene_text_status_var.set("Texto carregado; edite e clique em SALVAR ALTERAÇÃO antes de redublar.") if self.scene_text_path is not None else self.scene_text_status_var.set("TXT da cena não encontrado.")
             if self.scene_text_save_button is not None:
                 self.scene_text_save_button.configure(state="normal" if callable(self.scene_text_saver) and self.scene_text_path is not None else "disabled")
+            if getattr(self, 'show_original_text', False):
+                self.scene_text_box.configure(state='disabled')
+                self.scene_text_save_button.configure(state='disabled')
+                self.scene_text_status_var.set('Texto original para consulta. A redublagem usa a tradução selecionada.')
+            self._refresh_scene_translation_folders()
         except Exception:
             pass
+
+    def _allow_translation_switch(self):
+        if getattr(self, 'show_original_text', False): return True
+        if self.scene_text_box is None or self.scene_text_path is None:return True
+        try:saved=self.scene_text_path.read_text(encoding='utf-8-sig')
+        except (OSError,UnicodeError):saved=''
+        if self.scene_text_box.get('1.0','end-1c').strip()==saved.strip():return True
+        return messagebox.askyesno('Texto não salvo','Descartar as alterações deste texto e trocar a tradução? Para mantê-las, escolha Não e use Salvar alteração.',parent=self.window)
+
+    def _choose_scene_translation(self):
+        controller=getattr(self,'translation_controller',None)
+        if controller is None or controller.busy or not self._allow_translation_switch():return
+        controller.select_other_translation_folder()
+        self._refresh_scene_translation_folders()
+        self._refresh_scene_text()
+
+    def _select_scene_translation_folder(self,folder):
+        controller=getattr(self,'translation_controller',None)
+        key=self._scene_text_key()
+        if controller is None or not key or controller.busy or not self._allow_translation_switch():return
+        self.show_original_text = False
+        controller.select_other_translation_subfolder(folder)
+        controller.refresh_other_translation_text(key)
+        controller.use_other_translation_var.set('1' if controller.selected_other_translation_file else '0')
+        self._refresh_scene_translation_folders()
+        self._refresh_scene_text()
+        if not controller.selected_other_translation_file and self.scene_text_status_var is not None:
+            self.scene_text_status_var.set('Esta pasta não tem TXT correspondente à cena. Tradução principal exibida.')
+
+    def _refresh_scene_translation_folders(self):
+        bar=getattr(self,'scene_translation_folders_bar',None)
+        controller=getattr(self,'translation_controller',None)
+        if bar is None or controller is None:return
+        try:
+            from .review_tab import other_translation_folders
+        except ImportError:
+            from review_tab import other_translation_folders
+        for child in bar.winfo_children():child.destroy()
+        root=controller.other_translation_root_dir
+        folders=[folder for folder in other_translation_folders(root) if (folder / (str(self._scene_text_key())+'.txt')).is_file()]
+        if (root / (str(self._scene_text_key())+'.txt')).is_file():folders.insert(0,root)
+        if not folders:
+            Label(bar,text='Nenhuma pasta em OUTRAS TRADUÇÕES',bg=self.theme.get('surface','#FFFFFF'),fg=self.theme.get('text','#111827')).grid(row=0,column=0,sticky='w')
+        for index,folder in enumerate(folders):
+            active=folder==controller.other_translation_dir and controller.use_other_translation_var.get()=='1'
+            button=Button(bar,text=folder.name,command=lambda path=folder:self._select_scene_translation_folder(path),relief='flat',font=('Segoe UI',8,'bold'),padx=7,pady=3)
+            apply_button_style(button,self.theme,'accent' if active else 'secondary')
+            button.grid(row=0,column=index,sticky='w',padx=(0,4),pady=0)
+        for col in range(3):bar.grid_columnconfigure(col,weight=0)
+
+    def _toggle_scene_translation(self):
+        controller=getattr(self,'translation_controller',None)
+        if controller is None:return
+        if not self._allow_translation_switch():
+            principal=controller.text_by_stem.get(self._scene_text_key())
+            controller.use_other_translation_var.set('0' if self.scene_text_path==principal else '1')
+            return
+        controller.refresh_other_translation_text(self._scene_text_key())
+        controller.on_other_translation_toggle()
+        self._refresh_scene_translation_folders()
+        self._refresh_scene_text()
+
+    def _show_main_scene_translation(self):
+        controller=getattr(self,'translation_controller',None)
+        if controller is None:return
+        if not self._allow_translation_switch():return
+        self.show_original_text = False
+        controller.use_other_translation_var.set('0')
+        self._refresh_scene_translation_folders()
+        self._refresh_scene_text()
+
+    def _show_original_scene_text(self):
+        if not self._allow_translation_switch(): return
+        self.show_original_text = True
+        self._refresh_scene_text()
 
     def _save_scene_text_from_window(self) -> None:
         key = self._scene_text_key()
@@ -1623,6 +2468,16 @@ class AudioPlayerManager:
         frame.pack_propagate(False)
         self.review_progress_frame = frame
         self.review_progress_widgets = [frame]
+        controller = getattr(self, 'translation_controller', None)
+        if controller is not None and hasattr(controller, 'control_generation'):
+            stop_controls = Frame(frame, bg=surface)
+            stop_controls.pack(side='right', padx=(6, 0))
+            for label, after_scene, role in [('PARAR APÓS CENA', True, 'warning'), ('CANCELAR', False, 'danger')]:
+                button = Button(stop_controls, text=i18n.tr(label),
+                                command=lambda after=after_scene: controller.control_generation(after),
+                                relief='flat', font=('Segoe UI', 7, 'bold'), padx=5, pady=3)
+                apply_button_style(button, self.theme, role)
+                button.pack(fill='x', pady=1)
         style = ttk.Style(self.window)
         clone_color = button_style(self.theme, "primary")["bg"] if button_style is not None else "#2563EB"
         dub_color = button_style(self.theme, "success")["bg"] if button_style is not None else "#15803D"
@@ -1635,7 +2490,7 @@ class AudioPlayerManager:
         clone_label.pack(fill="x")
         self.review_progress_widgets.append(clone_label)
         self.review_clone_var = DoubleVar(value=0.0)
-        self.review_clone_bar = ttk.Progressbar(clone_column, orient="horizontal", mode="determinate", maximum=100, variable=self.review_clone_var, style="AudioReviewClone.Horizontal.TProgressbar")
+        self.review_clone_bar = ttk.Progressbar(clone_column, length=100, orient="horizontal", mode="determinate", maximum=100, variable=self.review_clone_var, style="AudioReviewClone.Horizontal.TProgressbar")
         self.review_clone_bar.pack(fill="x", pady=(2, 0))
         dub_column = Frame(frame, bg=surface)
         dub_column.pack(side="left", fill="both", expand=True, padx=(4, 0))
@@ -1644,7 +2499,7 @@ class AudioPlayerManager:
         dub_label.pack(fill="x")
         self.review_progress_widgets.append(dub_label)
         self.review_dub_var = DoubleVar(value=0.0)
-        self.review_dub_bar = ttk.Progressbar(dub_column, orient="horizontal", mode="determinate", maximum=100, variable=self.review_dub_var, style="AudioReviewDub.Horizontal.TProgressbar")
+        self.review_dub_bar = ttk.Progressbar(dub_column, length=100, orient="horizontal", mode="determinate", maximum=100, variable=self.review_dub_var, style="AudioReviewDub.Horizontal.TProgressbar")
         self.review_dub_bar.pack(fill="x", pady=(2, 0))
         self._refresh_review_snapshot()
 
@@ -1659,8 +2514,8 @@ class AudioPlayerManager:
             available_height = max(600, int(window.winfo_screenheight()) - 80)
         except Exception:
             available_height = 760
-        window.geometry(f"1100x{min(600, available_height)}")
-        window.minsize(900, min(600, available_height))
+        window.geometry(f"{1100 if getattr(self, 'is_part_window', False) else 1220}x{min(600, available_height)}")
+        window.minsize(900 if getattr(self, "is_part_window", False) else 1020, min(600, available_height))
         window.resizable(True, True)
         # Mantém a decoração normal do Windows para que o botão nativo de
         # maximizar/restaurar apareça junto de minimizar e X FECHAR.
@@ -1670,6 +2525,8 @@ class AudioPlayerManager:
             pass
         window.protocol("WM_DELETE_WINDOW", self.close_window)
         window.bind("<space>", self._on_edit_space, add="+")
+        window.bind("<Control-a>", self._select_all_dubbed_clips, add="+")
+        window.bind("<Control-A>", self._select_all_dubbed_clips, add="+")
         try:
             window.lift()
             window.focus_force()
@@ -1691,18 +2548,45 @@ class AudioPlayerManager:
         self.window_content = Frame(window, bg=surface, bd=0, highlightthickness=0)
         self.window_content.pack(fill="both", expand=True, padx=3, pady=3)
         content = self.window_content
+        if not getattr(self, "is_part_window", False):
+            try:
+                from .scene_parts import ScenePartsUI
+            except ImportError:
+                from scene_parts import ScenePartsUI
+            if not hasattr(self, "scene_parts_ui"):
+                self.scene_parts_ui = ScenePartsUI(self)
+            content = self.scene_parts_ui.attach(content)
         self.waveform_panel = Frame(content, bg=surface, bd=1, relief="solid")
         self.waveform_panel.pack(side="top", fill="x", expand=False, padx=14, pady=(0, 8))
         self.waveform_widgets = [self.waveform_panel]
         waveform_title = Label(self.waveform_panel, text=i18n.tr("FORMAS DE ONDA E COMPRIMENTO"), bg=surface, fg=text, font=("Segoe UI", 9, "bold"), anchor="w")
         waveform_title.pack(fill="x", padx=10, pady=(7, 3))
         self.waveform_widgets.append(waveform_title)
+        zoom_row = Frame(self.waveform_panel, bg=surface)
+        zoom_row.pack(fill="x", padx=10, pady=(0, 4))
+        self.waveform_widgets.append(zoom_row)
+        Label(zoom_row, text="ZOOM HORIZONTAL  −", bg=surface, fg=text, font=("Segoe UI", 8, "bold")).pack(side="left")
+        self.waveform_zoom_var = DoubleVar(value=0.0)
+        self.waveform_zoom_status = StringVar(value="100%")
+        self.waveform_zoom_slider = Canvas(zoom_row, height=26, width=230, bg=surface, highlightthickness=0, cursor="hand2", takefocus=True)
+        self.waveform_zoom_slider.bind("<Configure>", lambda _event:self._draw_zoom_slider())
+        self.waveform_zoom_slider.bind("<Button-1>", self._zoom_slider_pointer)
+        self.waveform_zoom_slider.bind("<B1-Motion>", self._zoom_slider_pointer)
+        self.waveform_zoom_slider.bind("<Left>", lambda _event:self._set_waveform_zoom(self.waveform_zoom/1.1))
+        self.waveform_zoom_slider.bind("<Right>", lambda _event:self._set_waveform_zoom(self.waveform_zoom*1.1))
+        self.waveform_zoom_slider.bind("<Home>", lambda _event:self._set_waveform_zoom(1.0))
+        self.waveform_zoom_slider.pack(side="left", fill="x", expand=True, padx=7)
+        Label(zoom_row, text="+", bg=surface, fg=text, font=("Segoe UI", 10, "bold")).pack(side="left")
+        Label(zoom_row, textvariable=self.waveform_zoom_status, bg=surface, fg=text, width=6, font=("Segoe UI", 8)).pack(side="left", padx=6)
+        reset_zoom = Button(zoom_row, text="100%", command=lambda:self._set_waveform_zoom(1.0), relief="flat", padx=7, pady=2)
+        apply_button_style(reset_zoom, self.theme, "secondary")
+        reset_zoom.pack(side="right")
         edit_toolbar = Frame(self.waveform_panel, bg=surface)
         edit_toolbar.pack(fill="x", padx=10, pady=(0, 5))
         self.waveform_widgets.append(edit_toolbar)
         self.audio_edit_status_var = StringVar(value=i18n.tr("Clique em EDITAR para selecionar trechos nas ondas."))
         edit_status = Label(edit_toolbar, textvariable=self.audio_edit_status_var, bg=surface, fg=self.theme.get("muted", "#64748B"), font=("Segoe UI", 7), anchor="w")
-        edit_status.pack(side="left", fill="x", expand=True)
+        edit_status.pack(side="top", fill="x", expand=True)
         self.waveform_widgets.append(edit_status)
         # O modo EDITAR/SAIR DO EDITAR fica separado das ações destrutivas e
         # de edição. As ações permanecem juntas, com SALVAR abrindo o grupo
@@ -1724,11 +2608,19 @@ class AudioPlayerManager:
             ("audio_cut_button", "RECORTAR", self._cut_audio_selection, "danger"),
         )
         for attribute, label, command, role in edit_buttons:
+            if attribute == "audio_duration_plus_button":
+                duration_label = Label(edit_actions, text=i18n.tr("DURAÇÃO"), bg=surface, fg=text, font=("Segoe UI", 7, "bold"))
+                duration_label.pack(side="left", padx=(1, 1))
+                self.waveform_widgets.append(duration_label)
             button = Button(edit_actions, text=i18n.tr(label), command=command, relief="flat", font=("Segoe UI", 7, "bold"), padx=7, pady=2)
             apply_button_style(button, self.theme, role)
             # DESFAZER e REFAZER ficam juntos; o grupo recebe uma lacuna
             # maior antes de SALVAR, e SALVAR também fica afastado de COLAR.
             gap_after_button = 12 if attribute in {"audio_redo_button", "audio_save_button"} else 2
+            if attribute in {"audio_trim_silence_button", "audio_duration_plus_button"}:
+                gap_after_button = 24
+            if attribute == "audio_duration_minus_button":
+                gap_after_button = 0
             button.pack(side="left", padx=(0, gap_after_button))
             setattr(self, attribute, button)
         self._update_audio_edit_buttons()
@@ -1749,13 +2641,54 @@ class AudioPlayerManager:
             duration_label.pack(side="right")
             self.waveform_widgets.extend((row, heading, label_widget, duration_label))
             self.waveform_duration_labels[kind] = duration_label
+            if kind == "dubbed":
+                self.audio_split_button = Button(heading, text=i18n.tr("DIVIDIR (Ctrl+I)"), command=self._split_dubbed_clip, state="disabled", relief="flat", font=("Segoe UI", 7, "bold"), padx=8, pady=2)
+                self.audio_split_button.configure(bg='#B5E61D', activebackground='#A2CF18', fg='#172033', disabledforeground='#52627A')
+                self.audio_split_button.pack(side="left", padx=14)
+                for attribute,label,db in (("audio_volume_minus_button","− VOLUME",-1.0),("audio_volume_plus_button","VOLUME +",1.0)):
+                    button=Button(heading,text=i18n.tr(label),command=lambda gain=db:self._process_scene_audio_edit(volume_db=gain),state="disabled",relief="flat",font=("Segoe UI",7,"bold"),padx=7,pady=2)
+                    apply_button_style(button,self.theme,"success")
+                    button.pack(side="left",padx=(0,3))
+                    setattr(self,attribute,button)
+                for attribute, label, command, role in (
+                    ('audio_trim_silence_button', 'CORTAR SILÊNCIO INÍCIO/FIM', self._process_scene_audio_edit, 'white'),
+                    ('audio_duration_minus_button', '−', lambda:self._process_scene_audio_edit(.99), 'success'),
+                    ('audio_duration_plus_button', '+', lambda:self._process_scene_audio_edit(1.01), 'success')):
+                    if attribute == 'audio_duration_plus_button':
+                        label_widget=Label(heading,text='DURAÇÃO',bg=surface,fg=text,font=('Segoe UI',7,'bold'))
+                        label_widget.pack(side='left',padx=1)
+                        self.waveform_widgets.append(label_widget)
+                    button=Button(heading,text=label,command=command,relief='flat',font=('Segoe UI',7,'bold'),padx=7,pady=2)
+                    apply_button_style(button,self.theme,role)
+                    button.pack(side='left',padx=(20,0) if attribute != 'audio_duration_plus_button' else (0,0))
+                    setattr(self,attribute,button)
+                self._update_audio_edit_buttons()
+                self.clip_drag = None
+                self.clip_timeline_canvas = Canvas(row, height=28, highlightthickness=0, bg=self.theme.get("input", "#FFFFFF"), cursor="hand2", takefocus=True)
+                self.clip_timeline_canvas.pack(fill="x", pady=(2, 0))
+                self._bind_audio_zoom(self.clip_timeline_canvas)
+                self.clip_timeline_canvas.bind("<Configure>", lambda _event: self._draw_clip_timeline())
+                self.clip_timeline_canvas.bind("<Button-1>", self._clip_drag_press)
+                self.clip_timeline_canvas.bind("<B1-Motion>", self._clip_drag_motion)
+                self.clip_timeline_canvas.bind("<ButtonRelease-1>", self._clip_drag_release)
+                self.clip_timeline_canvas.bind("<Delete>", self._delete_audio_selection)
+                self.clip_timeline_canvas.bind("<BackSpace>", self._delete_audio_selection)
+                self.clip_timeline_canvas.bind("<Control-c>", self._copy_audio_selection)
+                self.clip_timeline_canvas.bind("<Control-x>", self._cut_audio_selection)
+                self.clip_timeline_canvas.bind("<Control-v>", self._paste_audio_clip)
+                self.clip_timeline_canvas.bind("<Control-z>", self._undo_audio_edit)
+                self.clip_timeline_canvas.bind("<Control-y>", self._redo_audio_edit)
+                self.clip_timeline_canvas.bind("<space>", self._toggle_edit_play_pause)
             canvas = Canvas(row, width=900, height=62, highlightthickness=0, bd=1, relief="solid", bg=self.theme.get("input", "#FFFFFF"))
             canvas.pack(fill="x", expand=True, pady=(2, 0))
             self.waveform_canvases[kind] = canvas
+            self._bind_audio_zoom(canvas)
             canvas.bind("<Configure>", lambda _event, waveform_kind=kind: self._draw_waveform(waveform_kind))
             canvas.bind("<Button-1>", lambda event, waveform_kind=kind: self._on_waveform_press(waveform_kind, event))
             canvas.bind("<B1-Motion>", lambda event, waveform_kind=kind: self._on_waveform_motion(waveform_kind, event))
             canvas.bind("<ButtonRelease-1>", lambda event, waveform_kind=kind: self._on_waveform_release(waveform_kind, event))
+            canvas.bind("<Control-i>", self._split_dubbed_clip)
+            canvas.bind("<Control-I>", self._split_dubbed_clip)
             canvas.bind("<Control-c>", self._copy_audio_selection)
             canvas.bind("<Control-x>", self._cut_audio_selection)
             canvas.bind("<Control-v>", self._paste_audio_clip)
@@ -1765,6 +2698,9 @@ class AudioPlayerManager:
             canvas.bind("<BackSpace>", self._delete_audio_selection)
             canvas.bind("<space>", self._toggle_edit_play_pause)
             canvas.configure(cursor="hand2", takefocus=True)
+        self.waveform_scrollbar = Scrollbar(self.waveform_panel, orient="horizontal", command=self._scroll_audio_views)
+        self.waveform_scrollbar.pack(fill="x", padx=10, pady=(0, 5))
+        self.waveform_canvases["original"].configure(xscrollcommand=self.waveform_scrollbar.set)
         text_panel = Frame(content, bg=surface, bd=1, relief="solid", height=190)
         # Em uma janela maximizada, o painel de texto absorve o espaço livre
         # entre as ondas e os controles inferiores; assim não sobra um vazio
@@ -1776,6 +2712,24 @@ class AudioPlayerManager:
         Label(text_header, text=i18n.tr("TEXTO EM PORTUGUÊS — EDITÁVEL"), bg=surface, fg=text, font=("Segoe UI", 9, "bold"), anchor="w").pack(side="left")
         self.scene_text_title_var = StringVar(value="")
         Label(text_header, textvariable=self.scene_text_title_var, bg=surface, fg=text, font=("Segoe UI", 9), anchor="e").pack(side="right", fill="x", expand=True, padx=(12, 0))
+        controller=getattr(self,'translation_controller',None)
+        if controller is not None:
+            translation_row=Frame(text_panel,bg=surface)
+            translation_row.pack(fill='x',padx=10,pady=(3,3))
+            ttk.Checkbutton(translation_row,text=i18n.tr('Usar no redublar'),variable=controller.use_other_translation_var,onvalue='1',offvalue='0',command=self._toggle_scene_translation).pack(side='right',anchor='n',padx=(8,0))
+            text_switches=Frame(translation_row,bg=surface)
+            text_switches.pack(side='left',anchor='n',padx=(0,8))
+            for label, command in [('MOSTRAR TEXTO DA TRADUÇÃO PRINCIPAL',self._show_main_scene_translation),('MOSTRAR TEXTO ORIGINAL',self._show_original_scene_text)]:
+                button=Button(text_switches,text=i18n.tr(label),command=command,relief='flat',font=('Segoe UI',8,'bold'),padx=7,pady=1)
+                apply_button_style(button,self.theme,'primary')
+                button.pack(fill='x',pady=(0,1))
+            try:
+                from .ui_theme import horizontal_folder_strip
+            except ImportError:
+                from ui_theme import horizontal_folder_strip
+            folder_strip, self.scene_translation_folders_bar=horizontal_folder_strip(translation_row,self.theme)
+            folder_strip.pack(side='left',fill='x',expand=True,anchor='n')
+            self._refresh_scene_translation_folders()
         scene_text_frame = Frame(text_panel, bg=surface)
         scene_text_frame.pack(fill="both", expand=True, padx=10, pady=(2, 0))
         self.scene_text_box = Text(scene_text_frame, height=4, wrap="word", undo=True, font=("Segoe UI", 10), bg=self.theme.get("input", "#FFFFFF"), fg=self.theme.get("text", "#1F2937"), insertbackground=self.theme.get("text", "#1F2937"), relief="solid", bd=1)
@@ -1823,6 +2777,7 @@ class AudioPlayerManager:
             ("copy_name", "COPIAR NOME DO ÁUDIO"),
             ("copy_dubbed", "COPIAR LOCAL DO ÁUDIO DUBLADO"),
             ("copy_original", "COPIAR LOCAL DO ÁUDIO ORIGINAL"),
+            ("copy_part_all", "COPIAR PARTE INTEIRA") if getattr(self, "is_part_window", False) else ("dub_part", "DUBLAR PARTE DO TXT"),
         )
         for column in range(3):
             audio_controls.grid_columnconfigure(column, weight=1, uniform="audio_action")
@@ -1839,7 +2794,7 @@ class AudioPlayerManager:
                 wraplength=280,
                 justify="center",
             )
-            role = "neutral"
+            role = "success" if action_name in {"dub_part", "copy_part_all"} else "neutral"
             apply_button_style(button, self.theme, role)
             button.grid(row=row, column=column, sticky="nsew", padx=2, pady=2)
             self.audio_action_buttons.append((button, role))
@@ -1856,6 +2811,7 @@ class AudioPlayerManager:
                 ("approve", "Aprovar", "primary"),
                 ("reject", "Rejeitar", "danger"),
                 ("redub", "REDUBLAR", "success"),
+                ("redub_personalized", "REDUBLAR ÁUDIO PERSONALIZADO", "success"),
                 ("redub_other", "REDUBLAR COM OUTRO ÁUDIO", "accent"),
             )
             for action_name, label, role in definitions:
@@ -1876,21 +2832,39 @@ class AudioPlayerManager:
             window.update_idletasks()
             requested_height = max(560, int(window.winfo_reqheight()))
             fitted_height = min(requested_height, available_height)
-            window.geometry(f"1100x{fitted_height}")
-            window.minsize(900, fitted_height)
+            window.geometry(f"{1100 if getattr(self, 'is_part_window', False) else 1220}x{fitted_height}")
+            window.minsize(900 if getattr(self, "is_part_window", False) else 1020, fitted_height)
             window.update_idletasks()
         except Exception:
             pass
         return window
 
     def apply_theme(self, theme: dict):
-        self.theme = {**self.theme, **theme}
+        self._base_theme = {**getattr(self, "_base_theme", self.theme), **theme}
+        self.theme = dict(self._base_theme)
+        if self.dubbed_folder_name == "dublados personalizados":
+            self.theme.update(mode="escuro", surface="#450F18", root="#450F18",
+                              text="#FFF1F2", input="#2B0A10", input_text="#FFF1F2",
+                              muted="#F3B8C2", border="#883344", select="#8C263B")
         if self.window is None:
             return
         try:
             if self.window.winfo_exists():
                 surface = self.theme.get("surface", "#FFFFFF")
                 text = self.theme.get("text", "#1F2937")
+                def recolor_frames(widget):
+                    for child in widget.winfo_children():
+                        try:
+                            if hasattr(child, 'apply_folder_theme'):
+                                child.apply_folder_theme(self.theme)
+                            if child.winfo_class() in {"Frame", "Label"}:
+                                child.configure(bg=surface)
+                                if child.winfo_class() == "Label":
+                                    child.configure(fg=text)
+                            recolor_frames(child)
+                        except Exception:
+                            pass
+                recolor_frames(self.window)
                 border_color = self.window_border_color
                 self.window.configure(bg=border_color)
                 try:
@@ -1981,6 +2955,11 @@ class AudioPlayerManager:
                     (self.stop_button, "danger"),
                     (self.close_button, "secondary"),
                     (self.scene_text_save_button, "primary"),
+                    (getattr(self, "audio_trim_silence_button", None), "white"),
+                    (getattr(self, "audio_volume_minus_button", None), "success"),
+                    (getattr(self, "audio_volume_plus_button", None), "success"),
+                    (getattr(self, "audio_duration_minus_button", None), "success"),
+                    (getattr(self, "audio_duration_plus_button", None), "success"),
                     (self.audio_undo_button, "secondary"),
                     (self.audio_redo_button, "secondary"),
                     (self.audio_save_button, "primary"),
@@ -1993,6 +2972,13 @@ class AudioPlayerManager:
                 ):
                     if widget is not None:
                         apply_button_style(widget, self.theme, role)
+                slider = getattr(self, "waveform_zoom_slider", None)
+                if slider is not None:
+                    slider.configure(bg=surface)
+                    self._draw_zoom_slider()
+                self._draw_clip_timeline()
+                if hasattr(self, "scene_parts_ui"):
+                    self.scene_parts_ui.refresh(force=True)
         except Exception:
             pass
 
@@ -2019,6 +3005,12 @@ class AudioPlayerManager:
             self.emit_status(f"Não foi possível copiar: {exc}")
 
     def _audio_context_action(self, action: str) -> None:
+        if action == "dub_part":
+            self.scene_parts_ui.composer()
+            return
+        if action == "copy_part_all":
+            self._copy_whole_part()
+            return
         if action in {"open_dubbed", "copy_dubbed"}:
             path = self._current_audio_path("dubbed")
             label = "dublado"
@@ -2087,7 +3079,7 @@ class AudioPlayerManager:
         # a origem já pertence ao projeto: isso evita uma varredura de milhares de
         # arquivos para cada cena sem dublado correspondente.
         relative_checked = False
-        for source_folder_name in ("dublado", "WAV ORIGINAIS"):
+        for source_folder_name in ("dublado", "WAV ORIGINAIS", "dublados personalizados"):
             source_folder = (self.project_root / source_folder_name).expanduser().resolve()
             try:
                 relative = path.relative_to(source_folder)
@@ -2108,12 +3100,27 @@ class AudioPlayerManager:
         matches = self._project_audio_index_for(folder_name, folder).get(path.stem.casefold(), [])
         return matches[0] if len(matches) == 1 else None
 
+    def set_loaded_audio_pairs(self, pairs):
+        """Fixa os pares fornecidos pela aba, sem substituí-los por arquivos do projeto."""
+        self.loaded_audio_pairs = {Path(path).resolve(): pair for path, pair in pairs.items()}
+        self._resolved_pair_indices.clear()
+        custom_root = (self.project_root / "dublados personalizados").resolve() if self.project_root is not None else None
+        has_personalized = custom_root is not None and any(
+            dubbed is not None and Path(dubbed).resolve().is_relative_to(custom_root)
+            for _original, dubbed in self.loaded_audio_pairs.values()
+        )
+        self.set_dubbed_folder_name("dublados personalizados" if has_personalized else "dublado")
+
     def _find_original_audio(self, path: Path) -> Path | None:
         """Localiza o WAV de mesmo nome na pasta WAV ORIGINAIS do projeto."""
+        if getattr(self, "loaded_audio_pairs", None) is not None:
+            return self.loaded_audio_pairs.get(Path(path).resolve(), (None, None))[0]
         return self._find_project_audio_by_stem("WAV ORIGINAIS", path)
 
     def _find_dubbed_audio(self, path: Path) -> Path | None:
-        return self._find_project_audio_by_stem("dublado", path)
+        if getattr(self, "loaded_audio_pairs", None) is not None:
+            return self.loaded_audio_pairs.get(Path(path).resolve(), (None, None))[1]
+        return self._find_project_audio_by_stem(self.dubbed_folder_name, path)
 
     def _originals_for_navigation(self):
         return [self._find_original_audio(path) for path in self.navigation_paths]
@@ -2210,7 +3217,7 @@ class AudioPlayerManager:
         # O item selecionado já foi validado; os demais caminhos da playlist são
         # mantidos sem is_file/rglob para abrir a janela imediatamente. A validade
         # dos itens seguintes é conferida somente quando o usuário navega até eles.
-        self.navigation_paths = [Path(item).expanduser().resolve() for item in candidates]
+        self.navigation_paths = [Path(os.path.abspath(os.path.expanduser(str(item)))) for item in candidates]
         if scene_keys is not None:
             self.navigation_context_keys = [str(key) for key in scene_keys]
         else:
@@ -2316,7 +3323,7 @@ class AudioPlayerManager:
         self.audio_paused_path = None
         self.audio_paused_seconds = 0.0
         if self.audio_edit_mode and self.audio_edit_working.get("dubbed") is not None:
-            self._play_edit_preview("dubbed", 0.0)
+            self._play_edit_preview("dubbed", self._edit_selection_start("dubbed"))
             return
         paths = self.dubbed_pending_paths or self.pending_paths
         self._start_paths(paths, "dublada")
@@ -2326,7 +3333,7 @@ class AudioPlayerManager:
         self.audio_paused_path = None
         self.audio_paused_seconds = 0.0
         if self.audio_edit_mode and self.audio_edit_working.get("original") is not None:
-            self._play_edit_preview("original", 0.0)
+            self._play_edit_preview("original", self._edit_selection_start("original"))
             return
         self._start_paths(self.original_pending_paths, "original")
 

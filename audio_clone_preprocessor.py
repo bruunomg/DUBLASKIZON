@@ -303,7 +303,22 @@ class AudioCloneProcessor:
         self._run(args)
         return destination
 
-    def process(self, paths: Iterable[Path], target: str, output_root: Path = Path(CLONE_OUTPUT_FOLDER_NAME), output_format: str = "wav", bitrate: str = "256k", channels: int = 1, normalize: bool = True, omnivoice_seconds: float | None = None, block_minutes: float = 30.0, progress_callback: Callable[[float, str], None] | None = None) -> ProcessingReport:
+    @staticmethod
+    def custom_duration(input_seconds, seconds=None, max_bytes=None, output_format="wav", channels=1):
+        for value in (seconds, max_bytes):
+            if value is not None and (not math.isfinite(float(value)) or float(value) <= 0):
+                raise AudioProcessingError("Duração e tamanho personalizados devem ser maiores que zero.")
+        duration = min(input_seconds, float(seconds)) if seconds is not None else input_seconds
+        if max_bytes is not None:
+            rates = {"mp3": 32000, "m4a": 32000, "ogg": 24000,
+                     "wav": 44100 * 2 * channels, "aiff": 44100 * 2 * channels,
+                     "flac": 44100 * 2 * channels * .65}
+            duration = min(duration, max(0, (float(max_bytes) - 4096) / rates[output_format]))
+        if duration < .01:
+            raise AudioProcessingError("O tamanho escolhido é pequeno demais para gerar o áudio.")
+        return duration
+
+    def process(self, paths: Iterable[Path], target: str, output_root: Path = Path(CLONE_OUTPUT_FOLDER_NAME), output_format: str = "wav", bitrate: str = "256k", channels: int = 1, normalize: bool = True, omnivoice_seconds: float | None = None, block_minutes: float = 30.0, progress_callback: Callable[[float, str], None] | None = None, custom_seconds: float | None = None, custom_max_bytes: int | None = None) -> ProcessingReport:
         target = str(target).lower()
         if target not in MODES:
             raise AudioProcessingError(f"Modo desconhecido: {target}")
@@ -335,7 +350,12 @@ class AudioCloneProcessor:
             report_progress(56.0, "Analisando duração do áudio unido")
             intervals = self.silence_intervals(joined)
             report_progress(64.0, "Localizando pausas seguras para o corte")
-            if target == "omnivoice":
+            custom = custom_seconds is not None or custom_max_bytes is not None
+            if custom:
+                duration = self.custom_duration(joined_info.duration, custom_seconds, custom_max_bytes, output_format, channels)
+                report.segments = [Segment(0.0, duration)]
+                report.warnings.append("Saída personalizada: substitui os limites do perfil; não alonga áudios mais curtos.")
+            elif target == "omnivoice":
                 recommended = float(omnivoice_seconds or mode.recommended_seconds)
                 recommended = max(mode.minimum_seconds, min(mode.maximum_seconds, recommended))
                 if joined_info.duration < mode.minimum_seconds:
@@ -367,12 +387,27 @@ class AudioCloneProcessor:
             stem = self._safe_stem(source_paths[0])
             total_segments = max(1, len(report.segments))
             for index, segment in enumerate(report.segments, 1):
-                suffix = f"_{index:02d}" if target == "eleven_pro" else ""
+                suffix = "_personalizado" if custom else f"_{index:02d}" if target == "eleven_pro" else ""
                 extension = {"wav": ".wav", "mp3": ".mp3", "flac": ".flac", "ogg": ".ogg", "aiff": ".aiff", "m4a": ".m4a"}[output_format]
                 destination = output_dir / f"{stem}_{target}{suffix}{extension}"
                 self._export(joined, destination, segment, output_format, bitrate, channels, normalize)
                 report_progress(72.0 + 20.0 * index / total_segments, f"Exportando saída {index}/{total_segments}")
-                if mode.maximum_bytes is not None and destination.stat().st_size > mode.maximum_bytes:
+                if custom_max_bytes is not None:
+                    for attempt in range(10):
+                        actual = destination.stat().st_size
+                        if actual <= custom_max_bytes:
+                            break
+                        shorter = segment.duration * float(custom_max_bytes) / actual * .97
+                        if shorter < .01:
+                            destination.unlink(missing_ok=True)
+                            raise AudioProcessingError("Tamanho escolhido insuficiente para este formato.")
+                        segment = Segment(0.0, shorter)
+                        report.segments[index-1] = segment
+                        self._export(joined, destination, segment, output_format, bitrate, channels, normalize)
+                    if destination.stat().st_size > custom_max_bytes:
+                        destination.unlink(missing_ok=True)
+                        raise AudioProcessingError("Não foi possível atingir o limite de tamanho escolhido.")
+                if not custom and mode.maximum_bytes is not None and destination.stat().st_size > mode.maximum_bytes:
                     if output_format != "mp3":
                         report.warnings.append(f"{destination.name} excedeu o limite conservador; foi reexportado em mono MP3 256 kbps.")
                         destination.unlink(missing_ok=True)

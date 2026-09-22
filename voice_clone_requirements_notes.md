@@ -28,3 +28,11 @@ A documentação atual recomenda pelo menos uma hora de áudio para melhores res
 Fonte pública do OmniVoice: https://github.com/k2-fsa/OmniVoice
 
 O repositório público descreve o OmniVoice como um modelo TTS multilíngue instalável via PyPI/GitHub, mas não estabelece no README um limite universal do VoiceStudio. A ferramenta manterá os limites conservadores solicitados pelo usuário, com segmento de 5–20 segundos e máximo de 25 segundos, claramente identificados como configuração da ferramenta.
+
+
+## Personalização de saída — v14
+Use PERSONALIZAR TAMANHO / DURAÇÃO para informar segundos, tamanho máximo em MB ou ambos. A duração usa o início dos áudios reunidos, cortando o final sem acelerar ou alongar. Quando ambos são preenchidos, vale o limite atingido primeiro. O limite em MB é conferido no arquivo exportado; a duração pode ser reduzida novamente para respeitá-lo. VOLTAR AO PADRÃO restaura o perfil de clonagem. Saída estimada e Duração final acompanham os limites escolhidos.
+
+
+## Ouvir cena — v15
+A janela Personalizar saída do áudio usa as cores de fundo, campos e botões do tema ativo. Em Ouvir cena, clique EDITAR para habilitar − DURAÇÃO e +: cada clique reduz ou aumenta a duração atual em 1%, preservando o tom pelo mesmo processamento SoX/FFmpeg da aba Converter duração. CORTAR SILÊNCIO INÍCIO/FIM usa a mesma detecção de extremidades e preserva pausas internas. Os controles atuam somente no DUBLADO WAV PCM editável. Ouça a prévia, use DESFAZER/REFAZER se necessário e SALVAR para gravar. Processamento é feito em segundo plano; resultados de uma cena anterior ou de um áudio alterado durante a operação são descartados.

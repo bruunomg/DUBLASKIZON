@@ -4,6 +4,39 @@ from __future__ import annotations
 from typing import Any
 
 
+def horizontal_folder_strip(parent, theme=None):
+    """A single folder row with a narrow scrollbar, independent of content width."""
+    import tkinter as tk
+    from tkinter import ttk
+    theme = theme or {}
+    background = theme.get('surface', '#FFFFFF')
+    outer = tk.Frame(parent, bg=background)
+    canvas = tk.Canvas(outer, width=1, height=28, highlightthickness=0,
+                       borderwidth=0, background=background, xscrollincrement=24)
+    scroll = tk.Scrollbar(outer, orient='horizontal', width=9, borderwidth=0,
+                          highlightthickness=0, command=canvas.xview)
+    canvas.configure(xscrollcommand=scroll.set)
+    canvas.pack(fill='x', expand=True)
+    scroll.pack(fill='x')
+    inner = tk.Frame(canvas, bg=background)
+    def apply_theme(colors):
+        bg = colors.get('surface', '#FFFFFF')
+        outer.configure(bg=bg)
+        inner.configure(bg=bg)
+        canvas.configure(bg=bg)
+        scroll.configure(bg=colors.get('border', bg), troughcolor=bg,
+                         activebackground=colors.get('muted', bg))
+    outer.apply_folder_theme = apply_theme
+    apply_theme(theme)
+    canvas.create_window(0, 0, window=inner, anchor='nw')
+    def resize(_event=None):
+        canvas.configure(scrollregion=canvas.bbox('all'), height=max(24, inner.winfo_reqheight()))
+    inner.bind('<Configure>', resize)
+    canvas.bind('<Configure>', resize)
+    canvas.bind('<Shift-MouseWheel>', lambda event: (canvas.xview_scroll(-1 if event.delta > 0 else 1, 'units'), 'break')[1])
+    return outer, inner
+
+
 # Todos os papéis de botão têm quatro atributos Tk. Assim, botões criados por
 # módulos diferentes continuam com o mesmo contraste ao alternar o tema.
 BUTTON_PALETTES: dict[str, dict[str, dict[str, str]]] = {
@@ -124,6 +157,8 @@ def button_palette(theme: dict[str, Any] | None) -> dict[str, dict[str, str]]:
 
 
 def button_style(theme: dict[str, Any] | None, role: str = "neutral") -> dict[str, str]:
+    if role == "white":
+        return {"bg": "#FFFFFF", "fg": "#000000", "activebackground": "#FFFFFF", "activeforeground": "#000000", "disabledforeground": "#000000"}
     palette = button_palette(theme)
     return dict(palette.get(role, palette.get("neutral", BUTTON_PALETTES["claro"]["neutral"])))
 

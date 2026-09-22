@@ -9,3 +9,6 @@ scipy>=1.10
 
 # Compilação do executável no Windows
 pyinstaller>=6.0; platform_system == "Windows"
+
+# Compatibilidade do pydub com Python 3.13+ (audioop saiu da biblioteca padrao)
+audioop-lts>=0.2.1; python_version >= "3.13"

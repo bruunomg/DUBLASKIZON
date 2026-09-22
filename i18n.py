@@ -294,6 +294,7 @@ _TRANSLATIONS: dict[str, dict[str, str]] = {
     "CLONANDO REFERÊNCIA": {"en": "CLONING REFERENCE", "ru": "КЛОНИРОВАНИЕ ОБРАЗЦА", "es": "CLONANDO REFERENCIA"},
     "DUBLANDO CENA": {"en": "DUBBING SCENE", "ru": "ДУБЛИРОВАНИЕ СЦЕНЫ", "es": "DOBLANDO ESCENA"},
     "CARREGAR DA ABA REVISÃO": {"en": "LOAD FROM REVIEW TAB", "ru": "ЗАГРУЗИТЬ ИЗ ПРОВЕРКИ", "es": "CARGAR DESDE REVISIÓN"},
+    "CARREGAR DA ABA DUBLAGEM PERSONALIZADA": {"en": "LOAD AUDIO FROM PERSONALIZED TAB", "ru": "ЗАГРУЗИТЬ АУДИО ИЗ ПЕРСОНАЛИЗАЦИИ", "es": "CARGAR AUDIOS DE LA PESTAÑA PERSONALIZADA"},
     "CARREGAR DA CLONAGEM + DUBLAGEM": {"en": "LOAD FROM CLONING + DUBBING", "ru": "ЗАГРУЗИТЬ ИЗ КЛОНИРОВАНИЯ + ДУБЛЯЖА", "es": "CARGAR DESDE CLONACIÓN + DOBLAJE"},
     "CARREGAR DA CONVERSÃO DE FORMATOS": {"en": "LOAD FROM FORMAT CONVERTER", "ru": "ЗАГРУЗИТЬ ИЗ КОНВЕРТЕРА ФОРМАТОВ", "es": "CARGAR DESDE CONVERSIÓN DE FORMATOS"},
     "Fila em execução...": {"en": "Queue running...", "ru": "Очередь выполняется...", "es": "Cola en ejecución..."},
@@ -624,7 +625,7 @@ def translate_widget_tree(root, language: str | None = None) -> None:
                     source_title = current_title
                     setattr(widget, "_dublagenskizon_i18n_title_source", source_title)
                 rendered_title = tr(source_title, language)
-                widget.title(rendered_title)
+                if rendered_title != current_title:widget.title(rendered_title)
                 setattr(widget, "_dublagenskizon_i18n_title_render", rendered_title)
         except Exception:
             pass
@@ -638,7 +639,7 @@ def translate_widget_tree(root, language: str | None = None) -> None:
                         source = current
                         setattr(widget, "_dublagenskizon_i18n_source", source)
                     rendered = tr(source, language)
-                    widget.configure(text=rendered)
+                    if rendered != current:widget.configure(text=rendered)
                     setattr(widget, "_dublagenskizon_i18n_render", rendered)
             if widget_class in {"TCombobox", "Combobox"}:
                 values = list(widget.cget("values"))
@@ -653,9 +654,9 @@ def translate_widget_tree(root, language: str | None = None) -> None:
                 else:
                     source_current = current_value
                 new_values = [tr(source, language) for source in sources]
-                widget.configure(values=new_values)
+                if new_values != values:widget.configure(values=new_values)
                 if source_current in sources:
-                    widget.set(tr(source_current, language))
+                    if tr(source_current, language) != current_value:widget.set(tr(source_current, language))
                 setattr(widget, "_dublagenskizon_i18n_rendered_values", new_values)
             textvariable = str(widget.cget("textvariable"))
             if textvariable and widget_class in {"Label", "TLabel", "Labelframe", "TLabelframe", "Button", "TButton", "Checkbutton", "TCheckbutton", "Radiobutton", "TRadiobutton"}:
@@ -669,7 +670,7 @@ def translate_widget_tree(root, language: str | None = None) -> None:
                     source_value = source_text(current_value)
                     setattr(widget, "_dublagenskizon_i18n_var_source", source_value)
                 rendered_value = tr(source_value, language)
-                widget.setvar(textvariable, rendered_value)
+                if rendered_value != current_value:widget.setvar(textvariable, rendered_value)
                 setattr(widget, "_dublagenskizon_i18n_var_render", rendered_value)
         except Exception:
             pass
@@ -690,6 +691,169 @@ def translate_widget_tree(root, language: str | None = None) -> None:
 
 def translation_table() -> dict[str, dict[str, str]]:
     return _TRANSLATIONS.copy()
+
+
+# New controls use the same canonical Portuguese keys in every UI language.
+for _source, _en, _ru, _es in [
+    ('F5-TTS Russian — russo / inglês (uso não comercial)', 'F5-TTS Russian — Russian / English (non-commercial)', 'F5-TTS Russian — русский / английский (некоммерческое использование)', 'F5-TTS Russian — ruso / inglés (uso no comercial)'),
+    ('F5-TTS Russian: prepare em REQUISITOS; russo / inglês; uso não comercial.', 'F5-TTS Russian: prepare in REQUIREMENTS; Russian / English; non-commercial.', 'F5-TTS Russian: настройте в ТРЕБОВАНИЯХ; русский / английский; некоммерческое использование.', 'F5-TTS Russian: preparar en REQUISITOS; ruso / inglés; uso no comercial.'),
+    ('OmniVoice: multilíngue. F5-TTS Russian: russo / inglês, referência obrigatória, CC-BY-NC-SA-4.0.', 'OmniVoice: multilingual. F5-TTS Russian: Russian / English, reference required, CC-BY-NC-SA-4.0.', 'OmniVoice: многоязычный. F5-TTS Russian: русский / английский, нужен образец голоса, CC-BY-NC-SA-4.0.', 'OmniVoice: multilingüe. F5-TTS Russian: ruso / inglés, referencia obligatoria, CC-BY-NC-SA-4.0.'),
+    ('Mecanismo','Engine','Движок','Motor'),('Tradutor','Translator','Переводчик','Traductor'),
+    ('Idioma de saída','Output language','Язык перевода','Idioma de salida'),('Processamento','Processing','Обработка','Procesamiento'),
+    ('Modelo faster-whisper','faster-whisper model','Модель faster-whisper','Modelo faster-whisper'),('Modelo OpenAI Whisper','OpenAI Whisper model','Модель OpenAI Whisper','Modelo OpenAI Whisper'),
+    ('Python oficial','Official Python','Официальный Python','Python oficial'),('OmniVoice oficial','Official OmniVoice','Официальный OmniVoice','OmniVoice oficial'),
+    ('VoiceStudio (opcional)','VoiceStudio (optional)','VoiceStudio (необязательно)','VoiceStudio (opcional)'),
+    ('GPU AMD: suporte oficial','AMD GPU: official support','GPU AMD: официальная поддержка','GPU AMD: soporte oficial'),
+    ('Driver NVIDIA','NVIDIA driver','Драйвер NVIDIA','Controlador NVIDIA'),
+    ('1. INSTALAR PYTHON / AMBIENTE','1. INSTALL PYTHON / RUNTIME','1. УСТАНОВИТЬ PYTHON / СРЕДУ','1. INSTALAR PYTHON / ENTORNO'),
+    ('1. INSTALAR / REPARAR','1. INSTALL / REPAIR','1. УСТАНОВИТЬ / ВОССТАНОВИТЬ','1. INSTALAR / REPARAR'),
+    ('PARTE\n','PART\n','ЧАСТЬ\n','PARTE\n'),
+    ('2. BAIXAR MODELOS','2. DOWNLOAD MODELS','2. СКАЧАТЬ МОДЕЛИ','2. DESCARGAR MODELOS'),
+    ('3. TESTAR MODELO','3. TEST MODEL','3. ПРОВЕРИТЬ МОДЕЛЬ','3. PROBAR MODELO'),
+    ('ABRIR PASTA DE DESTINO DOS VÍDEOS DUBLADOS','OPEN DUBBED VIDEO OUTPUT FOLDER','ОТКРЫТЬ ПАПКУ ОЗВУЧЕННЫХ ВИДЕО','ABRIR CARPETA DE VÍDEOS DOBLADOS'),
+    ('ABRIR PASTA DO VÍDEO','OPEN VIDEO FOLDER','ОТКРЫТЬ ПАПКУ ВИДЕО','ABRIR CARPETA DEL VÍDEO'),
+    ('ADICIONAR PASTA','ADD FOLDER','ДОБАВИТЬ ПАПКУ','AÑADIR CARPETA'),
+    ('ADICIONAR TODAS COM ESTE NOME','ADD ALL WITH THIS NAME','ДОБАВИТЬ ВСЕ С ЭТИМ ИМЕНЕМ','AÑADIR TODAS CON ESTE NOMBRE'),
+    ('ADICIONAR TODAS DO PERSONAGEM','ADD ALL CHARACTER FOLDERS','ДОБАВИТЬ ВСЕ ПАПКИ ПЕРСОНАЖА','AÑADIR TODAS DEL PERSONAJE'),
+    ('ADICIONAR VÍDEOS','ADD VIDEOS','ДОБАВИТЬ ВИДЕО','AÑADIR VÍDEOS'),
+    ('APLICAR DUBLAGEM','APPLY DUBBING','ПРИМЕНИТЬ ДУБЛЯЖ','APLICAR DOBLAJE'),
+    ('CONVERSÃO DE FORMATOS','FORMAT CONVERSION','КОНВЕРТАЦИЯ ФОРМАТОВ','CONVERSIÓN DE FORMATOS'),
+    ('CONVERTER VÍDEO PARA FICAR MAIS LEVE','COMPRESS VIDEO','СЖАТЬ ВИДЕО','COMPRIMIR VÍDEO'),
+    ('COPIAR PARTE INTEIRA','COPY ENTIRE PART','КОПИРОВАТЬ ВСЮ ЧАСТЬ','COPIAR PARTE COMPLETA'),
+    ('DUBLADOS PERSONALIZADOS','CUSTOM DUBS','ПОЛЬЗОВАТЕЛЬСКИЙ ДУБЛЯЖ','DOBLAJES PERSONALIZADOS'),
+    ('EXTRAIR ÁUDIOS ORIGINAIS WAV','EXTRACT ORIGINAL AUDIO AS WAV','ИЗВЛЕЧЬ ИСХОДНЫЙ ЗВУК В WAV','EXTRAER AUDIOS ORIGINALES WAV'),
+    ('MOSTRAR TODAS AS CENAS','SHOW ALL SCENES','ПОКАЗАТЬ ВСЕ СЦЕНЫ','MOSTRAR TODAS LAS ESCENAS'),
+    ('OUVIR CENA','PLAY SCENE','ПРОСЛУШАТЬ СЦЕНУ','ESCUCHAR ESCENA'),
+    ('OUVIR TODOS','PLAY ALL','ПРОСЛУШАТЬ ВСЁ','ESCUCHAR TODOS'),
+    ('OUVIR ÁUDIO','PLAY AUDIO','ПРОСЛУШАТЬ АУДИО','ESCUCHAR AUDIO'),
+    ('OUVIR ÁUDIO DUBLADO','PLAY DUBBED AUDIO','ПРОСЛУШАТЬ ДУБЛЯЖ','ESCUCHAR AUDIO DOBLADO'),
+    ('OUVIR ÁUDIO MODELO','PLAY VOICE SAMPLE','ПРОСЛУШАТЬ ОБРАЗЕЦ ГОЛОСА','ESCUCHAR MUESTRA DE VOZ'),
+    ('OUVIR ÁUDIO ORIGINAL WAV','PLAY ORIGINAL WAV AUDIO','ПРОСЛУШАТЬ ИСХОДНЫЙ WAV','ESCUCHAR AUDIO ORIGINAL WAV'),
+    ('PARAR APÓS CENA','STOP AFTER SCENE','ОСТАНОВИТЬ ПОСЛЕ СЦЕНЫ','PARAR DESPUÉS DE LA ESCENA'),
+    ('PASTA PRINCIPAL','MAIN FOLDER','ОСНОВНАЯ ПАПКА','CARPETA PRINCIPAL'),
+    ('PREPARAR FERRAMENTAS','PREPARE TOOLS','ПОДГОТОВИТЬ ИНСТРУМЕНТЫ','PREPARAR HERRAMIENTAS'),
+    ('REDIMENSIONAR PARA CLONAR','RESIZE FOR CLONING','ИЗМЕНИТЬ РАЗМЕР ДЛЯ КЛОНИРОВАНИЯ','REDIMENSIONAR PARA CLONAR'),
+    ('REDUBLAR ÁUDIO PERSONALIZADO','REDUB CUSTOM AUDIO','ПЕРЕОЗВУЧИТЬ ПОЛЬЗОВАТЕЛЬСКОЕ АУДИО','REDOBLAR AUDIO PERSONALIZADO'),
+    ('REMOVER SELECIONADOS','REMOVE SELECTED','УДАЛИТЬ ВЫБРАННОЕ','ELIMINAR SELECCIONADOS'),
+    ('REVERTER DUBLAGEM','REVERT DUBBING','ОТМЕНИТЬ ДУБЛЯЖ','REVERTIR DOBLAJE'),
+    ('SALVAR ALTERAÇÃO','SAVE CHANGE','СОХРАНИТЬ ИЗМЕНЕНИЕ','GUARDAR CAMBIO'),
+    ('SELECIONAR PASTA DO PERSONAGEM','SELECT CHARACTER FOLDER','ВЫБРАТЬ ПАПКУ ПЕРСОНАЖА','SELECCIONAR CARPETA DEL PERSONAJE'),
+    ('SOMENTE ESTA PASTA','ONLY THIS FOLDER','ТОЛЬКО ЭТА ПАПКА','SOLO ESTA CARPETA'),
+    ('USAR MODELO E CONTINUAR','USE VOICE SAMPLE AND CONTINUE','ИСПОЛЬЗОВАТЬ ОБРАЗЕЦ И ПРОДОЛЖИТЬ','USAR MODELO Y CONTINUAR'),
+    ('VISUALIZAR VÍDEO','PREVIEW VIDEO','ПРОСМОТР ВИДЕО','VER VÍDEO'),
+    ('ÁUDIOS ORIGINAIS EXTRAÍDOS — WAV','EXTRACTED ORIGINAL AUDIO — WAV','ИЗВЛЕЧЁННЫЙ ИСХОДНЫЙ ЗВУК — WAV','AUDIOS ORIGINALES EXTRAÍDOS — WAV'),
+    ('ÁUDIOS MODELO DE VOZ — ALTERAR PERSONAGEM','VOICE SAMPLES — CHANGE CHARACTER','ОБРАЗЦЫ ГОЛОСА — СМЕНА ПЕРСОНАЖА','MUESTRAS DE VOZ — CAMBIAR PERSONAJE'),
+    ('Ⅱ PAUSE','Ⅱ PAUSE','Ⅱ ПАУЗА','Ⅱ PAUSA'),('▶ PLAY','▶ PLAY','▶ ВОСПРОИЗВЕСТИ','▶ REPRODUCIR'),
+    (' — EM USO',' — ACTIVE',' — АКТИВНО',' — EN USO'),(' — INATIVO',' — INACTIVE',' — НЕАКТИВНО',' — INACTIVO'),
+    ('Backup dos áudios WAV:','WAV audio backup:','Резервная копия WAV:','Copia de seguridad de audios WAV:'),
+    ('Manter mono/estéreo conforme cada áudio original (recomendado)','Keep original mono/stereo channels (recommended)','Сохранить исходные моно/стереоканалы (рекомендуется)','Mantener mono/estéreo del original (recomendado)'),
+    ('ARRASTE OS VÍDEOS AQUI — duplo clique para visualizar','DROP VIDEOS HERE — double-click to preview','ПЕРЕТАЩИТЕ ВИДЕО СЮДА — двойной щелчок для просмотра','ARRASTRE VÍDEOS AQUÍ — doble clic para ver'),
+    ('Arraste os áudios para a lista ou use ADICIONAR ÁUDIOS','Drop audio into the list or use ADD AUDIO','Перетащите аудио в список или нажмите ДОБАВИТЬ АУДИО','Arrastre audios a la lista o use AÑADIR AUDIOS'),
+    ('As partes\ngeradas\naparecerão\naqui.','Generated\nparts will\nappear\nhere.','Созданные\nчасти\nпоявятся\nздесь.','Las partes\ngeneradas\naparecerán\naquí.'),
+    ('EDITAR → clique na onda → DIVIDIR (Ctrl+I) → arraste as barras','EDIT → click waveform → SPLIT (Ctrl+I) → drag clip bars','ПРАВКА → щёлкните волну → РАЗДЕЛИТЬ (Ctrl+I) → перетащите части','EDITAR → clic en la onda → DIVIDIR (Ctrl+I) → arrastre las barras'),
+    ('Escolha uma voz para cada personagem identificado','Choose a voice for each detected character','Выберите голос для каждого найденного персонажа','Elija una voz para cada personaje detectado'),
+    ('Escolha uma voz geral ou configure Gray, Trishka, Ishi etc.','Choose a default voice or configure Gray, Trishka, Ishi, etc.','Выберите общий голос или настройте Gray, Trishka, Ishi и др.','Elija una voz general o configure Gray, Trishka, Ishi, etc.'),
+    ('Ex.: sotaque, emoção, idade, intensidade ou estilo.','E.g. accent, emotion, age, intensity or style.','Например: акцент, эмоция, возраст, интенсивность, стиль.','Ej.: acento, emoción, edad, intensidad o estilo.'),
+    ('Deixe somente o texto desta parte. O TXT e o áudio principal serão preservados.','Keep only the text for this part. Main TXT and audio are preserved.','Оставьте только текст этой части. Основной TXT и аудио сохранятся.','Deje solo el texto de esta parte. Se preservan el TXT y audio principales.'),
+    ('Ajusta a duração ao original preservando o tom. Não sincroniza palavras ou movimentos da boca.','Matches original duration while preserving pitch. Does not align words or lip movements.','Подгоняет длительность под оригинал, сохраняя высоту голоса. Не синхронизирует слова или движения губ.','Ajusta la duración al original conservando el tono. No sincroniza palabras ni labios.'),
+    ('Essa aproximação pode atenuar sílabas em traduções com ritmo diferente. Desative para ajustar somente a duração.','This approximation may attenuate syllables with different timing. Disable to adjust duration only.','При другом ритме перевода слоги могут стать тише. Отключите для изменения только длительности.','Esta aproximación puede atenuar sílabas con otro ritmo. Desactive para ajustar solo la duración.'),
+    ('Acima do limite, a cena será marcada como falha para revisão, sem substituir o áudio anterior. Mudanças durante um lote valem para o próximo lote.','Above the limit, the scene fails for review and keeps the previous audio. Changes during a batch apply to the next batch.','При превышении предела сцена помечается ошибкой, старое аудио сохраняется. Изменения во время задания действуют со следующего задания.','Al superar el límite, la escena falla para revisión y conserva el audio anterior. Cambios durante un lote se aplican al siguiente.'),
+    ('Usa FFmpeg já disponível na ferramenta. O modo experimental usa NumPy e pydub; não baixa modelos de IA.','Uses the available FFmpeg. Experimental mode needs NumPy and pydub; no AI models are downloaded.','Использует имеющийся FFmpeg. Экспериментальный режим требует NumPy и pydub; модели ИИ не скачиваются.','Usa FFmpeg disponible. El modo experimental requiere NumPy y pydub; no descarga modelos de IA.'),
+    ('1. Instale o ambiente  →  2. Baixe os modelos  →  3. Teste o carregamento','1. Install runtime  →  2. Download models  →  3. Test loading','1. Установите среду  →  2. Скачайте модели  →  3. Проверьте загрузку','1. Instale el entorno  →  2. Descargue modelos  →  3. Pruebe la carga'),
+    ('Abra os capítulos e selecione a pasta do personagem. Somente pastas são mostradas.','Expand chapters and select the character folder. Only folders are shown.','Раскройте главы и выберите папку персонажа. Показаны только папки.','Abra los capítulos y seleccione la carpeta del personaje. Solo se muestran carpetas.'),
+    ('Escolha duração, tamanho máximo, ou ambos. Deixe em branco o limite que não deseja usar.','Choose duration, maximum size, or both. Leave unused limits blank.','Задайте длительность, максимальный размер или оба. Ненужные ограничения оставьте пустыми.','Elija duración, tamaño máximo o ambos. Deje vacíos los límites que no desea usar.'),
+    ('O lote usa este recurso apenas quando falta texto. O pedido de redublagem gera uma nova tradução.\nModelos podem ser baixados no primeiro uso. O áudio é processado neste computador.','Batch mode uses this only when text is missing. A redubbing request generates a new translation.\nModels may download on first use. Audio is processed on this computer.','В пакетном режиме используется при отсутствии текста. Запрос переозвучивания создаёт новый перевод.\nМодели могут скачиваться при первом запуске. Аудио обрабатывается на этом компьютере.','El lote lo usa solo cuando falta texto. La solicitud de redoblaje genera una nueva traducción.\nLos modelos pueden descargarse al primer uso. El audio se procesa en este equipo.'),
+    ('OmniVoice oficial — russo e 600+ idiomas','Official OmniVoice — Russian and 600+ languages','Официальный OmniVoice — русский и ещё 600+ языков','OmniVoice oficial — ruso y más de 600 idiomas'),
+    ('Idioma da voz:','Voice language:','Язык озвучивания:','Idioma de la voz:'),
+    ('Russo','Russian','Русский','Ruso'),('Português (Brasil)','Portuguese (Brazil)','Португальский (Бразилия)','Portugués (Brasil)'),
+    ('Inglês','English','Английский','Inglés'),('Espanhol','Spanish','Испанский','Español'),('Francês','French','Французский','Francés'),
+    ('Alemão','German','Немецкий','Alemán'),('Italiano','Italian','Итальянский','Italiano'),('Japonês','Japanese','Японский','Japonés'),
+    ('Coreano','Korean','Корейский','Coreano'),('Chinês','Chinese','Китайский','Chino'),('Polonês','Polish','Польский','Polaco'),('Holandês','Dutch','Нидерландский','Neerlandés'),
+    ('Russo e outros idiomas: k2-fsa/OmniVoice (modelo oficial multilíngue).','Russian and other languages: k2-fsa/OmniVoice (official multilingual model).','Русский и другие языки: k2-fsa/OmniVoice (официальная многоязычная модель).','Ruso y otros idiomas: k2-fsa/OmniVoice (modelo multilingüe oficial).'),
+    ('+ ADICIONAR MODELO','+ ADD VOICE MODEL','+ ДОБАВИТЬ ОБРАЗЕЦ ГОЛОСА','+ AÑADIR MODELO'),
+    ('DUBLAGEM PERSONALIZADA','CUSTOM DUBBING','ПОЛЬЗОВАТЕЛЬСКИЙ ДУБЛЯЖ','DOBLAJE PERSONALIZADO'),
+    ('DUBLAR PERSONALIZADOS','GENERATE CUSTOM DUBS','СОЗДАТЬ ПОЛЬЗОВАТЕЛЬСКИЙ ДУБЛЯЖ','GENERAR DOBLAJES PERSONALIZADOS'),
+    ('REMOVER MODELO','REMOVE VOICE MODEL','УДАЛИТЬ ОБРАЗЕЦ','ELIMINAR MODELO'),
+    ('ABRIR DUBLADOS PERSONALIZADOS','OPEN CUSTOM DUBS','ОТКРЫТЬ ПОЛЬЗОВАТЕЛЬСКИЙ ДУБЛЯЖ','ABRIR DOBLAJES PERSONALIZADOS'),
+    ('ATUALIZAR CENAS','REFRESH SCENES','ОБНОВИТЬ СЦЕНЫ','ACTUALIZAR ESCENAS'),
+    ('ALINHAR RITMO E DURAÇÃO AO ORIGINAL','ALIGN TIMING AND DURATION TO ORIGINAL','СОГЛАСОВАТЬ РИТМ И ДЛИТЕЛЬНОСТЬ С ОРИГИНАЛОМ','ALINEAR RITMO Y DURACIÓN CON EL ORIGINAL'),
+    ('Alinhar ritmo e duração ao original','Align timing and duration to original','Согласовать ритм и длительность с оригиналом','Alinear ritmo y duración con el original'),
+    ('CONFIGURAR ALINHAMENTO','CONFIGURE ALIGNMENT','НАСТРОИТЬ ВЫРАВНИВАНИЕ','CONFIGURAR ALINEACIÓN'),
+    ('TRANSCREVER E TRADUZIR QUANDO FALTAR TXT','TRANSCRIBE AND TRANSLATE WHEN TXT IS MISSING','РАСПОЗНАВАТЬ И ПЕРЕВОДИТЬ ПРИ ОТСУТСТВИИ TXT','TRANSCRIBIR Y TRADUCIR SI FALTA TXT'),
+    ('Transcrever e traduzir quando faltar TXT','Transcribe and translate when TXT is missing','Распознавать и переводить при отсутствии TXT','Transcribir y traducir si falta TXT'),
+    ('CONFIGURAR TRANSCRIÇÃO / TRADUÇÃO','CONFIGURE TRANSCRIPTION / TRANSLATION','НАСТРОИТЬ РАСПОЗНАВАНИЕ / ПЕРЕВОД','CONFIGURAR TRANSCRIPCIÓN / TRADUCCIÓN'),
+    ('Pedido para transcrever e traduzir o original','Request transcription and translation of original','Запрашивать распознавание и перевод оригинала','Solicitar transcripción y traducción del original'),
+    ('Pedido para alterar personagem da dublagem personalizada','Request a different custom voice character','Запрашивать смену голоса персонажа','Solicitar cambio de personaje del doblaje personalizado'),
+    ('Pedido de alterar pronúncia do R','Request a change to R pronunciation','Запрашивать изменение произношения R','Solicitar cambio de pronunciación de R'),
+    ('Usar no redublar','Use when redubbing','Использовать при переозвучивании','Usar al redoblar'),
+    ('MOSTRAR TEXTO DA TRADUÇÃO PRINCIPAL','SHOW MAIN TRANSLATION','ПОКАЗАТЬ ОСНОВНОЙ ПЕРЕВОД','MOSTRAR TRADUCCIÓN PRINCIPAL'),
+    ('MOSTRAR TEXTO ORIGINAL','SHOW ORIGINAL TEXT','ПОКАЗАТЬ ОРИГИНАЛЬНЫЙ ТЕКСТ','MOSTRAR TEXTO ORIGINAL'),
+    ('DUBLAR PARTE DO TXT','DUB PART OF THE TEXT','ОЗВУЧИТЬ ЧАСТЬ ТЕКСТА','DOBLAR PARTE DEL TEXTO'),
+    ('PARTES DO TXT','TEXT PARTS','ЧАСТИ ТЕКСТА','PARTES DEL TEXTO'),
+    ('DIVIDIR (Ctrl+I)','SPLIT (Ctrl+I)','РАЗДЕЛИТЬ (Ctrl+I)','DIVIDIR (Ctrl+I)'),
+    ('CORTAR SILÊNCIO INÍCIO/FIM','TRIM START/END SILENCE','ОБРЕЗАТЬ ТИШИНУ В НАЧАЛЕ/КОНЦЕ','RECORTAR SILENCIO INICIAL/FINAL'),
+    ('DURAÇÃO','DURATION','ДЛИТЕЛЬНОСТЬ','DURACIÓN'),('ZOOM HORIZONTAL  −','HORIZONTAL ZOOM  −','ГОРИЗОНТАЛЬНЫЙ МАСШТАБ  −','ZOOM HORIZONTAL  −'),
+    ('− VOLUME','− VOLUME','− ГРОМКОСТЬ','− VOLUMEN'),('VOLUME +','VOLUME +','ГРОМКОСТЬ +','VOLUMEN +'),
+    ('COMPACTAR / CONVERTER VÍDEOS','COMPRESS / CONVERT VIDEOS','СЖАТЬ / КОНВЕРТИРОВАТЬ ВИДЕО','COMPRIMIR / CONVERTIR VÍDEOS'),
+    ('TROCAR AUDIO DO VÍDEO','REPLACE VIDEO AUDIO','ЗАМЕНИТЬ ЗВУК ВИДЕО','CAMBIAR AUDIO DEL VÍDEO'),
+    ('ADICIONAR ÁUDIOS / VÍDEOS','ADD AUDIO / VIDEO','ДОБАВИТЬ АУДИО / ВИДЕО','AÑADIR AUDIOS / VÍDEOS'),
+    ('ABRIR BACKUP','OPEN BACKUP','ОТКРЫТЬ РЕЗЕРВНУЮ КОПИЮ','ABRIR COPIA DE SEGURIDAD'),
+    ('ABRIR RELATÓRIO','OPEN REPORT','ОТКРЫТЬ ОТЧЁТ','ABRIR INFORME'),
+    ('APLICAR','APPLY','ПРИМЕНИТЬ','APLICAR'),('CANCELAR / FECHAR','CANCEL / CLOSE','ОТМЕНИТЬ / ЗАКРЫТЬ','CANCELAR / CERRAR'),
+    ('CANCELAR INSTALAÇÃO','CANCEL INSTALLATION','ОТМЕНИТЬ УСТАНОВКУ','CANCELAR INSTALACIÓN'),
+    ('CARREGAR TXT PRINCIPAL','LOAD MAIN TXT','ЗАГРУЗИТЬ ОСНОВНОЙ TXT','CARGAR TXT PRINCIPAL'),
+    ('CONSULTAR TAMANHO DOS MODELOS (sem baixar)','CHECK MODEL SIZES (no download)','ПРОВЕРИТЬ РАЗМЕРЫ МОДЕЛЕЙ (без скачивания)','CONSULTAR TAMAÑO DE MODELOS (sin descargar)'),
+    ('CONTINUAR','RESUME','ПРОДОЛЖИТЬ','CONTINUAR'),('Continuar','Resume','Продолжить','Continuar'),
+    ('CONVERTER\nDURAÇÃO','CONVERT\nDURATION','ИЗМЕНИТЬ\nДЛИТЕЛЬНОСТЬ','CONVERTIR\nDURACIÓN'),
+    ('CONVERTER\nFORMATOS','CONVERT\nFORMATS','КОНВЕРТИРОВАТЬ\nФОРМАТЫ','CONVERTIR\nFORMATOS'),
+    ('Complemento da voz (opcional)','Voice instruction (optional)','Уточнение голоса (необязательно)','Instrucción de voz (opcional)'),
+    ('Duração final (segundos):','Final duration (seconds):','Итоговая длительность (секунды):','Duración final (segundos):'),
+    ('ESCOLHER PASTA','CHOOSE FOLDER','ВЫБРАТЬ ПАПКУ','ELEGIR CARPETA'),
+    ('Formato de saída:','Output format:','Выходной формат:','Formato de salida:'),
+    ('Histórico global dos processos','Global process history','Общая история процессов','Historial global de procesos'),
+    ('Incluir Whisper (recomendado para clonar sem transcrição)','Include Whisper (recommended for cloning without a transcript)','Включить Whisper (для клонирования без расшифровки)','Incluir Whisper (recomendado para clonar sin transcripción)'),
+    ('Limite de alteração de velocidade (%):','Speed change limit (%):','Предел изменения скорости (%):','Límite de cambio de velocidad (%):'),
+    ('Modelo de voz:','Voice model:','Модель голоса:','Modelo de voz:'),
+    ('Nenhuma pasta em OUTRAS TRADUÇÕES','No folders in OUTRAS TRADUÇÕES','Нет папок в OUTRAS TRADUÇÕES','No hay carpetas en OUTRAS TRADUÇÕES'),
+    ('Nenhuma subpasta encontrada. Crie subpastas de idiomas dentro de OUTRAS TRADUÇÕES.','No matching version for this scene in OUTRAS TRADUÇÕES.','В OUTRAS TRADUÇÕES нет подходящей версии этой сцены.','No hay una versión de esta escena en OUTRAS TRADUÇÕES.'),
+    ('Não mostrar novamente ao iniciar','Do not show again at startup','Не показывать при запуске','No volver a mostrar al iniciar'),
+    ('O que é necessário','Requirements','Что необходимо','Requisitos'),('OLLAMA OFICIAL','OFFICIAL OLLAMA','ОФИЦИАЛЬНЫЙ OLLAMA','OLLAMA OFICIAL'),
+    ('Organizar DUBLADOS','Organize DUBBED AUDIO','Упорядочить ДУБЛЯЖ','Organizar DOBLAJES'),
+    ('Organização da saída','Output organization','Организация выходных файлов','Organización de salida'),
+    ('PERSONALIZADO ✓ — ALTERAR','CUSTOM ✓ — CHANGE','НАСТРОЕНО ✓ — ИЗМЕНИТЬ','PERSONALIZADO ✓ — CAMBIAR'),
+    ('PERSONALIZAR TAMANHO / DURAÇÃO','CUSTOMIZE SIZE / DURATION','НАСТРОИТЬ РАЗМЕР / ДЛИТЕЛЬНОСТЬ','PERSONALIZAR TAMAÑO / DURACIÓN'),
+    ('POR PERSONAGEM','BY CHARACTER','ПО ПЕРСОНАЖАМ','POR PERSONAJE'),
+    ('PREPARAR DEPENDÊNCIAS','PREPARE DEPENDENCIES','ПОДГОТОВИТЬ ЗАВИСИМОСТИ','PREPARAR DEPENDENCIAS'),
+    ('PREPARAR FERRAMENTAS DE ÁUDIO','PREPARE AUDIO TOOLS','ПОДГОТОВИТЬ АУДИОИНСТРУМЕНТЫ','PREPARAR HERRAMIENTAS DE AUDIO'),
+    ('PREPARAR O DUBLASKIZON','SET UP DUBLASKIZON','НАСТРОИТЬ DUBLASKIZON','PREPARAR DUBLASKIZON'),
+    ('PRONÚNCIA DO R','R PRONUNCIATION','ПРОИЗНОШЕНИЕ R','PRONUNCIACIÓN DE R'),
+    ('Pasta de saída:','Output folder:','Выходная папка:','Carpeta de salida:'),
+    ('Processamento:','Processing:','Обработка:','Procesamiento:'),
+    ('Processos de instalação e download','Installation and download processes','Установка и скачивание','Procesos de instalación y descarga'),
+    ('Qualidade (perfis com perdas):','Quality (lossy presets):','Качество (профили с потерями):','Calidad (perfiles con pérdidas):'),
+    ('Quem fará a voz','Voice assignment','Кто озвучивает','Quién hace la voz'),
+    ('REDUBLAR ÁUDIO SELECIONADO','REDUB SELECTED AUDIO','ПЕРЕОЗВУЧИТЬ ВЫБРАННОЕ АУДИО','REDOBLAR AUDIO SELECCIONADO'),
+    ('REQUISITOS','REQUIREMENTS','ТРЕБОВАНИЯ','REQUISITOS'),('SALVAR VOZES','SAVE VOICES','СОХРАНИТЬ ГОЛОСА','GUARDAR VOCES'),
+    ('Saída dos resultados','Results output','Результаты','Salida de resultados'),
+    ('TRANSCRIÇÃO E TRADUÇÃO LOCAIS','LOCAL TRANSCRIPTION AND TRANSLATION','ЛОКАЛЬНОЕ РАСПОЗНАВАНИЕ И ПЕРЕВОД','TRANSCRIPCIÓN Y TRADUCCIÓN LOCALES'),
+    ('Tamanho máximo (MB):','Maximum size (MB):','Максимальный размер (МБ):','Tamaño máximo (MB):'),
+    ('Total de cenas processadas','Total scenes processed','Всего обработано сцен','Total de escenas procesadas'),
+    ('VOLTAR AO PADRÃO','RESET TO DEFAULT','ВОССТАНОВИТЬ ПО УМОЛЧАНИЮ','RESTABLECER VALORES'),
+    ('WAV ORIGINAIS','ORIGINAL WAV FILES','ИСХОДНЫЕ WAV','WAV ORIGINALES'),
+    ('▶ OUVIR MODELO','▶ PLAY VOICE MODEL','▶ ПРОСЛУШАТЬ ОБРАЗЕЦ','▶ ESCUCHAR MODELO'),
+    ('▶ OUVIR ORIGINAL','▶ PLAY ORIGINAL','▶ ПРОСЛУШАТЬ ОРИГИНАЛ','▶ ESCUCHAR ORIGINAL'),
+    ('1. ÁUDIOS MODELO DE VOZ — prefira fala limpa, sem música/efeitos','1. VOICE SAMPLES — use clean speech without music/effects','1. ОБРАЗЦЫ ГОЛОСА — чистая речь без музыки/эффектов','1. MUESTRAS DE VOZ — voz limpia sin música/efectos'),
+    ('ÁUDIOS MODELO DE VOZ — prefira fala limpa, sem música/efeitos','VOICE SAMPLES — use clean speech without music/effects','ОБРАЗЦЫ ГОЛОСА — чистая речь без музыки/эффектов','MUESTRAS DE VOZ — voz limpia sin música/efectos'),
+    ('2. CENAS QUE SERÃO DUBLADAS','2. SCENES TO DUB','2. СЦЕНЫ ДЛЯ ОЗВУЧИВАНИЯ','2. ESCENAS PARA DOBLAR'),
+    ('3. GERAR','3. GENERATE','3. СОЗДАТЬ','3. GENERAR'),
+    ('Aproximar pausas e intensidade (experimental)','Approximate pauses and intensity (experimental)','Приблизить паузы и интенсивность (экспериментально)','Aproximar pausas e intensidad (experimental)'),
+    ('Mecanismo:','Engine:','Движок:','Motor:'),('Tradutor:','Translator:','Переводчик:','Traductor:'),
+    ('Idioma de saída:','Output language:','Язык перевода:','Idioma de salida:'),
+    ('Idioma original (auto = detectar)','Source language (auto = detect)','Исходный язык (auto = определить)','Idioma original (auto = detectar)'),
+    ('Alinhamento de ritmo e duração','Timing and duration alignment','Выравнивание ритма и длительности','Alineación de ritmo y duración'),
+    ('Transcrever → traduzir → dublar','Transcribe → translate → dub','Распознать → перевести → озвучить','Transcribir → traducir → doblar'),
+]:
+    _TRANSLATIONS[_source]={'en':_en,'ru':_ru,'es':_es}
 
 
 _HELP_STEPS = {

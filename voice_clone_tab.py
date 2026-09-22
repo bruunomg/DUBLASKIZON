@@ -57,7 +57,7 @@ TARGET_HELP_TEXTS = {
     "eleven_instant": "ElevenLabs Instant\n\nPadrão: 120 segundos em MP3 256 kbps, 44,1 kHz, mono, para boa compatibilidade e upload menor.\nFaixa recomendada: 60–180 segundos. Limite de tamanho tratado pelo app: 400 MB como margem conservadora.\nEscolha uma voz limpa, contínua e sem música; o excedente é cortado no final.",
     "eleven_pro": "ElevenLabs Professional\n\nPadrão: blocos de 30 minutos em FLAC ou WAV, 44,1 kHz, mono.\nO app organiza o conjunto em blocos de 30–45 minutos, com total de até 180 minutos.\nLimite de tamanho tratado pelo app: 450 MB por bloco como margem conservadora. O excedente total é cortado no final.",
 }
-FORMAT_BITRATE_ESTIMATES = {"mp3": 256000, "ogg": 192000, "m4a": 192000}
+FORMAT_BITRATE_ESTIMATES = {"mp3": 256000, "ogg": 192000, "m4a": 256000}
 FORMAT_COMPRESSION_FACTORS = {"flac": 0.65}
 FORMAT_HELP_TEXT = (
     "WAV: sem compressão; melhor para edição e para preservar a maior qualidade.\n\n"
@@ -82,6 +82,7 @@ class VoiceClonePreprocessorApp:
         if not TK_AVAILABLE:
             raise RuntimeError(f"Tkinter indisponível: {TK_IMPORT_ERROR}")
         self.root = root
+        self.custom_limits = None
         self.embedded = embedded
         self.project_actions = project_actions or {}
         self.central_log_callback = self.project_actions.get("central_log")
@@ -225,6 +226,9 @@ class VoiceClonePreprocessorApp:
         self.target_combo.current(0)
         self.target_combo.pack(side="left")
         self.target_combo.bind("<<ComboboxSelected>>", self._target_changed)
+        self.custom_button = Button(options, text="PERSONALIZAR TAMANHO / DURAÇÃO", command=self.show_custom_limits, relief="flat", padx=8, pady=4, cursor="hand2")
+        self.custom_button.grid(row=5, column=0, columnspan=5, sticky="w", padx=10, pady=(0, 8))
+        apply_button_style(self.custom_button, self.theme, "accent")
         self.help_button = Button(target_controls, text="?", command=self.show_target_help, relief="flat", font=("Segoe UI", 9, "bold"), width=2, padx=0, pady=3, cursor="hand2")
         apply_button_style(self.help_button, self.theme, "secondary")
         self.help_button.pack(side="left", padx=(5, 0))
@@ -311,6 +315,65 @@ class VoiceClonePreprocessorApp:
         if hasattr(self, "target_help_tooltip"):
             self.target_help_tooltip.text = TARGET_HELP_TEXTS.get(target, TARGET_HELP_TEXTS["omnivoice"])
         self._update_selected_metrics()
+
+    def show_custom_limits(self):
+        if self.running:
+            messagebox.showinfo("Processamento", "Aguarde o processamento terminar.", parent=self.root)
+            return
+        import tkinter as tk
+        window = tk.Toplevel(self.root)
+        window.title("Personalizar saída do áudio")
+        window.transient(self.root.winfo_toplevel())
+        window.resizable(False, False)
+        surface = self.theme.get("surface", "#FFFFFF")
+        foreground = self.theme.get("text", "#1F2937")
+        window.configure(bg=surface)
+        window.grab_set()
+        current = self.custom_limits or (None, None)
+        seconds = StringVar(value="" if current[0] is None else str(current[0]))
+        size = StringVar(value="" if current[1] is None else str(current[1] / 1048576))
+        tk.Label(window, text="Escolha duração, tamanho máximo, ou ambos. Deixe em branco o limite que não deseja usar.", wraplength=460).pack(padx=16,pady=12)
+        fields = tk.Frame(window); fields.pack(fill="x",padx=16)
+        tk.Label(fields,text="Duração final (segundos):").grid(row=0,column=0,sticky="w",pady=6)
+        tk.Entry(fields,textvariable=seconds,width=18).grid(row=0,column=1,padx=8)
+        tk.Label(fields,text="Tamanho máximo (MB):").grid(row=1,column=0,sticky="w",pady=6)
+        tk.Entry(fields,textvariable=size,width=18).grid(row=1,column=1,padx=8)
+        tk.Label(window,text="O áudio é cortado no final, sem acelerar nem alongar. Se escolher ambos, vale o limite atingido primeiro. O tamanho é um teto, não um valor exato.\nEssa opção substitui os limites do perfil de clonagem.",wraplength=460).pack(padx=16,pady=12)
+        def apply():
+            try:
+                duration = float(seconds.get().replace(",", ".")) if seconds.get().strip() else None
+                mb = float(size.get().replace(",", ".")) if size.get().strip() else None
+                if duration is None and mb is None:raise ValueError("Informe pelo menos um limite.")
+                if any(v is not None and (not math.isfinite(v) or v <= 0) for v in (duration,mb)):raise ValueError("Use valores maiores que zero.")
+                maximum = int(mb * 1048576) if mb is not None else None
+                AudioCloneProcessor.custom_duration(duration or 1, duration, maximum, i18n.source_text(self.format_var.get()) or "wav", 2 if self.channels_combo.get().startswith("2") else 1)
+            except (ValueError, OverflowError, AudioProcessingError) as exc:
+                messagebox.showerror("Parâmetros",str(exc),parent=window);return
+            self.custom_limits=(duration,maximum)
+            self.custom_button.configure(text="PERSONALIZADO ✓ — ALTERAR")
+            self._update_selected_metrics();window.destroy()
+        def reset():
+            self.custom_limits=None;self.custom_button.configure(text="PERSONALIZAR TAMANHO / DURAÇÃO")
+            self._update_selected_metrics();window.destroy()
+        row=tk.Frame(window);row.pack(padx=16,pady=(0,14))
+        tk.Button(row,text="APLICAR",command=apply).pack(side="left",padx=4)
+        tk.Button(row,text="VOLTAR AO PADRÃO",command=reset).pack(side="left",padx=4)
+        tk.Button(row,text="CANCELAR",command=window.destroy).pack(side="left",padx=4)
+
+        def theme_widget(widget):
+            if isinstance(widget, (tk.Frame, tk.Label)):
+                widget.configure(bg=surface)
+            if isinstance(widget, tk.Label):
+                widget.configure(fg=foreground, font=("Segoe UI", 10))
+            if isinstance(widget, tk.Entry):
+                widget.configure(bg=self.theme.get("input", surface), fg=self.theme.get("input_text", foreground), insertbackground=foreground, relief="solid", bd=1, font=("Segoe UI", 11))
+            if isinstance(widget, tk.Button):
+                role = "primary" if widget.cget("text") == "APLICAR" else "secondary"
+                apply_button_style(widget, self.theme, role)
+                widget.configure(font=("Segoe UI", 9, "bold"), padx=12, pady=7, relief="flat")
+            for child in widget.winfo_children():
+                theme_widget(child)
+        theme_widget(window)
 
     def show_target_help(self):
         target = self.current_target()
@@ -407,6 +470,16 @@ class VoiceClonePreprocessorApp:
         except Exception:
             channels = 1
         output_format = i18n.source_text(self.format_var.get()) or "wav"
+        limits = getattr(self, "custom_limits", None)
+        if limits is not None and input_duration > 0:
+            try:
+                final_duration = AudioCloneProcessor.custom_duration(input_duration, *limits, output_format, channels)
+            except AudioProcessingError:
+                self.status_var.set("Limite personalizado muito pequeno para este formato. Ajuste o tamanho ou a duração.")
+                return 0.0, 0, None
+            estimated = self._estimate_encoded_size(final_duration, output_format, channels)
+            if limits[1] is not None:estimated = min(estimated, limits[1])
+            return final_duration, estimated, None
         final_duration = min(max(0.0, input_duration), mode.maximum_seconds)
         estimated_total = self._estimate_encoded_size(final_duration, output_format, channels)
         estimated_peak = None
@@ -450,6 +523,9 @@ class VoiceClonePreprocessorApp:
             size_limit = min(mode.maximum_bytes, natural_max_size) if natural_max_size > 0 else mode.maximum_bytes
         size_limit = max(1, size_limit)
         duration_limit = mode.maximum_seconds
+        if getattr(self, "custom_limits", None) is not None:
+            duration_limit = self.custom_limits[0] or total_duration
+            size_limit = self.custom_limits[1] or max(1, estimated_total)
         size_percent = min(100.0, size_for_bar / size_limit * 100.0)
         duration_percent = min(100.0, final_duration / max(1.0, duration_limit) * 100.0)
         self.size_progress.configure(value=size_percent)
@@ -689,17 +765,17 @@ class VoiceClonePreprocessorApp:
         self.process_button.configure(text="CANCELAR PROCESSAMENTO")
         selected_label = "selecionado(s)" if self.file_tree.selection() else "da lista"
         self.status_var.set(f"Juntando {len(selected_paths)} áudio(s) {selected_label} e preparando para {self.target_combo.get()}...")
-        args = (selected_paths, self.current_target(), self.output_dir_var.get(), self.format_var.get(), self.channels_combo.get(), silence_db, silence_seconds, omni_seconds, block_minutes, self.normalize_var.get() == "1")
+        args = (selected_paths, self.current_target(), self.output_dir_var.get(), self.format_var.get(), self.channels_combo.get(), silence_db, silence_seconds, omni_seconds, block_minutes, self.normalize_var.get() == "1", self.custom_limits)
         self.worker = threading.Thread(target=self._worker, args=args, daemon=True)
         self.worker.start()
 
-    def _worker(self, paths, target, output_root, output_format, channels_value, silence_db, silence_seconds, omni_seconds, block_minutes, normalize):
+    def _worker(self, paths, target, output_root, output_format, channels_value, silence_db, silence_seconds, omni_seconds, block_minutes, normalize, custom_limits=None):
         try:
             channels = 2 if channels_value.startswith("2") else 1
             processor = self.make_processor(silence_db=silence_db, silence_seconds=silence_seconds)
             def on_progress(percent, stage):
                 self.queue.put(("process_progress", (percent, stage)))
-            report = processor.process(paths, target, output_root=Path(output_root), output_format=output_format, channels=channels, normalize=normalize, omnivoice_seconds=omni_seconds, block_minutes=block_minutes, progress_callback=on_progress)
+            report = processor.process(paths, target, output_root=Path(output_root), output_format=output_format, channels=channels, normalize=normalize, omnivoice_seconds=omni_seconds, block_minutes=block_minutes, progress_callback=on_progress, custom_seconds=(custom_limits or (None,None))[0], custom_max_bytes=(custom_limits or (None,None))[1])
             self.queue.put(("done", report))
         except Exception as exc:
             self.queue.put(("error", str(exc)))

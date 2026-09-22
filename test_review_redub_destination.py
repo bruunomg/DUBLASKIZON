@@ -38,6 +38,7 @@ with tempfile.TemporaryDirectory() as folder:
         return SimpleNamespace(returncode=0, stdout="ok")
 
     review_tab.subprocess.run = fake_run
+    app._run_cancellable_generation = fake_run
     try:
         review_tab.ReviewApp._run_generation(app, "CAP01/cena", "texto", target, target, reference, "unchanged")
     finally:

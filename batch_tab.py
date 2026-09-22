@@ -31,6 +31,7 @@ import shutil
 import time
 import re
 import json
+from generation_progress import GenerationProgress
 import tempfile
 import wave
 import urllib.request
@@ -74,8 +75,10 @@ LANGUAGE = "pt"
 INSTRUCT = "portuguese accent"
 OVERWRITE = False
 DEFAULT_MODEL_CHOICES = [
+    # Backend F5 has a separate runtime; never route its checkpoint through OmniVoice.
     ("OmniVoice BR-PT v1.5 — recomendado", "edwixx/omnivoice-brpt-v15"),
-    ("OmniVoice base — 600+ idiomas", "k2-fsa/OmniVoice"),
+    ("OmniVoice oficial — russo e 600+ idiomas", "k2-fsa/OmniVoice"),
+    ("F5-TTS Russian — russo / inglês (uso não comercial)", "hotstone228/F5-TTS-Russian"),
 ]
 MODEL_CHOICES = list(DEFAULT_MODEL_CHOICES)
 MODE_CHOICES = [
@@ -312,7 +315,17 @@ class RoundedProgress:
         self.height = height
         self.track = track
         self.fill = fill
-        self.canvas = Canvas(parent, width=width, height=height, highlightthickness=0, bg=parent.cget("background"))
+        try:
+            background = parent.cget("background")
+        except (tk.TclError, AttributeError):
+            # ttk widgets expose their colors through styles, not the Tk
+            # ``-background`` option.  Keep the progress canvas compatible
+            # with both classic Tk frames and ttk frames.
+            try:
+                background = ttk.Style(parent).lookup("TFrame", "background") or "white"
+            except tk.TclError:
+                background = "white"
+        self.canvas = Canvas(parent, width=width, height=height, highlightthickness=0, bg=background)
         self.fraction = 0.0
         self.draw()
 
@@ -372,8 +385,18 @@ def hidden_process_kwargs() -> dict:
     return kwargs
 
 
+def find_voice_command(model):
+    from f5_backend import MODEL, inference_command
+    return inference_command() if model == MODEL else find_omnivoice_command()
+
+
 def find_omnivoice_command() -> list[str] | None:
     configured = os.environ.get("OMNIVOICE_INFER")
+    if not configured:
+        from dependency_setup import inference_command
+        managed = inference_command()
+        if managed:
+            return managed
     candidates = []
     if configured:
         candidates.append(Path(configured).expanduser())
@@ -463,33 +486,29 @@ def model_is_cached(model_id: str) -> bool:
     return any((cache_root / f"models--{encoded}").is_dir() for cache_root in model_cache_roots())
 
 
-def find_audio_by_stem() -> dict[str, Path]:
-    if not AUDIO_DIR.is_dir():
-        return {}
-    files: dict[str, Path] = {}
-    for path in sorted(AUDIO_DIR.rglob("*"), key=lambda item: str(item).casefold()):
-        if (
-            is_internal_omnivoice_backup(path)
-            or is_format_archive_dir(path.parent)
-            or not path.is_file()
-            or path.suffix.casefold() not in AUDIO_EXTENSIONS
-        ):
-            continue
-        stem = relative_scene_key(path, AUDIO_DIR)
-        current = files.get(stem)
-        if current is None or (is_wav_path(path) and not is_wav_path(current)):
-            files[stem] = path
+def find_audio_by_stem(directory=None) -> dict[str, Path]:
+    root=Path(directory) if directory is not None else AUDIO_DIR
+    files={}
+    for folder,dirs,names in os.walk(root):
+        dirs[:]=sorted((d for d in dirs if d.casefold()!=OMNIVOICE_BACKUP_DIR_NAME.casefold() and not is_format_archive_dir(Path(d))),key=str.casefold)
+        for name in sorted(names,key=str.casefold):
+            path=Path(folder)/name
+            if path.suffix.casefold() not in AUDIO_EXTENSIONS:continue
+            stem=path.relative_to(root).with_suffix('').as_posix()
+            current=files.get(stem)
+            if current is None or (is_wav_path(path) and not is_wav_path(current)):files[stem]=path
     return files
 
 
-def find_text_by_stem() -> dict[str, Path]:
-    if not TEXT_DIR.is_dir():
-        return {}
-    return {
-        relative_scene_key(path, TEXT_DIR): path
-        for path in sorted(TEXT_DIR.rglob("*"), key=lambda item: str(item).casefold())
-        if path.is_file() and path.suffix.lower() == ".txt"
-    }
+def find_text_by_stem(directory=None) -> dict[str, Path]:
+    root=Path(directory) if directory is not None else TEXT_DIR
+    files={}
+    for folder,dirs,names in os.walk(root):
+        dirs.sort(key=str.casefold)
+        for name in sorted(names,key=str.casefold):
+            if Path(name).suffix.lower()=='.txt':
+                path=Path(folder)/name;files[path.relative_to(root).with_suffix('').as_posix()]=path
+    return files
 
 
 def _unique_archive_destination(source: Path, archive_dir: Path) -> Path:
@@ -617,20 +636,20 @@ class BatchApp:
         self.pending_wav_audio = [path for path in self.audio_by_stem.values() if wav_needs_omnivoice_adjustment(path)]
         self.initial_audio_conversion_errors: list[str] = [f"WAV legado renomeado: {item}" for item in self.legacy_audio_renames]
         self.initial_conversion_prompted = False
+        self.auto_translation_var = StringVar(value="0")
+        self.auto_translation_settings = {}
+        self.speech_language_var = StringVar(value='Russo' if i18n.CURRENT_LANGUAGE=='ru' else 'Português (Brasil)')
+        self.align_audio_var = StringVar(value='0')
+        self.align_audio_settings = {'pauses': False, 'max_change': 25}
         self.text_by_stem = find_text_by_stem()
         missing_text = sorted(set(self.audio_by_stem) - set(self.text_by_stem), key=str.casefold)
-        if missing_text and messagebox.askyesno(
-            "Áudios sem TXT",
-            f"Foram encontrados {len(missing_text)} áudio(s) sem TXT acompanhante.\n\nDeseja gerar os TXT em branco agora?",
+        if missing_text:
+            messagebox.showinfo(
+            "Dublagem sem texto em português",
+            "Você pode dublar sem TXT de texto português: o Dublaskizon também transcreve o áudio, traduz e depois dubla.\n\nAtive TRANSCREVER E TRADUZIR QUANDO FALTAR TXT e escolha os modelos em CONFIGURAR TRANSCRIÇÃO / TRADUÇÃO. Na primeira utilização, prepare as dependências.",
             parent=self.root,
-        ):
-            TEXT_DIR.mkdir(parents=True, exist_ok=True)
-            for stem in missing_text:
-                target = TEXT_DIR / f"{stem}.txt"
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.touch(exist_ok=True)
-            self.text_by_stem = find_text_by_stem()
-        self.stems = sorted(set(self.audio_by_stem) & set(self.text_by_stem), key=str.casefold)
+            )
+        self.stems = self.available_translation_stems()
         self.sort_mode = "alphabetical"
         self.run_stems = list(self.stems)
         self.force_overwrite = False
@@ -666,7 +685,8 @@ class BatchApp:
         self.current_var = StringVar(value="Aguardando início — escolha a ferramenta e clique em INICIAR DUBLAGEM")
         self.summary_var = StringVar(value="")
         self.model_choices = discover_model_choices()
-        self.model_var = StringVar(value=self.display_model(*self.model_choices[0]))
+        initial_model = next((item for item in self.model_choices if item[1]=='k2-fsa/OmniVoice'),self.model_choices[0]) if i18n.CURRENT_LANGUAGE=='ru' else self.model_choices[0]
+        self.model_var = StringVar(value=self.display_model(*initial_model))
         self.mode_var = StringVar(value=MODE_CHOICES[0][0])
         self.instruct_var = StringVar(value=INSTRUCT)
         self.voice_profile_var = StringVar(value=next(iter(VOICE_PROFILES)))
@@ -702,6 +722,9 @@ class BatchApp:
     def load_voice_settings(self):
         try:
             data = json.loads(VOICE_SETTINGS_FILE.read_text(encoding="utf-8"))
+            self.auto_translation_settings=dict(data.get("auto_translation_settings",{}))
+            self.speech_language_var.set(str(data.get('speech_language', self.auto_translation_settings.get('language', self.speech_language_var.get()))))
+            self.align_audio_settings.update(data.get('align_audio_settings', {}))
             profile = str(data.get("default_profile", ""))
             if profile in VOICE_PROFILES:
                 self.voice_profile_var.set(profile)
@@ -727,6 +750,9 @@ class BatchApp:
                 "complement": self.instruct_var.get().strip(),
                 "r_pronunciation": self.selected_r_pronunciation_id(),
                 "characters": self.character_voice_profiles,
+                "auto_translation_settings": getattr(self,"auto_translation_settings",{}),
+                "speech_language": i18n.source_text(self.speech_language_var.get()),
+                "align_audio_settings": self.align_audio_settings,
             }, ensure_ascii=False, indent=2), encoding="utf-8")
         except OSError as exc:
             self.emit_log(f"Não foi possível salvar as escolhas de voz: {exc}", "error")
@@ -819,6 +845,17 @@ class BatchApp:
                 surface_color(theme, "progress_dub", "#7C3AED"),
                 surface,
             )
+        for name, role, fallback in (
+            ("transcribe_progress", "progress_transcribe", "#278D9F"),
+            ("translate_progress", "progress_translate", "#BA8834"),
+        ):
+            bar = getattr(self, name, None)
+            if bar is not None:
+                bar.set_theme(
+                    surface_color(theme, "progress_track", theme.get("border", "#CBD5E1")),
+                    surface_color(theme, role, fallback),
+                    surface,
+                )
         if hasattr(self, "audio_player"):
             self.audio_player.apply_theme(theme)
         if hasattr(self, "dependencies_button"):
@@ -952,7 +989,7 @@ class BatchApp:
         rebuilt = find_audio_by_stem()
         self.audio_by_stem = {stem: path for stem, path in rebuilt.items() if is_wav_path(path)}
         self.text_by_stem = find_text_by_stem()
-        self.stems = sorted(set(self.audio_by_stem) & set(self.text_by_stem), key=str.casefold)
+        self.stems = self.available_translation_stems()
         self.run_stems = list(self.stems)
         if hasattr(self, "statuses"):
             self.statuses = {stem: self.statuses.get(stem, "pendente") for stem in self.stems}
@@ -1064,7 +1101,7 @@ class BatchApp:
             current = self.audio_by_stem.get(stem)
             if current is None or not is_wav_path(current) or path == current:
                 self.audio_by_stem[stem] = path
-        self.stems = sorted(set(self.audio_by_stem) & set(self.text_by_stem), key=str.casefold)
+        self.stems = self.available_translation_stems()
         self.run_stems = list(self.stems)
         self.statuses = {stem: self.statuses.get(stem, "pendente") for stem in self.stems}
         self.populate_queue()
@@ -1294,6 +1331,33 @@ class BatchApp:
         cache = "cache local" if model_is_cached(model_id) else "download sob demanda"
         return f"{label} [{cache}]"
 
+    def available_translation_stems(self):
+        variable=getattr(self,"auto_translation_var",None)
+        enabled=variable is not None and variable.get()=="1"
+        return sorted(set(self.audio_by_stem) if enabled else set(self.audio_by_stem)&set(self.text_by_stem),key=str.casefold)
+
+    def configure_auto_translation(self):
+        if self.running:return
+        from audio_translation import choose_settings
+        config=choose_settings(self.root,getattr(self,"auto_translation_settings",{}))
+        if config is not None:
+            self.auto_translation_settings=config
+            self.speech_language_var.set(config['language'])
+            self.save_voice_settings()
+        return config
+
+    def toggle_auto_translation(self):
+        if self.running:
+            self.auto_translation_var.set("1" if getattr(self,"run_translation_settings",None) else "0")
+            return
+        if self.auto_translation_var.get()=="1":
+            if self.configure_auto_translation() is None:
+                self.auto_translation_var.set("0")
+        self.stems=self.available_translation_stems()
+        self.run_stems=list(self.stems)
+        self.statuses={stem:self.statuses.get(stem,"pendente") for stem in self.stems}
+        self.populate_queue()
+
     def selected_r_pronunciation_id(self) -> str:
         variable = getattr(self, "r_pronunciation_var", None)
         raw_value = variable.get() if variable is not None else getattr(self, "selected_r_pronunciation", R_PRONUNCIATION_CHOICES[0][0])
@@ -1304,9 +1368,9 @@ class BatchApp:
         return R_PRONUNCIATION_CHOICES[0][1]
 
     def selected_model_id(self):
-        selected = self.model_var.get()
+        selected = i18n.source_text(self.model_var.get())
         for label, model_id in self.model_choices:
-            if selected.startswith(label):
+            if selected.startswith(label) or any(self.model_var.get().startswith(i18n.tr(label, language)) for language in i18n.LANGUAGE_LABELS):
                 return model_id
         return self.model_choices[0][1]
 
@@ -1335,6 +1399,10 @@ class BatchApp:
 
     def update_model_info(self):
         model_id = self.selected_model_id()
+        from f5_backend import MODEL as F5_MODEL
+        if model_id == F5_MODEL:
+            self.model_info_var.set('F5-TTS Russian: prepare em REQUISITOS; russo / inglês; uso não comercial.')
+            return
         if model_is_cached(model_id):
             self.model_info_var.set(f"Modelo detectado no cache local: {model_id}")
         else:
@@ -1344,7 +1412,7 @@ class BatchApp:
         mode_id = self.selected_mode_id()
         if mode_id == "clone":
             self.mode_info_var.set("Mais indicado para dublagem: replica a voz do WAV de referência.")
-            self.instruct_entry.configure(state="disabled")
+            self.instruct_entry.configure(state="normal")
             self.voice_profile_combo.configure(state="disabled")
             self.character_voices_button.configure(state="disabled")
         elif mode_id == "design":
@@ -1364,7 +1432,41 @@ class BatchApp:
         combo.bind("<Button-5>", lambda _event: "break")
 
     def on_model_changed(self, _event=None):
+        from f5_backend import MODEL
+        if self.selected_model_id() == MODEL:
+            self.speech_language_var.set(i18n.tr('Russo'))
+            self.mode_var.set(i18n.tr(next(label for label, mode in MODE_CHOICES if mode == 'clone')))
+            self.auto_translation_settings['language'] = 'Russo'
+            self.update_mode_info()
+        elif self.selected_model_id() == 'edwixx/omnivoice-brpt-v15':
+            self.speech_language_var.set(i18n.tr('Português (Brasil)'))
+            self.auto_translation_settings['language'] = 'Português (Brasil)'
+            if self.instruct_var.get().strip().casefold() in ('russo','russian','russian accent','русский','ruso'):
+                self.instruct_var.set('portuguese accent')
         self.update_model_info()
+        self.save_voice_settings()
+
+    def on_voice_complement_changed(self, *_args):
+        raw = self.instruct_var.get().strip().casefold()
+        language = 'Russo' if raw in ('russo','russian','russian accent','русский','ruso') else 'Português (Brasil)' if raw in ('português (brasil)','portuguese accent') else None
+        if not language:return
+        self.speech_language_var.set(i18n.tr(language))
+        self.auto_translation_settings['language']=language
+        # Display the actual multilingual model, rather than silently using it.
+        if language == 'Russo' and self.selected_model_id() == 'edwixx/omnivoice-brpt-v15':
+            label=next(label for label,model in self.model_choices if model=='k2-fsa/OmniVoice')
+            self.model_var.set(self.display_model(label,'k2-fsa/OmniVoice'))
+        self.update_model_info()
+        self.save_voice_settings()
+
+    def on_speech_language_changed(self, _event=None):
+        language=i18n.source_text(self.speech_language_var.get())
+        self.auto_translation_settings['language']=language
+        if language != 'Português (Brasil)' and self.selected_model_id() == 'edwixx/omnivoice-brpt-v15':
+            label=next(label for label,model in self.model_choices if model=='k2-fsa/OmniVoice')
+            self.model_var.set(self.display_model(label,'k2-fsa/OmniVoice'))
+        self.update_model_info()
+        self.save_voice_settings()
 
     def on_mode_changed(self, _event=None):
         self.update_mode_info()
@@ -1418,7 +1520,7 @@ class BatchApp:
         self.model_combo.configure(state="readonly" if state == "normal" else "disabled")
         self.mode_combo.configure(state="readonly" if state == "normal" else "disabled")
         voice_enabled = self.selected_mode_id() in {"design", "auto"}
-        self.instruct_entry.configure(state=state if voice_enabled else "disabled")
+        self.instruct_entry.configure(state=state)
         self.voice_profile_combo.configure(state="readonly" if state == "normal" and voice_enabled else "disabled")
         self.character_voices_button.configure(state=state if voice_enabled else "disabled")
         if hasattr(self, "r_pronunciation_combo"):
@@ -1458,6 +1560,13 @@ class BatchApp:
         self.model_combo.bind("<<ComboboxSelected>>", self.on_model_changed)
         self.bind_combo_click_only(self.model_combo)
         Label(options, textvariable=self.model_info_var, bg="#FFFFFF", fg="#6B7280", font=("Segoe UI", 8)).grid(row=2, column=0, sticky="w", padx=(10, 6), pady=(0, 8))
+        from audio_translation import LANGUAGES
+        language_row = ttk.Frame(options)
+        language_row.grid(row=3,column=0,columnspan=2,sticky='w',padx=10,pady=(0,5))
+        ttk.Label(language_row,text='Idioma da voz:').pack(side='left')
+        language_combo=ttk.Combobox(language_row,textvariable=self.speech_language_var,values=list(LANGUAGES),state='readonly',width=22)
+        language_combo.pack(side='left',padx=6)
+        language_combo.bind('<<ComboboxSelected>>',self.on_speech_language_changed)
 
         Label(options, text="Modo de geração", bg="#FFFFFF", fg="#26364A", font=("Segoe UI", 9, "bold")).grid(row=0, column=1, sticky="w", padx=6, pady=(9, 2))
         self.mode_combo = ttk.Combobox(options, textvariable=self.mode_var, values=[label for label, _mode in MODE_CHOICES], state="readonly", width=42)
@@ -1483,7 +1592,9 @@ class BatchApp:
         Label(options, text="Suaviza ou reforça o R na síntese.", bg="#FFFFFF", fg="#6B7280", font=("Segoe UI", 8)).grid(row=2, column=3, sticky="w", padx=6, pady=(0, 8))
 
         Label(options, text="Complemento da voz (opcional)", bg="#FFFFFF", fg="#26364A", font=("Segoe UI", 9, "bold")).grid(row=0, column=4, sticky="w", padx=6, pady=(9, 2))
-        self.instruct_entry = ttk.Entry(options, textvariable=self.instruct_var, width=36)
+        self.instruct_entry = ttk.Combobox(options, textvariable=self.instruct_var, values=('', 'Russo', 'portuguese accent'), width=36)
+        if not getattr(self,'_complement_trace',None):
+            self._complement_trace=self.instruct_var.trace_add('write',self.on_voice_complement_changed)
         self.instruct_entry.grid(row=1, column=4, sticky="ew", padx=(6, 10), pady=(0, 8))
         Label(options, text="Ex.: sotaque, emoção, idade, intensidade ou estilo.", bg="#FFFFFF", fg="#6B7280", font=("Segoe UI", 8)).grid(row=2, column=4, sticky="w", padx=(6, 10), pady=(0, 8))
         options.grid_columnconfigure(0, weight=1)
@@ -1493,6 +1604,7 @@ class BatchApp:
         options.grid_columnconfigure(4, weight=1)
         main = Frame(self.root, bg="#F5F6FA")
         main.pack(fill="both", expand=True, padx=16, pady=(0, 10))
+
         self.main_pane = ttk.PanedWindow(main, orient="horizontal")
         self.main_pane.pack(fill="both", expand=True)
 
@@ -1546,14 +1658,44 @@ class BatchApp:
         self.audio_conversion_progress.pack(side="right", padx=(4, 0))
         Label(scene_header, textvariable=self.audio_conversion_status_var, bg="white", fg="#2563EB", font=("Segoe UI", 7), anchor="e").pack(side="right", padx=(4, 0))
 
-        progress_frame = Frame(right, bg="white")
+        progress_bg = surface_color(getattr(self, "theme", {}), "surface", "#FFFFFF")
+        progress_frame = Frame(right, bg=progress_bg)
         progress_frame.pack(fill="x", padx=14, pady=(2, 10))
-        Label(progress_frame, text="Clonagem / referência", bg="white", fg="#2F75B5", font=("Segoe UI", 9, "bold")).pack(anchor="w")
-        self.clone_progress = RoundedProgress(progress_frame, width=560, height=22, track="#E7EEF8", fill="#2F75B5")
-        self.clone_progress.pack(fill="x", pady=(3, 8))
-        Label(progress_frame, text="Dublagem / síntese", bg="white", fg="#8E6BBE", font=("Segoe UI", 9, "bold")).pack(anchor="w")
-        self.dub_progress = RoundedProgress(progress_frame, width=560, height=22, track="#F0EAF7", fill="#9B7BC5")
-        self.dub_progress.pack(fill="x", pady=(3, 3))
+        # Duas linhas paralelas: a atividade principal e a etapa automática
+        # relacionada ficam visíveis juntas. A largura menor deixa espaço para
+        # os controles de início no painel à direita.
+        progress_grid = ttk.Frame(progress_frame)
+        progress_grid.pack(fill="x")
+        progress_grid.columnconfigure(0, weight=1)
+        progress_grid.columnconfigure(1, weight=1)
+        progress_grid.columnconfigure(2, weight=0)
+
+        def progress_panel(row, column, title, color, attribute, track):
+            panel = ttk.Frame(progress_grid)
+            panel.grid(row=row, column=column, sticky="ew", padx=(0, 8), pady=(0, 5))
+            ttk.Label(panel, text=title).pack(anchor="w")
+            bar = RoundedProgress(panel, width=380, height=18, track=track, fill=color)
+            bar.pack(fill="x", expand=True)
+            setattr(self, attribute, bar)
+
+        progress_panel(0, 0, "Clonagem / referência", "#2F75B5", "clone_progress", "#E7EEF8")
+        progress_panel(0, 1, "Transcrevendo", "#278D9F", "transcribe_progress", "#E7EEF8")
+        progress_panel(1, 0, "Dublagem / síntese", "#9B7BC5", "dub_progress", "#F0EAF7")
+        progress_panel(1, 1, "Traduzindo", "#BA8834", "translate_progress", "#FFF1D6")
+
+        start_panel = ttk.Frame(progress_grid)
+        start_panel.grid(row=0, column=2, rowspan=2, sticky="nsew", padx=(2, 0))
+        progress_grid.columnconfigure(2, minsize=340)
+        progress_grid.rowconfigure(0, weight=1)
+        progress_grid.rowconfigure(1, weight=1)
+        self.start_button = Button(start_panel, text="INICIAR DUBLAGEM", command=self.start_run,
+                                   bg="#C00000", activebackground="#8B0000", fg="white",
+                                   activeforeground="white", font=("Segoe UI", 12, "bold"),
+                                   relief="flat", padx=22, pady=18, cursor="hand2")
+        self.start_button.pack(fill="both", expand=True, pady=(16, 5))
+        ttk.Checkbutton(start_panel, text='ALINHAR RITMO E DURAÇÃO AO ORIGINAL', variable=self.align_audio_var,
+                        onvalue='1', offvalue='0').pack(fill='x', pady=(2, 3))
+        ttk.Button(start_panel, text='CONFIGURAR ALINHAMENTO', command=self.configure_audio_alignment).pack(fill='x')
         Label(progress_frame, text="Azul = referência/clonagem   Lilás = fala em português   Verde = cena pulada/concluída", bg="white", fg="#6B7280", font=("Segoe UI", 8)).pack(anchor="w", pady=(3, 0))
 
         controls = Frame(right, bg="white")
@@ -1564,8 +1706,15 @@ class BatchApp:
         self.stop_button.pack(side="left", padx=(0, 6))
         self.cancel_button = Button(controls, text="Cancelar", command=self.cancel_run, bg="#C00000", fg="white", relief="flat", padx=12, pady=5)
         self.cancel_button.pack(side="left")
-        self.start_button = Button(controls, text="INICIAR DUBLAGEM", command=self.start_run, bg="#C00000", activebackground="#8B0000", fg="white", activeforeground="white", font=("Segoe UI", 11, "bold"), relief="flat", padx=22, pady=10, cursor="hand2")
-        self.start_button.pack(side="right")
+        # Mantém a largura alinhada, mas deixa o ttk calcular a altura dos
+        # dois controles; desativar a propagação aqui fazia o checkbox e o
+        # botão de configuração ficarem cortados.
+        start_group=ttk.Frame(start_panel)
+        start_group.pack(fill='x', pady=(4, 0))
+        ttk.Checkbutton(start_group,text="TRANSCREVER E TRADUZIR QUANDO FALTAR TXT",variable=self.auto_translation_var,onvalue="1",offvalue="0",command=self.toggle_auto_translation).pack(fill='x',anchor='w',pady=(0,4))
+        ttk.Button(start_group,text="CONFIGURAR TRANSCRIÇÃO / TRADUÇÃO",command=self.configure_auto_translation).pack(fill='x',pady=(0,5))
+        # O botão de início fica junto das quatro barras, acima; este grupo
+        # mantém apenas a opção e a configuração da transcrição.
 
         log_label = Frame(right, bg="white")
         log_label.pack(fill="x", padx=14)
@@ -1800,6 +1949,13 @@ class BatchApp:
             self.audio_player.set_scene_text_integration(self.load_scene_text_for_player, self.save_scene_text_from_player)
             self.audio_player.set_review_snapshot_provider(None)
             return
+        review_app.translation_settings_provider=lambda:dict(getattr(self,"auto_translation_settings",{}))
+        review_app.alignment_settings_provider=lambda:dict(self.align_audio_settings)
+        review_app.speech_language_provider=lambda:i18n.source_text(self.speech_language_var.get())
+        review_app.voice_model_provider=self.selected_model_id
+        # Use the same scene text, folders, part generation and job controls as Review.
+        self.audio_player.translation_controller = review_app
+        self.audio_player.part_context_provider = review_app.part_generation_context
         actions = {
             "open_audacity": lambda stem: review_app.run_audio_review_action(stem, "open_audacity"),
             "approve": lambda stem: review_app.run_audio_review_action(stem, "approve"),
@@ -1809,7 +1965,14 @@ class BatchApp:
         }
         self.audio_player.set_scene_integration(self._sync_audio_player_selection, actions)
         self.audio_player.set_scene_text_integration(review_app.load_scene_text_for_player, review_app.save_scene_text_from_player)
-        self.audio_player.set_review_snapshot_provider(getattr(review_app, "player_review_snapshot", None))
+        def batch_snapshot(stem=None):
+            if self.running:
+                return {"clone_progress":self.clone_progress.fraction*100,
+                        "dub_progress":self.dub_progress.fraction*100,
+                        "phase":self.current_var.get()+": "+self.status_var.get()}
+            return None
+        review_app.batch_progress_provider=batch_snapshot
+        self.audio_player.set_review_snapshot_provider(review_app.player_review_snapshot)
         if hasattr(review_app, "set_player_refresh_callback"):
             review_app.set_player_refresh_callback(self.audio_player.refresh_current_scene)
         if hasattr(review_app, "set_process_message_callback"):
@@ -1823,6 +1986,10 @@ class BatchApp:
         self.audio_player.set_review_preferences({
             "auto_open_var": review_app.auto_open_var,
             "auto_open_command": review_app.toggle_auto_open,
+            "request_translation_var": getattr(review_app,"request_translation_var",None),
+            "align_original_var": getattr(review_app,'align_original_var',None),
+            "translate_missing_var": getattr(review_app,'translate_missing_var',None),
+            "request_character_var": getattr(review_app,"request_character_var",None),
             "request_r_var": review_app.request_r_var,
             "request_r_command": review_app.toggle_r_request,
         })
@@ -1883,9 +2050,8 @@ class BatchApp:
             self.queue_list.itemconfig(0, foreground=empty_color)
             return
         queue_color = "#FFFFFF" if self.theme.get("mode") in {"medio", "escuro"} else self.theme.get("input_text", "#374151")
-        for index, stem in enumerate(self.stems):
-            self.queue_list.insert(END, f"[ ] {self.scene_display_name(stem)}")
-            self.queue_list.itemconfig(index, foreground=queue_color)
+        self.queue_list.configure(fg=queue_color)
+        if self.stems:self.queue_list.insert(END,*(f"[ ] {self.scene_display_name(stem)}" for stem in self.stems))
         missing_text = sorted(set(self.audio_by_stem) - set(self.text_by_stem))
         missing_audio = sorted(set(self.text_by_stem) - set(self.audio_by_stem))
         if missing_text:
@@ -1973,18 +2139,24 @@ class BatchApp:
             self.current_stem = stem
             self.current_var.set(f"[{number}/{total}] {stem}")
             self.status_var.set("Preparando referência e clonagem...")
-            self.clone_progress.set(0.10)
-            self.dub_progress.set(0.02)
+            self.clone_progress.set(0)
+            self.dub_progress.set(0)
+            for name in ('transcribe_progress','translate_progress'):
+                if hasattr(self,name):getattr(self,name).set(0)
             self.update_queue_item(stem, "[CLONANDO]", "#2F75B5")
-            self.animate_dub_progress()
+            self.stop_progress_animation()
         elif kind == "stage":
             _, stem, stage, fraction = message
-            if stage == "clone":
-                self.clone_progress.set(fraction)
+            if stage in ('transcribe','translate'):
+                bar=getattr(self,stage+'_progress',None)
+                if bar is not None:bar.set(fraction)
+                self.status_var.set(f"{stem}: "+('transcrevendo áudio original' if stage=='transcribe' else 'traduzindo texto')+f' ({fraction*100:.0f}%)')
+            elif stage == "clone":
+                self.clone_progress.set(max(self.clone_progress.fraction, fraction))
                 self.status_var.set(f"{stem}: clonando/preparando referência...")
             elif stage == "dub":
                 self.clone_progress.set(1.0)
-                self.dub_progress.set(fraction)
+                self.dub_progress.set(max(self.dub_progress.fraction, fraction))
                 self.status_var.set(f"{stem}: dublando em português...")
         elif kind == "skipped":
             _, stem = message
@@ -2001,6 +2173,9 @@ class BatchApp:
             self.update_queue_item(stem, "[OK]", "#2E7D32")
             self.counts["gerados"] += 1
             self.status_var.set(f"Concluído: {stem}")
+            callback = self.project_actions.get('scene_completed')
+            if callback:
+                callback(stem, self.audio_by_stem[stem], TEXT_DIR / f'{stem}.txt', 'normal')
             try:
                 self.audio_player.refresh_current_scene(stem)
             except Exception:
@@ -2085,6 +2260,69 @@ class BatchApp:
             self.root.after_cancel(self.stage_after_id)
             self.stage_after_id = None
 
+    def configure_audio_alignment(self):
+        from tkinter import Toplevel, BooleanVar, Spinbox
+        window = Toplevel(self.root)
+        window.title('Alinhamento de ritmo e duração')
+        window.transient(self.root)
+        surface = getattr(self, 'theme', {}).get('surface', '#FFFFFF')
+        window.configure(bg=surface)
+        body = ttk.Frame(window, padding=16)
+        body.pack(fill='both', expand=True)
+        ttk.Label(body, text='Ajusta a duração ao original preservando o tom. Não sincroniza palavras ou movimentos da boca.', wraplength=460).pack(anchor='w', pady=(0, 10))
+        pauses = BooleanVar(value=bool(self.align_audio_settings.get('pauses', False)))
+        ttk.Checkbutton(body, text='Aproximar pausas e intensidade (experimental)', variable=pauses).pack(anchor='w')
+        ttk.Label(body, text='Essa aproximação pode atenuar sílabas em traduções com ritmo diferente. Desative para ajustar somente a duração.', wraplength=460).pack(anchor='w', pady=6)
+        ttk.Label(body, text='Limite de alteração de velocidade (%):').pack(anchor='w')
+        limit = StringVar(value=str(self.align_audio_settings.get('max_change', 25)))
+        ttk.Spinbox(body, from_=5, to=100, textvariable=limit, width=8).pack(anchor='w')
+        ttk.Label(body, text='Acima do limite, a cena será marcada como falha para revisão, sem substituir o áudio anterior. Mudanças durante um lote valem para o próximo lote.', wraplength=460).pack(anchor='w', pady=8)
+        ttk.Label(body, text='Usa FFmpeg já disponível na ferramenta. O modo experimental usa NumPy e pydub; não baixa modelos de IA.', wraplength=460).pack(anchor='w', pady=6)
+        ttk.Button(body, text='BAIXAR / PREPARAR FERRAMENTAS', command=self.dependencies_button.invoke).pack(fill='x', pady=5)
+        def save():
+            try:
+                value = int(limit.get())
+                if not 5 <= value <= 100: raise ValueError()
+            except ValueError:
+                messagebox.showerror('Alinhamento', 'Informe um limite entre 5 e 100%.', parent=window)
+                return
+            self.align_audio_settings = {'pauses': pauses.get(), 'max_change': value}
+            self.save_voice_settings()
+            window.destroy()
+        ttk.Button(body, text='SALVAR', command=save).pack(fill='x', pady=5)
+
+    def align_generated_audio(self, generated, original):
+        options = getattr(self, 'run_alignment_settings', None)
+        if not options: return
+        from personalized_dubbing_tab import _audio_duration, _ffmpeg_path, _atempo_chain, match_original_expression
+        ffmpeg = _ffmpeg_path()
+        if not ffmpeg: raise RuntimeError('FFmpeg ausente. Use BAIXAR / PREPARAR FERRAMENTAS.')
+        source_duration, target_duration = _audio_duration(generated), _audio_duration(original)
+        if min(source_duration, target_duration) <= 0: raise RuntimeError('Não foi possível medir as durações para alinhar.')
+        speed = source_duration / target_duration
+        if abs(speed - 1) * 100 > float(options['max_change']):
+            raise RuntimeError('Alinhamento excede o limite de velocidade configurado; revise o texto/duração da cena.')
+        aligned = generated.with_name(generated.stem + '.__alinhado.wav')
+        try:
+            if options.get('pauses'):
+                match_original_expression(generated, original, aligned)
+            else:
+                command = [ffmpeg, '-y', '-v', 'error', '-i', str(generated), '-af',
+                           _atempo_chain(speed) + f',apad,atrim=duration={target_duration:.6f}',
+                           '-c:a', 'pcm_s16le', str(aligned)]
+                with tempfile.TemporaryFile() as log:
+                    self.current_process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, **hidden_process_kwargs())
+                    code = self.current_process.wait()
+                    self.current_process = None
+                    if code: raise RuntimeError('FFmpeg não conseguiu alinhar a cena.')
+            if self.cancel_requested: raise RuntimeError('Alinhamento cancelado.')
+            if not aligned.is_file() or abs(_audio_duration(aligned) - target_duration) > .1:
+                raise RuntimeError('O áudio alinhado não passou na validação de duração.')
+            os.replace(aligned, generated)
+        finally:
+            self.current_process = None
+            aligned.unlink(missing_ok=True)
+
     def start_run(self):
         if self.running:
             if self.paused:
@@ -2116,13 +2354,47 @@ class BatchApp:
             messagebox.showerror("Pasta de saída", f"Não foi possível gravar em:\n{OUTPUT_DIR}\n\n{exc}")
             return
 
-        self.infer_prefix = find_omnivoice_command()
+        try:
+            self.infer_prefix = find_voice_command(self.selected_model_id())
+        except Exception as exc:
+            messagebox.showerror('Modelo de voz', str(exc), parent=self.root)
+            return
         if not self.infer_prefix:
             messagebox.showerror("OmniVoice não encontrado", "Não encontrei o comando omnivoice-infer. Instale o pacote OmniVoice ou defina a variável OMNIVOICE_INFER com o caminho do executável.", parent=self.root)
             self.append_log("ERRO: omnivoice-infer não foi encontrado.", "error")
             return
+        from audio_translation import settings, translation_python
+        self.run_alignment_settings = dict(self.align_audio_settings) if self.align_audio_var.get() == '1' else None
+        if self.run_alignment_settings:
+            from personalized_dubbing_tab import _ffmpeg_path
+            if not _ffmpeg_path():
+                messagebox.showerror('Alinhamento', 'Use BAIXAR / PREPARAR FERRAMENTAS para instalar FFmpeg.', parent=self.root)
+                return
+            if self.run_alignment_settings.get('pauses'):
+                try:
+                    import numpy
+                    import pydub
+                except ImportError:
+                    messagebox.showerror('Alinhamento', 'Modo experimental requer NumPy e pydub neste Python. Desative a aproximação de pausas para usar apenas duração.', parent=self.root)
+                    return
+        self.run_translation_settings = settings(self.auto_translation_settings) if self.auto_translation_var.get()=="1" else None
+        if self.run_translation_settings:
+            try:translation_python()
+            except Exception as exc:
+                messagebox.showerror("Transcrição / tradução",str(exc),parent=self.root)
+                return
         self.selected_model = self.selected_model_id()
+        self.run_speech_language = settings({'language':i18n.source_text(self.speech_language_var.get())})['tts_language']
+        if self.run_translation_settings:self.run_speech_language=self.run_translation_settings['tts_language']
+        from audio_translation import synthesis_settings
+        self.selected_model, _ = synthesis_settings(self.run_speech_language,self.selected_model,'')
         self.selected_mode = self.selected_mode_id()
+        from f5_backend import MODEL as F5_MODEL, validate
+        if self.selected_model == F5_MODEL:
+            try:validate(self.run_speech_language, self.selected_mode)
+            except ValueError as exc:
+                messagebox.showerror('F5-TTS Russian', str(exc), parent=self.root)
+                return
         self.selected_instruct = self.instruct_var.get().strip()
         self.selected_r_pronunciation = self.selected_r_pronunciation_id()
         selected_profile_instruction = VOICE_PROFILES.get(self.voice_profile_var.get(), "")
@@ -2197,7 +2469,9 @@ class BatchApp:
         self.emit_log("CANCELAR: interrompendo a cena atual e encerrando a fila.", "error")
 
     def build_infer_command(self, stem: str, text: str, output_file: Path) -> list[str]:
+        language = getattr(self,'scene_translation_language',None) or getattr(self,'run_speech_language',LANGUAGE)
         r_mode = getattr(self, "selected_r_pronunciation", None) or self.selected_r_pronunciation_id()
+        if language not in ('pt','Portuguese'):r_mode='unchanged'
         rendered_text = apply_r_pronunciation(text, r_mode)
         command = [
             *self.infer_prefix,
@@ -2206,7 +2480,7 @@ class BatchApp:
             "--text",
             rendered_text,
             "--language",
-            LANGUAGE,
+            language,
         ]
         instruction = ""
         if self.selected_mode == "clone":
@@ -2218,6 +2492,8 @@ class BatchApp:
         # OmniVoice valida --instruct contra uma lista fechada de itens.
         r_instruction = r_pronunciation_instruction(r_mode)
         instruction = ", ".join(part for part in (instruction.strip(), r_instruction) if part)
+        from audio_translation import synthesis_settings
+        command[command.index('--model')+1], instruction = synthesis_settings(language,self.selected_model,instruction)
         if instruction:
             command.extend(["--instruct", instruction])
         command.extend(["--output", str(output_file)])
@@ -2225,6 +2501,10 @@ class BatchApp:
 
     def omnivoice_environment(self) -> dict[str, str]:
         environment = os.environ.copy()
+        # UTF-8 so F5-TTS (and any model) can print Cyrillic/Unicode without
+        # crashing on Windows cp1252 consoles, and so text=True decoding works.
+        environment["PYTHONIOENCODING"] = "utf-8"
+        environment["PYTHONUTF8"] = "1"
         ffmpeg_dir = find_ffmpeg_directory()
         if ffmpeg_dir:
             environment["PATH"] = str(ffmpeg_dir) + os.pathsep + environment.get("PATH", "")
@@ -2242,7 +2522,8 @@ class BatchApp:
                 break
 
             ref_audio = self.audio_by_stem[stem]
-            text_file = self.text_by_stem[stem]
+            text_file = self.text_by_stem.get(stem) or (TEXT_DIR / f"{stem}.txt")
+            self.scene_translation_language = None
             output_file = OUTPUT_DIR / f"{stem}.wav"
             output_file.parent.mkdir(parents=True, exist_ok=True)
             self.message_queue.put(("started", stem, number, total))
@@ -2254,7 +2535,14 @@ class BatchApp:
                 continue
 
             try:
-                text = text_file.read_text(encoding="utf-8-sig").strip()
+                text = text_file.read_text(encoding="utf-8-sig").strip() if text_file.is_file() else ""
+                config=getattr(self,"run_translation_settings",None)
+                if not text and config:
+                    from audio_translation import generate_text
+                    text,self.scene_translation_language=generate_text(ref_audio,text_file,ROOT,stem,config,
+                        lambda value:self.emit_log(value,"info"),lambda:self.cancel_requested,
+                        on_progress=lambda stage,fraction:self.message_queue.put(('stage',stem,stage,fraction)))
+                    if text_file.is_file():self.text_by_stem[stem]=text_file
             except UnicodeDecodeError as exc:
                 self.message_queue.put(("error", stem, f"[{number}/{total}] FALHA: TXT inválido em {text_file.name}: {exc}"))
                 continue
@@ -2262,6 +2550,11 @@ class BatchApp:
                 self.message_queue.put(("error", stem, f"[{number}/{total}] FALHA lendo {text_file.name}: {exc}"))
                 continue
 
+            except Exception as exc:
+                self.message_queue.put(("error",stem,f"Falha na transcrição/tradução de {stem}: {exc}"))
+                continue
+
+            if self.cancel_requested:break
             if not text:
                 self.emit_log(f"[{number}/{total}] PULADO: TXT vazio em {text_file.name}; preencha o texto para dublar.", "skip")
                 self.message_queue.put(("skipped", stem))
@@ -2278,22 +2571,24 @@ class BatchApp:
                 self.emit_log(f"[{number}/{total}] voz de {character_from_stem(stem)}: {profile_name}", "info")
             self.emit_log(f"[{number}/{total}] dublando: {text_file.name} -> {output_file.name}", "info")
             try:
-                self.current_process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=self.omnivoice_environment(), **hidden_process_kwargs())
+                self.current_process = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    bufsize=1,
+                    env=self.omnivoice_environment(),
+                    **hidden_process_kwargs(),
+                )
+                observer=GenerationProgress(lambda c,d,p: (self.message_queue.put(("stage",stem,"clone",c/100)), self.message_queue.put(("stage",stem,"dub",d/100)) if d else None))
                 if self.current_process.stdout:
                     for raw_line in self.current_process.stdout:
                         line = raw_line.strip()
                         if line:
                             self.emit_log(line, "normal")
-                            lower = line.lower()
-                            if "loading model" in lower or "fetching" in lower:
-                                self.message_queue.put(("stage", stem, "clone", 0.35))
-                            elif "loading weights" in lower or "model loaded" in lower:
-                                self.message_queue.put(("stage", stem, "clone", 0.72))
-                            elif "asr model" in lower or "generating audio" in lower:
-                                self.message_queue.put(("stage", stem, "clone", 1.0))
-                                self.message_queue.put(("stage", stem, "dub", 0.18))
-                            elif "saved to" in lower:
-                                self.message_queue.put(("stage", stem, "dub", 1.0))
+                            observer.feed(line)
                 return_code = self.current_process.wait()
             except Exception as exc:
                 self.current_process = None
@@ -2312,6 +2607,13 @@ class BatchApp:
                 break
             if return_code == 0 and temporary_output_file.exists():
                 try:
+                    backup_path = None
+                    if getattr(self, 'run_alignment_settings', None):
+                        self.emit_log(f'Alinhando ritmo e duração: {stem}', 'info')
+                        self.align_generated_audio(temporary_output_file, self.audio_by_stem[stem])
+                    if self.cancel_requested:
+                        temporary_output_file.unlink(missing_ok=True)
+                        break
                     backup_path = _archive_dubbed_before_replace(stem, output_file)
                     os.replace(temporary_output_file, output_file)
                     self.message_queue.put(("success", stem))

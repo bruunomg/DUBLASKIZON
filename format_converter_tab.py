@@ -61,6 +61,7 @@ if TK_AVAILABLE:
     messagebox = i18n.localized_messagebox(messagebox)
 
 
+VIDEO_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".webm", ".m4v", ".mpg", ".mpeg", ".wmv", ".flv", ".ts", ".mts", ".m2ts", ".vob", ".ogv", ".3gp", ".mxf"}
 AUDIO_EXTENSIONS = {
     ".wav", ".wave", ".mp3", ".ogg", ".flac", ".aiff", ".aif",
     ".m4a", ".aac", ".wma", ".opus",
@@ -72,7 +73,7 @@ FORMAT_ARCHIVE_DIR_NAMES = {
 
 
 def is_audio_file(path: Path) -> bool:
-    return path.is_file() and path.suffix.casefold() in AUDIO_EXTENSIONS
+    return path.is_file() and path.suffix.casefold() in (AUDIO_EXTENSIONS | VIDEO_EXTENSIONS)
 
 
 def _is_internal_project_audio(path: Path, scan_root: Path | None = None) -> bool:
@@ -170,11 +171,11 @@ class FormatConverterApp:
         self.format_var = StringVar(value=DEFAULT_FORMAT)
         self.input_dir_var = StringVar(value="Nenhum arquivo carregado")
         self.output_dir_var = StringVar(value=str(self.project_root / FORMAT_OUTPUT_FOLDER_NAME))
-        self.status_var = StringVar(value="Adicione os áudios e escolha o formato de saída.")
+        self.status_var = StringVar(value="Adicione áudios ou vídeos e escolha o formato de áudio de saída.")
         self.count_var = StringVar(value="Áudios: 0")
         self.progress_var = StringVar(value="Conversão de formato: aguardando")
         self.download_status_var = StringVar(value="Ferramentas: não verificadas")
-        self.panel_title_var = StringVar(value="ÁUDIOS PARA CONVERTER (0)")
+        self.panel_title_var = StringVar(value="ÁUDIOS / VÍDEOS PARA CONVERTER (0)")
         self.audio_player = AudioPlayerManager(self.root, self.project_root, status_callback=lambda text: (self.status_var.set(text), self._log_central(text, "info")))
         self.build_ui()
         self.refresh_for_project()
@@ -245,7 +246,7 @@ class FormatConverterApp:
         Entry(panel, textvariable=self.input_dir_var, state="readonly", readonlybackground="#FFFFFF", fg="#64748B", relief="flat", font=("Segoe UI", 8)).pack(fill="x", padx=10, pady=(0, 5))
         list_frame = Frame(panel, bg="#FFFFFF")
         list_frame.pack(fill="both", expand=True, padx=10, pady=(0, 6))
-        self.listbox = Listbox(list_frame, selectmode="extended", activestyle="none", height=12, font=("Segoe UI", 10), bg="#FFFFFF", fg="#1F2937", selectbackground="#DBEAFE", selectforeground="#1F2937")
+        self.listbox = Listbox(list_frame, selectmode="extended", exportselection=False, activestyle="none", height=12, font=("Segoe UI", 10), bg="#FFFFFF", fg="#1F2937", selectbackground="#DBEAFE", selectforeground="#1F2937")
         scrollbar = Scrollbar(list_frame, orient="vertical", command=self.listbox.yview)
         self.listbox.configure(yscrollcommand=scrollbar.set)
         self.listbox.pack(side="left", fill="both", expand=True)
@@ -256,7 +257,7 @@ class FormatConverterApp:
         file_buttons = Frame(panel, bg="#FFFFFF")
         file_buttons.pack(fill="x", padx=10, pady=(0, 5))
         Button(file_buttons, text="ABRIR PASTA", command=self.choose_input_folder, bg="#2563EB", activebackground="#1D4ED8", fg="white", relief="flat", font=("Segoe UI", 8, "bold"), padx=9, pady=4, cursor="hand2").pack(side="left", padx=(0, 4))
-        Button(file_buttons, text="ADICIONAR ÁUDIOS", command=self.add_files, bg="#64748B", activebackground="#475569", fg="white", relief="flat", font=("Segoe UI", 8, "bold"), padx=9, pady=4, cursor="hand2").pack(side="left", padx=4)
+        Button(file_buttons, text="ADICIONAR ÁUDIOS / VÍDEOS", command=self.add_files, bg="#64748B", activebackground="#475569", fg="white", relief="flat", font=("Segoe UI", 8, "bold"), padx=9, pady=4, cursor="hand2").pack(side="left", padx=4)
         Button(file_buttons, text="LIMPAR", command=self.clear_files, bg="#CBD5E1", activebackground="#94A3B8", fg="#1F2937", relief="flat", padx=9, pady=4, cursor="hand2").pack(side="right")
         audio_buttons = Frame(panel, bg="#FFFFFF")
         audio_buttons.pack(fill="x", padx=10, pady=(0, 5))
@@ -279,6 +280,12 @@ class FormatConverterApp:
         Button(output_buttons, text="ABRIR PASTA", command=self.open_output_folder, bg="#0F766E", activebackground="#115E59", fg="white", relief="flat", font=("Segoe UI", 8, "bold"), padx=7, pady=3, cursor="hand2").pack(side="left")
         options.grid_columnconfigure(0, weight=1)
         options.grid_columnconfigure(1, weight=1)
+
+        personalized_actions = Frame(self.root, bg="#F5F6FA")
+        personalized_actions.pack(fill="x", padx=16, pady=(0, 6))
+        self.load_personalized_button = Button(personalized_actions, text="CARREGAR DA ABA DUBLAGEM PERSONALIZADA", command=self.load_from_personalized, bg="#D97706", activebackground="#B45309", fg="white", relief="flat", font=("Segoe UI", 8, "bold"), padx=9, pady=6, cursor="hand2")
+        self.load_personalized_button.pack(side="left")
+        Label(self.root, text="Também aceita vídeos: extrai a primeira faixa de áudio para WAV, MP3, FLAC e demais saídas. O vídeo original é preservado.", bg="#F5F6FA", fg="#475569", wraplength=1000, anchor="w").pack(fill="x", padx=16, pady=(0, 6))
 
         actions = Frame(self.root, bg="#F5F6FA")
         actions.pack(fill="x", padx=16, pady=(0, 6))
@@ -361,13 +368,13 @@ class FormatConverterApp:
         self.set_files(self.files + found, "Arquivos arrastados")
 
     def choose_input_folder(self):
-        selected = filedialog.askdirectory(parent=self.root, title="Escolher pasta de áudios para converter")
+        selected = filedialog.askdirectory(parent=self.root, title="Escolher pasta de áudios ou vídeos para converter")
         if selected:
             folder = Path(selected)
             self.set_files(list_audio_files(folder), str(folder))
 
     def add_files(self):
-        selected = filedialog.askopenfilenames(parent=self.root, title="Selecionar áudios para converter", filetypes=[("Áudios", "*.wav *.wave *.mp3 *.ogg *.flac *.aiff *.aif *.m4a *.aac *.wma *.opus"), ("Todos os arquivos", "*.*")])
+        selected = filedialog.askopenfilenames(parent=self.root, title="Selecionar áudios ou vídeos para converter", filetypes=[("Áudios e vídeos", " ".join("*" + ext for ext in sorted(AUDIO_EXTENSIONS | VIDEO_EXTENSIONS))), ("Todos os arquivos", "*.*")])
         if selected:
             self.set_files(self.files + [Path(path) for path in selected], "Arquivos selecionados")
 
@@ -417,7 +424,7 @@ class FormatConverterApp:
         self.files = sorted(unique, key=lambda path: (path.name.casefold(), str(path).casefold()))
         self.file_source_by_path = next_sources
         self.input_dir_var.set(label)
-        self.panel_title_var.set(f"ÁUDIOS PARA CONVERTER ({len(self.files)})")
+        self.panel_title_var.set(f"ÁUDIOS / VÍDEOS PARA CONVERTER ({len(self.files)})")
         self.count_var.set(f"Áudios: {len(self.files)}")
         self.listbox.delete(0, END)
         name_counts: dict[str, int] = {}
@@ -435,7 +442,7 @@ class FormatConverterApp:
         if source in {"original", "dublado"}:
             return source
         resolved = Path(path).expanduser().resolve()
-        for kind, base_name in (("original", "WAV ORIGINAIS"), ("dublado", "dublado")):
+        for kind, base_name in (("original", "WAV ORIGINAIS"), ("dublado", "dublado"), ("dublado", "dublados personalizados")):
             try:
                 resolved.relative_to((self.project_root / base_name).resolve())
                 return kind
@@ -444,12 +451,14 @@ class FormatConverterApp:
         return ""
 
     def _format_audio_key(self, path: Path, kind: str) -> str:
-        base_name = "WAV ORIGINAIS" if kind == "original" else "dublado"
-        try:
-            relative = Path(path).expanduser().resolve().relative_to((self.project_root / base_name).resolve()).with_suffix("")
-            return relative.as_posix().casefold()
-        except ValueError:
-            return Path(path).stem.casefold()
+        bases = ("WAV ORIGINAIS",) if kind == "original" else ("dublados personalizados", "dublado")
+        for base_name in bases:
+            try:
+                relative = Path(path).expanduser().resolve().relative_to((self.project_root / base_name).resolve()).with_suffix("")
+                return relative.as_posix().casefold()
+            except ValueError:
+                continue
+        return Path(path).stem.casefold()
 
     def _context_audio_paths(self, index: int):
         if index < 0 or index >= len(self.files):
@@ -526,21 +535,40 @@ class FormatConverterApp:
             menu.grab_release()
         return "break"
 
+    def _prepare_loaded_playback(self):
+        groups = {}
+        items = []
+        for path in self.files:
+            kind = self._format_audio_kind(path) or "dublado"
+            key = self._format_audio_key(path, kind)
+            groups.setdefault((key, kind), []).append(path)
+            items.append((path, kind, key))
+        pairs = {}
+        for path, kind, key in items:
+            other_kind = "dublado" if kind == "original" else "original"
+            matches = groups.get((key, other_kind), [])
+            counterpart = matches[0] if len(matches) == 1 else None
+            pairs[path] = (path, counterpart) if kind == "original" else (counterpart, path)
+        self.audio_player.set_loaded_audio_pairs(pairs)
+
     def play_selected(self, _event=None):
         selection = self.listbox.curselection()
         if not selection or int(selection[0]) >= len(self.files):
             return
         index = int(selection[0])
         path = self.files[index]
+        self._prepare_loaded_playback()
         self.audio_player.play_one(path, f"OUVIR — {path.name}", playlist=self.files, index=index)
 
     def play_all(self):
+        self._prepare_loaded_playback()
         self.audio_player.play_all(self.files, "OUVIR TODOS — FORMATOS")
 
     def load_project_defaults(self, source_label: str):
         """Carrega os áudios atuais do projeto em uma única lista, sem criar pastas."""
         self.project_root = Path(getattr(self.root, "project_root", self.project_root)).expanduser().resolve()
         self.audio_player.set_project_root(self.project_root)
+        self.audio_player.set_dubbed_folder_name("dublado")
         original_files, dubbed_files = project_audio_files(self.project_root)
         files = original_files + dubbed_files
         source_labels = {str(path): "ORIGINAL" for path in original_files}
@@ -549,6 +577,22 @@ class FormatConverterApp:
         self.set_files(files, label, source_labels=source_labels)
         self.status_var.set(f"Carregado da aba {source_label}: confira os arquivos antes de converter.")
         self.append_log(f"Carregamento da aba {source_label}: {len(files)} arquivo(s) carregado(s).")
+
+    def load_from_personalized(self):
+        if self.running:
+            self.status_var.set("Aguarde a conversão terminar antes de carregar outros áudios.")
+            return
+        self.project_root = Path(getattr(self.root, "project_root", self.project_root)).expanduser().resolve()
+        self.audio_player.set_project_root(self.project_root)
+        self.audio_player.set_dubbed_folder_name("dublados personalizados")
+        folder = self.project_root / "dublados personalizados"
+        files = [path for path in list_audio_files(folder) if not path.name.startswith(".")]
+        label = f"Carregado da aba DUBLAGEM PERSONALIZADA: {len(files)} áudio(s)"
+        self.set_files(files, label, source_labels={str(path): "DUBLADO" for path in files})
+        message = (label + ". Confira os arquivos antes de converter." if files else
+                   "Nenhum áudio em dublados personalizados. Gere os áudios na aba DUBLAGEM PERSONALIZADA e carregue novamente.")
+        self.status_var.set(message)
+        self.append_log(message)
 
     def load_from_review(self):
         self.load_project_defaults("REVISÃO")
@@ -665,7 +709,7 @@ class FormatConverterApp:
         if not ffmpeg:
             raise RuntimeError("FFmpeg não foi encontrado. Clique em BAIXAR / PREPARAR FFmpeg + FFplay.")
         spec = FORMAT_CHOICES[format_name]
-        command = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(source), "-vn", "-c:a", spec["codec"]]
+        command = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(source), "-map", "0:a:0", "-vn", "-c:a", spec["codec"]]
         if spec.get("rate"):
             command.extend(["-ar", spec["rate"]])
         if spec.get("channels"):
@@ -674,16 +718,27 @@ class FormatConverterApp:
             command.extend(["-b:a", spec["bitrate"]])
         if spec.get("quality"):
             command.extend(["-q:a", spec["quality"]])
-        command.append(str(target))
-        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", **hidden_process_kwargs())
-        self.process = process
-        stdout, stderr = process.communicate()
-        if self.process is process:
-            self.process = None
-        if self.cancel_event.is_set():
-            raise RuntimeError("cancelamento solicitado")
-        if process.returncode != 0:
-            raise RuntimeError(stderr.strip()[-1200:] or f"FFmpeg retornou código {process.returncode}.")
+        handle = tempfile.NamedTemporaryFile(prefix=".extrair-audio-", suffix=target.suffix, dir=target.parent, delete=False)
+        temporary = Path(handle.name)
+        handle.close()
+        command.append(str(temporary))
+        try:
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", **hidden_process_kwargs())
+            self.process = process
+            if self.cancel_event.is_set():
+                process.terminate()
+            stdout, stderr = process.communicate()
+            if self.process is process:
+                self.process = None
+            if self.cancel_event.is_set():
+                raise RuntimeError("cancelamento solicitado")
+            if process.returncode != 0:
+                raise RuntimeError(stderr.strip()[-1200:] or f"FFmpeg retornou código {process.returncode}.")
+            if not temporary.is_file() or temporary.stat().st_size == 0:
+                raise RuntimeError("Nenhum áudio foi extraído. Confira se o vídeo possui uma faixa de áudio.")
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
 
     def _output_relative_path(self, source: Path) -> Path:
         """Preserva a subpasta de arquivos importados das pastas do projeto."""
@@ -727,7 +782,7 @@ class FormatConverterApp:
         if self.running or self.dependencies_running:
             return
         if not self.files:
-            messagebox.showwarning("Conversão de formatos", "Nenhum áudio foi carregado.", parent=self.root)
+            messagebox.showwarning("Conversão de formatos", "Nenhum áudio ou vídeo foi carregado.", parent=self.root)
             return
         format_name = i18n.source_text(self.format_var.get())
         if format_name not in FORMAT_CHOICES:

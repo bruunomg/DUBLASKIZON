@@ -32,7 +32,7 @@ BASE_WINDOW_WIDTH = 1440
 BASE_WINDOW_HEIGHT = 980
 BASE_MIN_WIDTH = 1160
 BASE_MIN_HEIGHT = 760
-PROJECT_FOLDERS = ("WAV ORIGINAIS", "TXT TEXTO PORTUGUES", "TXT TEXTO ORIGINAL", "TXT TEXTO do WAV TRANSCRITO e TRADUZIDO", "OUTRAS TRADUÇÕES", "dublado", "revisoes", "REDIMENSIONAR ÁUDIO PARA CLONAR")
+PROJECT_FOLDERS = ("WAV ORIGINAIS", "TXT TEXTO PORTUGUES", "TXT TEXTO ORIGINAL", "TXT TEXTO do WAV TRANSCRITO e TRADUZIDO", "OUTRAS TRADUÇÕES", "dublado", "dublados personalizados", "MODELOS DE VOZ PERSONALIZADOS", "revisoes", "REDIMENSIONAR ÁUDIO PARA CLONAR")
 THEMES = {
     "claro": {
         "mode": "claro", "root": "#F5F6FA", "surface": "#FFFFFF", "panel": "#FFFFFF", "text": "#1F2937",
@@ -133,8 +133,11 @@ try:
     import format_converter_tab  # type: ignore
     import wem_filter_tab  # type: ignore
     import voice_clone_tab  # type: ignore
+    import personalized_dubbing_tab  # type: ignore
+    import video_converter_tab
+    import video_audio_swap_tab
 except ImportError:
-    from . import batch_tab, review_tab, duration_converter_tab, format_converter_tab, wem_filter_tab, voice_clone_tab
+    from . import batch_tab, review_tab, duration_converter_tab, format_converter_tab, wem_filter_tab, voice_clone_tab, personalized_dubbing_tab, video_converter_tab, video_audio_swap_tab
 
 
 if tk is not None:
@@ -765,14 +768,20 @@ class DublaskizonApp:
         self.active_scroll = None
         self.clone_scroll = None
         self.review_scroll = None
+        self.personalized_scroll = None
         self.terminal_scroll = None
         self.converter_scroll = None
         self.format_scroll = None
+        self.video_scroll = None
+        self.swap_scroll = None
         self.batch_app = None
         self.review_app = None
+        self.personalized_app = None
         self.terminal_app = None
         self.converter_app = None
         self.format_app = None
+        self.video_app = None
+        self.swap_app = None
         self.wem_filter_app = None
         self.wem_filter_scroll = None
         self.wem_filter_frame = None
@@ -801,23 +810,39 @@ class DublaskizonApp:
         tk.Label(brand_line, text="DUBLASKIZON", bg="#172033", fg="white", font=("Segoe UI", 22, "bold")).pack(side="left")
         tk.Label(brand_line, text="OmniVoice + Audacity — dublagem e revisão em um único aplicativo", bg="#172033", fg="#CBD5E1", font=("Segoe UI", 11)).pack(side="left", padx=(18, 0), pady=(5, 0))
 
-        tabs_bar = tk.Frame(root, bg="#E2E8F0")
+        tabs_shell = tk.Frame(root, bg="#E2E8F0")
+        tabs_shell.pack(fill="x", padx=10, pady=(8, 0))
+        self.tabs_canvas = tk.Canvas(tabs_shell, bg="#E2E8F0", height=54, highlightthickness=0)
+        self.tabs_canvas.pack(fill="x")
+        tab_scroll = ttk.Scrollbar(tabs_shell, orient="horizontal", command=self.tabs_canvas.xview)
+        tab_scroll.pack(fill="x")
+        self.tabs_canvas.configure(xscrollcommand=tab_scroll.set)
+        tabs_bar = tk.Frame(self.tabs_canvas, bg="#E2E8F0")
         self.tabs_bar = tabs_bar
-        tabs_bar.pack(fill="x", padx=10, pady=(8, 0))
+        self.tabs_canvas.create_window((0, 0), window=tabs_bar, anchor="nw")
+        tabs_bar.bind("<Configure>", lambda event: self.tabs_canvas.configure(scrollregion=self.tabs_canvas.bbox("all"), height=tabs_bar.winfo_reqheight()))
         self.clone_tab_button = tk.Button(tabs_bar, text="CLONAGEM + DUBLAGEM", command=lambda: self.select_tab(self.clone_scroll), bg="#2563EB", activebackground="#1D4ED8", fg="white", activeforeground="white", relief="sunken", font=("Segoe UI", 10, "bold"), padx=11, pady=6, width=21, cursor="hand2")
         self.clone_tab_button.pack(side="left", padx=(0, 4))
         self.review_tab_button = tk.Button(tabs_bar, text="REVISÃO", command=lambda: self.select_tab(self.review_scroll), bg="#C4B5FD", activebackground="#A78BFA", fg="#24134D", activeforeground="#24134D", relief="raised", font=("Segoe UI", 10, "bold"), padx=11, pady=6, width=21, cursor="hand2")
         self.review_tab_button.pack(side="left", padx=(4, 0))
-        self.converter_tab_button = tk.Button(tabs_bar, text="CONVERTER DURAÇÃO", command=lambda: self.select_tab(self.converter_scroll), bg="#F97316", activebackground="#EA580C", fg="white", activeforeground="white", relief="raised", font=("Segoe UI", 10, "bold"), padx=11, pady=6, width=21, cursor="hand2")
+        self.personalized_tab_button = tk.Button(tabs_bar, text="DUBLAGEM PERSONALIZADA", command=lambda: self.select_tab(self.personalized_scroll), bg="#8B5CF6", activebackground="#7C3AED", fg="white", activeforeground="white", relief="raised", font=("Segoe UI", 8, "bold"), padx=9, pady=0, width=16, height=2, wraplength=120, justify="center", cursor="hand2")
+        self.personalized_tab_button.pack(side="left", padx=(4, 0))
+        self.converter_tab_button = tk.Button(tabs_bar, text="CONVERTER\nDURAÇÃO", command=lambda: self.select_tab(self.converter_scroll), bg="#F97316", activebackground="#EA580C", fg="white", activeforeground="white", relief="raised", font=("Segoe UI", 10, "bold"), padx=11, pady=6, width=21, cursor="hand2")
         self.converter_tab_button.pack(side="left", padx=(4, 0))
-        self.format_tab_button = tk.Button(tabs_bar, text="CONVERTER FORMATOS", command=lambda: self.select_tab(self.format_scroll), bg="#14B8A6", activebackground="#0F766E", fg="white", activeforeground="white", relief="raised", font=("Segoe UI", 10, "bold"), padx=11, pady=6, width=21, cursor="hand2")
+        self.format_tab_button = tk.Button(tabs_bar, text="CONVERTER\nFORMATOS", command=lambda: self.select_tab(self.format_scroll), bg="#14B8A6", activebackground="#0F766E", fg="white", activeforeground="white", relief="raised", font=("Segoe UI", 10, "bold"), padx=11, pady=6, width=21, cursor="hand2")
         self.format_tab_button.pack(side="left", padx=(4, 0))
         self.wem_filter_tab_button = tk.Button(tabs_bar, text="FILTRO RENOMEAR .WEM", command=lambda: self.select_tab(self.wem_filter_scroll), bg="#7C3AED", activebackground="#6D28D9", fg="white", activeforeground="white", relief="raised", font=("Segoe UI", 10, "bold"), padx=11, pady=6, width=21, cursor="hand2")
         self.wem_filter_tab_button.pack(side="left", padx=(4, 0))
-        self.voice_clone_tab_button = tk.Button(tabs_bar, text="REDIMENSIONAR ÁUDIO PARA CLONAR", command=lambda: self.select_tab(self.voice_clone_scroll), bg="#0F766E", activebackground="#115E59", fg="white", activeforeground="white", relief="raised", font=("Segoe UI", 8, "bold"), padx=11, pady=0, width=28, height=2, wraplength=180, justify="center", cursor="hand2")
-        self.voice_clone_tab_button.pack(side="left", padx=(4, 0))
-        self.commands_tab_button = tk.Button(tabs_bar, text="COMANDOS", command=lambda: self.select_tab(self.terminal_scroll), bg="#F59E0B", activebackground="#D97706", fg="#3B2500", activeforeground="#3B2500", relief="raised", font=("Segoe UI", 10, "bold"), padx=11, pady=6, width=21, cursor="hand2")
-        self.commands_tab_button.pack(side="left", padx=(4, 0))
+        tools_bar = tabs_bar
+        self.tools_tabs_bar = tabs_bar
+        self.voice_clone_tab_button = tk.Button(tools_bar, text="REDIMENSIONAR ÁUDIO PARA CLONAR", command=lambda: self.select_tab(self.voice_clone_scroll), bg="#0F766E", fg="white", font=("Segoe UI", 8, "bold"), padx=8, pady=5, width=25, wraplength=170, cursor="hand2")
+        self.voice_clone_tab_button.pack(side="left", padx=(0, 4))
+        self.video_tab_button = tk.Button(tools_bar, text="COMPACTAR / CONVERTER VÍDEOS", command=lambda: self.select_tab(self.video_scroll), bg="#0F766E", fg="white", font=("Segoe UI", 8, "bold"), padx=8, pady=5, width=25, wraplength=170, cursor="hand2")
+        self.video_tab_button.pack(side="left", padx=(0, 4))
+        self.swap_tab_button = tk.Button(tools_bar, text="TROCAR AUDIO DO VÍDEO", command=lambda: self.select_tab(self.swap_scroll), bg="#7C3AED", fg="white", font=("Segoe UI", 8, "bold"), padx=8, pady=5, width=25, wraplength=170, cursor="hand2")
+        self.swap_tab_button.pack(side="left", padx=(0, 4))
+        self.commands_tab_button = tk.Button(tools_bar, text="COMANDOS", command=lambda: self.select_tab(self.terminal_scroll), bg="#F59E0B", fg="#3B2500", font=("Segoe UI", 8, "bold"), padx=8, pady=5, width=18, cursor="hand2")
+        self.commands_tab_button.pack(side="left")
 
         scale_panel = tk.Frame(brand_line, bg="#172033")
         self.scale_panel = scale_panel
@@ -915,25 +940,15 @@ class DublaskizonApp:
 
     def _shortcut_find(self, event=None):
         widget = getattr(event, "widget", None) if event is not None else self.root.focus_get()
-        if widget is None:
-            return "break"
+        widget = widget or self.root
         try:
-            parent = widget.winfo_toplevel()
-        except (AttributeError, tk.TclError):
-            parent = self.root
-        if simpledialog is None:
-            return "break"
-        query = simpledialog.askstring(
-            i18n.tr("LOCALIZAR"),
-            i18n.tr("Texto para localizar:"),
-            parent=parent,
-        )
-        if query:
-            if not self._find_in_widget(widget, query):
-                try:
-                    parent.bell()
-                except (AttributeError, tk.TclError):
-                    pass
+            from .find_panel import FindPanel
+        except ImportError:
+            from find_panel import FindPanel
+        if not hasattr(self, "find_panel"):
+            self.find_panel = FindPanel(self.root, self.current_theme())
+        self.find_panel.theme = self.current_theme()
+        self.find_panel.show(widget)
         return "break"
 
     def _find_in_widget(self, widget, query: str) -> bool:
@@ -1040,120 +1055,8 @@ class DublaskizonApp:
         return any(path.exists() for path in candidates)
 
     def show_dependency_assistant(self) -> None:
-        if getattr(self, "dependency_window", None) is not None:
-            try:
-                self.dependency_window.lift()
-                return
-            except Exception:
-                self.dependency_window = None
-        window = tk.Toplevel(self.root)
-        self.dependency_window = window
-        window.title("Verificação inicial — requisitos do Dublaskizon")
-        window.geometry("900x660")
-        window.minsize(760, 560)
-        window.transient(self.root)
-        window.grab_set()
-        apply_window_icon(window)
-        theme = self.current_theme()
-        window.configure(bg=theme["root"])
-        dont_show_var = tk.BooleanVar(value=not self.should_show_dependency_assistant())
-
-        def close_dependency_window():
-            self.save_dependency_assistant_preference(not dont_show_var.get())
-            self.dependency_window = None
-            window.destroy()
-
-        window.protocol("WM_DELETE_WINDOW", close_dependency_window)
-
-        tk.Label(window, text="VERIFICAR O QUE O DUBLASKIZON PRECISA", font=("Segoe UI", 14, "bold"), bg=theme["root"], fg=theme["text"]).pack(anchor="w", padx=16, pady=(14, 3))
-        tk.Label(window, text="As verificações abaixo não alteram o computador. Instalações só acontecem após sua confirmação.", anchor="w", bg=theme["root"], fg=theme["muted"]).pack(fill="x", padx=16, pady=(0, 10))
-
-        command_frame = ttk.LabelFrame(window, text="Comandos de diagnóstico", padding=10)
-        command_frame.pack(fill="x", padx=16, pady=(0, 8))
-        checks = [
-            ("pip_show", "python -m pip show omnivoice", "Confirma se o pacote OmniVoice está instalado e mostra sua versão."),
-            ("infer_help", "python -m omnivoice.cli.infer --help", "Confirma se o gerador e seus parâmetros podem ser carregados."),
-            ("cuda", "python -c \"import torch; ...\"", "Verifica PyTorch, CUDA e se a GPU NVIDIA está disponível."),
-            ("ffmpeg", "ffmpeg -version", "Confirma se o FFmpeg usado para ler e converter áudios está acessível."),
-        ]
-        variables = {}
-        for row, (key, command, description) in enumerate(checks):
-            variable = tk.BooleanVar(value=True)
-            variables[key] = variable
-            ttk.Checkbutton(command_frame, text=command, variable=variable).grid(row=row * 2, column=0, sticky="w")
-            ttk.Label(command_frame, text=description, foreground=theme["muted"]).grid(row=row * 2 + 1, column=0, sticky="w", padx=(24, 0), pady=(0, 5))
-
-        optional = ttk.LabelFrame(window, text="Itens relacionados", padding=10)
-        optional.pack(fill="x", padx=16, pady=(0, 8))
-        model_status = "encontrado no cache" if batch_tab.model_is_cached("edwixx/omnivoice-brpt-v15") else "ainda não baixado; será baixado na primeira geração"
-        ttk.Label(optional, text=f"Modelo edwixx/omnivoice-brpt-v15: {model_status}").pack(anchor="w")
-        studio_status = "detectado" if self.voice_studio_installed() else "não detectado"
-        ttk.Label(optional, text=f"VoiceStudio: {studio_status} — opcional; não é necessário para o Dublaskizon.").pack(anchor="w", pady=(3, 0))
-        links = ttk.Frame(optional)
-        links.pack(fill="x", pady=(6, 0))
-        ttk.Button(links, text="Abrir página do modelo", command=lambda: webbrowser.open("https://huggingface.co/edwixx/omnivoice-brpt-v15"), style="Teal.TButton").pack(side="left")
-        ttk.Button(links, text="Abrir VoiceStudio", command=lambda: webbrowser.open("https://github.com/debpalash/VoiceStudio"), style="Accent.TButton").pack(side="left", padx=(6, 0))
-
-        result_box = tk.Text(window, height=12, wrap="word", font=("Consolas", 9), state="disabled", bg=theme["input"], fg=theme["input_text"], insertbackground=theme["input_text"], selectbackground=theme["select"], selectforeground="#FFFFFF", relief="flat", bd=1)
-        result_box.pack(fill="both", expand=True, padx=16, pady=(0, 8))
-
-        def write_result(text: str):
-            result_box.configure(state="normal")
-            result_box.insert("end", text.rstrip() + "\n")
-            result_box.see("end")
-            result_box.configure(state="disabled")
-
-        def diagnostic_worker():
-            python = self.dependency_python_command()
-            if python is None:
-                self.root.after(0, lambda: write_result("[ERRO] Python externo não foi encontrado. Instale Python 3.11 ou 3.12."))
-                return
-            commands = {
-                "pip_show": [*python, "-m", "pip", "show", "omnivoice"],
-                "infer_help": [*python, "-m", "omnivoice.cli.infer", "--help"],
-                "cuda": [*python, "-c", "import torch; print('PyTorch:', torch.__version__); print('CUDA:', torch.cuda.is_available()); print('GPU:', torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"],
-                "ffmpeg": [str((batch_tab.find_ffmpeg_directory() or Path("")) / ("ffmpeg.exe" if sys.platform.startswith("win") else "ffmpeg")), "-version"],
-            }
-            for key, label, _description in checks:
-                if not variables[key].get():
-                    continue
-                self.root.after(0, lambda value=label: write_result(f"\n> {value}"))
-                try:
-                    result = subprocess.run(commands[key], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60, **batch_tab.hidden_process_kwargs())
-                    output = (result.stdout or result.stderr or "sem resposta").strip()
-                    marker = "OK" if result.returncode == 0 else "FALHOU"
-                    self.root.after(0, lambda value=f"[{marker}] {output[-2500:]}": write_result(value))
-                except Exception as exc:
-                    self.root.after(0, lambda value=f"[ERRO] {exc}": write_result(value))
-
-        def run_checks():
-            write_result("Iniciando verificações selecionadas...")
-            threading.Thread(target=diagnostic_worker, daemon=True).start()
-
-        def install_omnivoice():
-            python = self.dependency_python_command()
-            if python is None:
-                messagebox.showerror("Instalar OmniVoice", "Python 3.11 ou 3.12 não foi encontrado.", parent=window)
-                return
-            if not messagebox.askyesno("Instalar OmniVoice", "Executar este comando?\n\npython -m pip install omnivoice\n\nEle instala o mecanismo de geração de voz e suas dependências.", parent=window):
-                return
-            def installer():
-                self.root.after(0, lambda: write_result("\n> python -m pip install omnivoice"))
-                try:
-                    result = subprocess.run([*python, "-m", "pip", "install", "omnivoice"], capture_output=True, text=True, encoding="utf-8", errors="replace", **batch_tab.hidden_process_kwargs())
-                    output = (result.stdout or result.stderr or "sem resposta").strip()
-                    self.root.after(0, lambda: write_result(("[OK] " if result.returncode == 0 else "[FALHOU] ") + output[-4000:]))
-                except Exception as exc:
-                    self.root.after(0, lambda: write_result(f"[ERRO] {exc}"))
-            threading.Thread(target=installer, daemon=True).start()
-
-        buttons = ttk.Frame(window)
-        buttons.pack(fill="x", padx=16, pady=(0, 14))
-        ttk.Button(buttons, text="VERIFICAR SELECIONADOS", command=run_checks, style="Primary.TButton").pack(side="left")
-        ttk.Button(buttons, text="INSTALAR OMNIVOICE", command=install_omnivoice, style="Success.TButton").pack(side="left", padx=(6, 0))
-        ttk.Button(buttons, text="CONTINUAR SEM EXECUTAR", command=close_dependency_window, style="Secondary.TButton").pack(side="right")
-        ttk.Checkbutton(buttons, text="Não mostrar novamente ao iniciar", variable=dont_show_var).pack(side="right", padx=(8, 12))
-        self.ensure_control_contrast(window)
+        from dependency_setup import show_assistant
+        show_assistant(self)
 
     def load_player_mode(self) -> str:
         try:
@@ -1175,7 +1078,7 @@ class DublaskizonApp:
             pass
 
     def apply_player_mode(self) -> None:
-        for app in (self.batch_app, self.review_app, self.converter_app, self.format_app, self.voice_clone_app):
+        for app in (self.batch_app, self.review_app, self.personalized_app, self.converter_app, self.format_app, self.voice_clone_app):
             player = getattr(app, "audio_player", None)
             if player is not None and hasattr(player, "set_playback_mode"):
                 player.set_playback_mode(self.player_mode)
@@ -1221,6 +1124,8 @@ class DublaskizonApp:
             self.batch_app.apply_language(self.language_code)
         if getattr(self, "voice_clone_app", None) is not None and hasattr(self.voice_clone_app, "apply_language"):
             self.voice_clone_app.apply_language(self.language_code)
+        if getattr(self, "personalized_app", None) is not None and hasattr(self.personalized_app, "apply_language"):
+            self.personalized_app.apply_language(self.language_code)
         i18n.translate_widget_tree(self.root, self.language_code)
         self.update_theme_button()
         self.update_player_mode_button()
@@ -1246,8 +1151,14 @@ class DublaskizonApp:
             return
 
     def refresh_screen(self) -> None:
-        if (getattr(self.batch_app, "running", False) or getattr(self.converter_app, "running", False) or getattr(self.format_app, "running", False)):
-            messagebox.showwarning("Atualizar tela", "Pare a tarefa em execução antes de atualizar a tela.", parent=self.root)
+        apps = (getattr(self, name, None) for name in (
+            'batch_app', 'personalized_app', 'review_app', 'converter_app',
+            'format_app', 'video_app', 'swap_app', 'voice_clone_app'))
+        if any(getattr(app, flag, False) for app in apps
+               for flag in ('running', 'busy', 'dependencies_running')):
+            # Rebuilding widgets destroys queues, editors and active job controllers.
+            # Only refresh the review index while any worker is active.
+            self.refresh_review()
             return
         active_name = self.current_tab_key()
         if active_name == "wem_filter":
@@ -1265,7 +1176,7 @@ class DublaskizonApp:
             return
         self.rebuild_views()
         self.apply_language(self.language_code, save=False)
-        target = {"clone": self.clone_scroll, "review": self.review_scroll, "terminal": self.terminal_scroll, "converter": self.converter_scroll, "format": self.format_scroll, "wem_filter": self.wem_filter_scroll, "voice_clone": self.voice_clone_scroll}[active_name]
+        target = {"clone": self.clone_scroll, "review": self.review_scroll, "personalized": self.personalized_scroll, "terminal": self.terminal_scroll, "converter": self.converter_scroll, "format": self.format_scroll, "video": self.video_scroll, "swap": self.swap_scroll, "wem_filter": self.wem_filter_scroll, "voice_clone": self.voice_clone_scroll}[active_name]
         self.select_tab(target)
         self.status_refresh_message()
         if hasattr(self, "help_manager"):
@@ -1360,8 +1271,11 @@ class DublaskizonApp:
         mapping = (
             (self.clone_scroll, "clone"),
             (self.review_scroll, "review"),
+            (self.personalized_scroll, "personalized"),
             (self.converter_scroll, "converter"),
             (self.format_scroll, "format"),
+            (self.video_scroll, "video"),
+            (self.swap_scroll, "swap"),
             (self.wem_filter_scroll, "wem_filter"),
             (self.voice_clone_scroll, "voice_clone"),
             (self.terminal_scroll, "terminal"),
@@ -1407,6 +1321,8 @@ class DublaskizonApp:
                     widget.configure(bg=theme["header"])
             if getattr(self, "tabs_bar", None) is not None:
                 self.tabs_bar.configure(bg=theme["tabs"])
+                self.tools_tabs_bar.configure(bg=theme["tabs"])
+                self.tabs_canvas.configure(bg=theme["tabs"])
             if getattr(self, "scale_panel", None) is not None:
                 self.scale_panel.configure(bg=theme["header"])
                 if getattr(self, "language_label", None) is not None:
@@ -1437,10 +1353,10 @@ class DublaskizonApp:
                     apply_button_style(widget, theme, role)
             self.update_tab_buttons()
             apply_button_style_to_tree(self.root, theme)
-            for app in (getattr(self, "batch_app", None), getattr(self, "review_app", None), getattr(self, "terminal_app", None), getattr(self, "converter_app", None), getattr(self, "format_app", None), getattr(self, "wem_filter_app", None), getattr(self, "voice_clone_app", None)):
+            for app in (getattr(self, "batch_app", None), getattr(self, "review_app", None), getattr(self, "personalized_app", None), getattr(self, "terminal_app", None), getattr(self, "converter_app", None), getattr(self, "format_app", None), getattr(self, "video_app", None), getattr(self, "swap_app", None), getattr(self, "wem_filter_app", None), getattr(self, "voice_clone_app", None)):
                 if app is not None and hasattr(app, "apply_theme"):
                     app.apply_theme(theme)
-            for scroll in (getattr(self, "clone_scroll", None), getattr(self, "review_scroll", None), getattr(self, "terminal_scroll", None), getattr(self, "converter_scroll", None), getattr(self, "format_scroll", None), getattr(self, "wem_filter_scroll", None), getattr(self, "voice_clone_scroll", None)):
+            for scroll in (getattr(self, "clone_scroll", None), getattr(self, "review_scroll", None), getattr(self, "personalized_scroll", None), getattr(self, "terminal_scroll", None), getattr(self, "converter_scroll", None), getattr(self, "format_scroll", None), getattr(self, "video_scroll", None), getattr(self, "swap_scroll", None), getattr(self, "wem_filter_scroll", None), getattr(self, "voice_clone_scroll", None)):
                 if scroll is not None and scroll.winfo_exists():
                     scroll.set_background(theme["root"])
             if hasattr(self, "help_manager"):
@@ -1553,53 +1469,13 @@ class DublaskizonApp:
             self._scale_font_targets.pop(key, None)
             self._scale_padding_targets.pop(key, None)
 
-        # Os botões das abas precisam conservar um retângulo comum. Em 80% o
-        # padding vertical dos botões de uma linha seria reduzido para 5 px,
-        # enquanto o botão de redimensionamento, que precisa de duas linhas,
-        # permaneceria com 38 px. Mantemos 38 px para toda a barra e ajustamos
-        # somente a largura do botão de duas linhas; sua fonte continua em 8 pt.
-        tab_buttons = (
-            getattr(self, "clone_tab_button", None),
-            getattr(self, "review_tab_button", None),
-            getattr(self, "converter_tab_button", None),
-            getattr(self, "format_tab_button", None),
-            getattr(self, "wem_filter_tab_button", None),
-            getattr(self, "voice_clone_tab_button", None),
-            getattr(self, "commands_tab_button", None),
-        )
-        if self.scale_percent < 100:
-            voice_button = getattr(self, "voice_clone_tab_button", None)
-            for button in tab_buttons:
-                if button is None or button is voice_button:
-                    continue
-                try:
-                    # Mantém a altura de 38 px necessária para o texto em duas linhas.
-                    button.configure(pady=6)
-                except (tk.TclError, TypeError, ValueError):
-                    pass
-            if voice_button is not None:
-                try:
-                    self.root.update_idletasks()
-                    reference = int(self.clone_tab_button.winfo_reqwidth())
-                    current_width = max(1, int(voice_button.cget("width")))
-                    current_padx = max(0, int(voice_button.cget("padx")))
-                    best = None
-                    # Em escala reduzida, o arredondamento do Tk pode produzir
-                    # 1–2 px de diferença. Escolhemos a combinação mais próxima
-                    # sem reduzir a margem lateral que já protege o texto.
-                    for padx in range(max(0, current_padx - 2), current_padx + 3):
-                        for width in range(max(1, current_width - 3), current_width + 5):
-                            voice_button.configure(width=width, padx=padx)
-                            self.root.update_idletasks()
-                            measured = int(voice_button.winfo_reqwidth())
-                            score = (abs(measured - reference), -padx, measured)
-                            if best is None or score < best[0]:
-                                best = (score, width, padx)
-                    if best is not None:
-                        _, width, padx = best
-                        voice_button.configure(width=width, padx=padx, height=2)
-                except (tk.TclError, TypeError, ValueError):
-                    pass
+        # Uma única linha: dimensões idênticas para todas as abas, inclusive em outras escalas.
+        for name in ("clone", "review", "personalized", "converter", "format", "wem_filter", "voice_clone", "video", "swap", "commands"):
+            button = getattr(self, name + "_tab_button", None)
+            if button is not None:
+                button.configure(font=("Segoe UI", max(8, round(9 * self.scale_percent / 100)), "bold"),
+                                 width=19, height=2, padx=10, pady=7, wraplength=max(100, round(136 * self.scale_percent / 100)))
+                button.pack_configure(padx=(0, 6))
         self.root.update_idletasks()
 
     def resize_window_to_scale(self) -> None:
@@ -1646,7 +1522,7 @@ class DublaskizonApp:
             self._scaling_in_progress = False
 
     def refresh_scrollbars(self):
-        for scroll_frame in (getattr(self, "clone_scroll", None), getattr(self, "review_scroll", None), getattr(self, "converter_scroll", None), getattr(self, "format_scroll", None), getattr(self, "wem_filter_scroll", None), getattr(self, "voice_clone_scroll", None)):
+        for scroll_frame in (getattr(self, "clone_scroll", None), getattr(self, "review_scroll", None), getattr(self, "converter_scroll", None), getattr(self, "format_scroll", None), getattr(self, "video_scroll", None), getattr(self, "swap_scroll", None), getattr(self, "wem_filter_scroll", None), getattr(self, "voice_clone_scroll", None)):
             if scroll_frame is not None and scroll_frame.winfo_exists():
                 scroll_frame.refresh_layout()
 
@@ -1666,34 +1542,103 @@ class DublaskizonApp:
     def project_callbacks(self):
         return {
             "central_log": self.central_log,
+            "prepare_video_tools": self.prepare_shared_audio_tools,
             "select_project": self.choose_project_folder,
             "use_exe_folder": self.use_exe_folder,
             "tutorial": self.open_tutorial,
             "load_converter_from_review": self.load_converter_from_review,
             "load_converter_from_batch": self.load_converter_from_batch,
+            "load_converter_from_personalized": self.load_converter_from_personalized,
             "load_voice_clone_from_format": self.load_voice_clone_from_format,
             "get_format_audio_files": self.get_format_audio_files,
             "refresh_review": self.refresh_review,
+            "control_dubbing": self.control_dubbing,
+            "scene_completed": self.scene_completed,
+            "prepare_audio_tools": self.prepare_shared_audio_tools,
         }
+
+    def scene_completed(self, stem, original, text, source):
+        if getattr(self, '_review_refresh_running', False):
+            self._review_completed_during_scan.append((stem, original, text, source))
+        review = getattr(self, 'review_app', None)
+        if review is not None:
+            review.register_completed_scene(stem, original, text, source)
+
+    def control_dubbing(self, source, after_scene):
+        app = self.personalized_app if source == 'custom' else self.batch_app
+        if not getattr(app, 'running', False):
+            return
+        if source == 'custom':
+            if after_scene:
+                app.stop_after_current = True
+                app.status_var.set('A cena atual será concluída e a fila será encerrada.')
+            else:
+                app.cancel_generation()
+        elif after_scene:
+            app.stop_after_scene()
+        else:
+            app.cancel_run()
 
     def refresh_review(self):
         review = getattr(self, "review_app", None)
-        if review is None or getattr(review, "busy", False):
+        if review is None or getattr(self, '_review_refresh_running', False):
             return
-        previous_stem = None
-        if getattr(review, "stems", None) and 0 <= getattr(review, "current_index", -1) < len(review.stems):
-            previous_stem = review.stems[review.current_index]
-        review.audio_by_stem = review_tab.scene_audio_files()
-        review.text_by_stem = review_tab.scene_text_files()
-        review.stems = sorted(set(review.audio_by_stem) & set(review.text_by_stem), key=str.casefold)
-        review.scene_count_var.set(f"DUBLADOS ({len(review.stems)} áudios)")
-        review.refresh_scene_list()
-        if review.stems:
-            index = review.stems.index(previous_stem) if previous_stem in review.stems else 0
-            review.select_scene(index)
-        else:
-            review.scene_var.set("Nenhuma cena selecionada")
-            review.path_var.set("")
+        self._review_refresh_running = True
+        self._review_completed_during_scan = []
+        project = self.project_root
+        results = queue.Queue()
+        audio_dir, text_dir = review_tab.AUDIO_DIR, review_tab.TEXT_DIR
+        original_dir = getattr(review, 'original_text_dir', review_tab.ORIGINAL_TEXT_DIR)
+        other_dir = review.other_translation_dir
+        review.status_var.set('Atualizando cenas disponíveis; a dublagem continua…')
+        def scan():
+            try:
+                results.put((True, (
+                    batch_tab.find_audio_by_stem(audio_dir),
+                    batch_tab.find_text_by_stem(text_dir),
+                    review_tab.original_text_files(original_dir),
+                    review_tab.other_translation_text_files(other_dir),
+                    batch_tab.find_audio_by_stem(project / 'dublados personalizados'),
+                )))
+            except Exception as exc:
+                results.put((False, str(exc)))
+        def finish():
+            if review is not getattr(self, 'review_app', None) or project != self.project_root:
+                self._review_refresh_running = False
+                return
+            try:
+                ok, data = results.get_nowait()
+            except queue.Empty:
+                self.root.after(100, finish)
+                return
+            self._review_refresh_running = False
+            if not ok:
+                review.status_var.set('Não foi possível atualizar a Revisão: ' + data)
+                return
+            previous = review.current_stem()
+            audio, texts, originals, alternatives, custom = data
+            review.audio_by_stem = audio
+            review.text_by_stem = texts
+            if original_dir == getattr(review, 'original_text_dir', review_tab.ORIGINAL_TEXT_DIR):
+                review.original_text_by_stem = originals
+            if other_dir == review.other_translation_dir:
+                review.other_translation_by_stem = alternatives
+            available = set(audio) & set(texts)
+            if getattr(review, 'audio_source_mode', 'normal') == 'custom':
+                available &= set(custom)
+            review.default_stems = sorted(available, key=str.casefold)
+            review.refresh_scene_list(preserve_stem=previous)
+            # Do not reload the current editor/player: it may contain unsaved edits.
+            if previous is None and review.stems and not getattr(review, 'busy', False):
+                review.select_scene(0)
+            review.refresh_original_folder_buttons()
+            review.refresh_other_translation_folder_buttons()
+            for event in self._review_completed_during_scan:
+                review.register_completed_scene(*event)
+            self._review_completed_during_scan = []
+            review.status_var.set('Revisão atualizada. Cenas disponíveis para revisar; processamento preservado.')
+        threading.Thread(target=scan, daemon=True).start()
+        self.root.after(100, finish)
 
     def load_converter_from_review(self):
         if self.converter_app is not None:
@@ -1704,6 +1649,11 @@ class DublaskizonApp:
         if self.converter_app is not None:
             self.converter_app.load_from_batch()
             self.select_tab(self.converter_scroll)
+
+    def load_converter_from_personalized(self):
+        if self.converter_app is not None:
+            self.select_tab(self.converter_scroll)
+            self.converter_app.load_from_personalized()
 
     def get_format_audio_files(self):
         """Retorna a fila atual da aba Converter Formatos sem abrir outra janela."""
@@ -1722,30 +1672,47 @@ class DublaskizonApp:
             messagebox.showwarning("Pastas do projeto", f"Não foi possível criar todas as pastas do projeto:\n{exc}", parent=self.root)
 
     def rebuild_views(self):
+        if getattr(self.swap_app, "running", False):
+            return
+        if self.swap_app is not None:
+            self.swap_app.close_previews()
+        if getattr(self.video_app, "running", False) or getattr(self.swap_app, "running", False):
+            return
+        if self.video_app is not None:
+            self.video_app.close_previews()
+        if getattr(getattr(self, "personalized_app", None), "busy", False):
+            return
         if (self.batch_app is not None and getattr(self.batch_app, "running", False)) or (self.converter_app is not None and getattr(self.converter_app, "running", False)) or (self.format_app is not None and getattr(self.format_app, "running", False)):
             return
-        for old_view in (self.clone_scroll, self.review_scroll, self.terminal_scroll, self.converter_scroll, self.format_scroll, self.wem_filter_scroll, self.voice_clone_scroll):
+        for old_view in (self.clone_scroll, self.review_scroll, self.personalized_scroll, self.terminal_scroll, self.converter_scroll, self.format_scroll, self.video_scroll, self.swap_scroll, self.wem_filter_scroll, self.voice_clone_scroll):
             if old_view is not None:
                 old_view.destroy()
 
         batch_tab.configure_project_root(self.project_root)
         review_tab.configure_project_root(self.project_root)
+        personalized_dubbing_tab.configure_project_root(self.project_root)
         # Corrige nomes legados antes de instanciar a Revisão, que também lê WAV ORIGINAIS.
         batch_tab.migrate_legacy_converted_wavs()
         # Não criar diretórios ao trocar/abrir o projeto; apenas atualizar as listas.
         theme = self.current_theme()
         self.clone_scroll = ScrollableFrame(self.content, background=theme["root"])
         self.review_scroll = ScrollableFrame(self.content, background=theme["root"])
+        self.personalized_scroll = ScrollableFrame(self.content, background=theme["root"])
         self.terminal_scroll = ScrollableFrame(self.content, background=theme["root"])
         self.converter_scroll = ScrollableFrame(self.content, background=theme["root"])
         self.format_scroll = ScrollableFrame(self.content, background=theme["root"])
+        self.video_scroll = ScrollableFrame(self.content, background=theme["root"])
+        self.swap_scroll = ScrollableFrame(self.content, background=theme["root"])
         self.wem_filter_scroll = ScrollableFrame(self.content, background=theme["root"])
         self.voice_clone_scroll = ScrollableFrame(self.content, background=theme["root"])
         self.clone_frame = self.clone_scroll.inner
         self.review_frame = self.review_scroll.inner
+        self.personalized_frame = self.personalized_scroll.inner
         self.terminal_frame = self.terminal_scroll.inner
         self.converter_frame = self.converter_scroll.inner
         self.format_frame = self.format_scroll.inner
+        self.video_frame = self.video_scroll.inner
+        self.swap_frame = self.swap_scroll.inner
         self.wem_filter_frame = self.wem_filter_scroll.inner
         self.voice_clone_frame = self.voice_clone_scroll.inner
         self.clone_scroll.pack(fill="both", expand=True)
@@ -1755,11 +1722,14 @@ class DublaskizonApp:
         # Assim, as duas abas passam a enxergar os WAVs com exatamente os mesmos stems dos TXT.
         self.batch_app = batch_tab.BatchApp(self.clone_frame, embedded=True, project_actions=callbacks)
         self.review_app = review_tab.ReviewApp(self.review_frame, embedded=True, project_actions=callbacks)
+        self.personalized_app = personalized_dubbing_tab.PersonalizedDubbingApp(self.personalized_frame, embedded=True, project_root=self.project_root, project_actions=callbacks, review_app=self.review_app)
         self.batch_app.set_review_audio_target(self.review_app)
         self.terminal_app = TerminalApp(self.terminal_frame, self.root, theme, global_log_queue=self.central_log_queue, central_log_callback=self.central_log)
         duration_converter_tab.configure_project_root(self.project_root)
         self.converter_app = duration_converter_tab.DurationConverterApp(self.converter_frame, embedded=True, project_root=self.project_root, project_actions=callbacks)
         self.format_app = format_converter_tab.FormatConverterApp(self.format_frame, embedded=True, project_root=self.project_root, project_actions=callbacks)
+        self.video_app = video_converter_tab.VideoConverterApp(self.video_frame, project_root=self.project_root, project_actions=callbacks)
+        self.swap_app = video_audio_swap_tab.VideoAudioSwapApp(self.swap_frame, project_root=self.project_root, project_actions=callbacks)
         self.wem_filter_app = wem_filter_tab.WemFilterApp(self.wem_filter_frame, embedded=True, project_root=self.project_root, project_actions=callbacks)
         self.voice_clone_app = voice_clone_tab.VoiceClonePreprocessorApp(self.voice_clone_frame, embedded=True, project_root=self.project_root, project_actions=callbacks)
         self.apply_player_mode()
@@ -1770,13 +1740,15 @@ class DublaskizonApp:
         self.batch_app.dependencies_button.configure(command=self.prepare_shared_audio_tools)
         self.update_project_display()
         self.update_tab_buttons()
+        if not getattr(self,"_activity_timer",None):
+            self._activity_timer=self.root.after(750,self.poll_tab_activity)
         self.apply_theme()
         self.apply_scale(self.scale_percent, resize_window=False, save=False)
         if hasattr(self, "language_code"):
             self.apply_language(self.language_code, save=False)
 
     def prepare_shared_audio_tools(self) -> None:
-        apps = (self.converter_app, self.format_app, self.voice_clone_app, self.batch_app)
+        apps = (self.converter_app, self.format_app, self.voice_clone_app, self.batch_app, self.video_app, self.swap_app)
         if any(getattr(app, "running", False) for app in apps):
             self.central_log("COMANDOS", "Preparação das ferramentas bloqueada: há um processamento em andamento.", "info")
             messagebox.showwarning("Ferramentas", "Aguarde o processamento atual terminar antes de preparar as ferramentas.", parent=self.root)
@@ -1910,6 +1882,12 @@ class DublaskizonApp:
         self.set_project_root(APP_DIR, create_structure=True)
 
     def set_project_root(self, project_root: Path, create_structure: bool = True):
+        if getattr(self.video_app, "running", False) or getattr(self.swap_app, "running", False):
+            messagebox.showwarning("Vídeo em execução", "Aguarde ou cancele a conversão antes de trocar o projeto.", parent=self.root)
+            return
+        if getattr(getattr(self, "personalized_app", None), "busy", False):
+            messagebox.showwarning("Dublagem em execução", "Aguarde a dublagem personalizada terminar antes de trocar o projeto.", parent=self.root)
+            return
         if self.batch_app is not None and getattr(self.batch_app, "running", False):
             messagebox.showwarning("Dublagem em execução", "Aguarde ou cancele a fila antes de trocar a pasta do projeto.", parent=self.root)
             return
@@ -1952,10 +1930,16 @@ class DublaskizonApp:
             # A largura real da aba só existe depois do pack; centraliza a divisória
             # após a interface e a escala visual terminarem de se acomodar.
             self.root.after(50, self.review_app.schedule_initial_text_divider)
+        elif scroll_frame is self.personalized_scroll:
+            self.personalized_app.refresh_for_project()
         elif scroll_frame is self.terminal_scroll:
             self.terminal_app.refresh_for_project()
         elif scroll_frame is self.converter_scroll:
             self.converter_app.refresh_for_project()
+        elif scroll_frame is self.swap_scroll:
+            self.swap_app.refresh_for_project()
+        elif scroll_frame is self.video_scroll:
+            self.video_app.refresh_for_project()
         elif scroll_frame is self.format_scroll:
             self.format_app.refresh_for_project()
         elif scroll_frame is self.wem_filter_scroll:
@@ -1965,13 +1949,33 @@ class DublaskizonApp:
         if hasattr(self, "help_manager"):
             self.help_manager.update_tab()
 
+    def poll_tab_activity(self):
+        if not self.root.winfo_exists(): return
+        self._activity_blink = not getattr(self, '_activity_blink', False)
+        self.update_tab_buttons()
+        for name, app_name in (("clone","batch_app"),("review","review_app"),("personalized","personalized_app"),
+                               ("converter","converter_app"),("format","format_app"),("video","video_app"),
+                               ("swap","swap_app"),("wem_filter","wem_filter_app"),("voice_clone","voice_clone_app")):
+            app=getattr(self,app_name,None)
+            active=any(bool(getattr(app,flag,False)) for flag in ('running','busy','dependencies_running','_scan_running'))
+            if active and self.active_scroll is not getattr(self,name+'_scroll',None) and self._activity_blink:
+                button=getattr(self,name+'_tab_button',None)
+                if button is not None:button.configure(bg='#FBBF24',fg='#111827')
+        process=getattr(getattr(self,'terminal_app',None),'process',None)
+        if process is not None and process.poll() is None and self.active_scroll is not self.terminal_scroll and self._activity_blink:
+            self.commands_tab_button.configure(bg='#FBBF24',fg='#111827')
+        self._activity_timer=self.root.after(750,self.poll_tab_activity)
+
     def update_tab_buttons(self):
         theme = self.current_theme()
         tab_states = (
             (self.clone_tab_button, self.active_scroll is self.clone_scroll),
             (self.review_tab_button, self.active_scroll is self.review_scroll),
+            (self.personalized_tab_button, self.active_scroll is self.personalized_scroll),
             (self.converter_tab_button, self.active_scroll is self.converter_scroll),
             (self.format_tab_button, self.active_scroll is self.format_scroll),
+            (self.video_tab_button, self.active_scroll is self.video_scroll),
+            (self.swap_tab_button, self.active_scroll is self.swap_scroll),
             (self.wem_filter_tab_button, self.active_scroll is self.wem_filter_scroll),
             (self.voice_clone_tab_button, self.active_scroll is self.voice_clone_scroll),
             (self.commands_tab_button, self.active_scroll is self.terminal_scroll),
@@ -1981,6 +1985,18 @@ class DublaskizonApp:
             widget.configure(relief="sunken" if selected else "raised")
 
     def close(self):
+        if getattr(self.swap_app, "running", False):
+            if messagebox.askyesno("Troca de áudio", "Cancelar a operação? Aguarde o cancelamento e feche novamente.", parent=self.root):
+                self.swap_app.cancel_run()
+            return
+        if self.swap_app is not None:
+            self.swap_app.close_previews()
+        if getattr(self.video_app, "running", False) or getattr(self.swap_app, "running", False):
+            if messagebox.askyesno("Conversão de vídeo", "Cancelar a conversão? Aguarde a conclusão do cancelamento e feche novamente.", parent=self.root):
+                self.video_app.cancel_run()
+            return
+        if self.video_app is not None:
+            self.video_app.close_previews()
         if hasattr(self, "help_manager"):
             self.help_manager.close()
         batch_running = getattr(self.batch_app, "running", False)

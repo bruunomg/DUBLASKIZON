@@ -255,9 +255,13 @@ def executable_path(name: str, project_root: Path | None = None) -> str | None:
             candidate = root / executable_name
             if candidate.is_file():
                 return str(candidate)
+        # Broad project/app roots contain thousands of audio files. Only tool
+        # directories are recursive; executables at the root were checked above.
+        if root.name.casefold() not in {TOOLS_DIR_NAME.casefold(), "tools", "sox"}:
+            continue
         try:
             for candidate in root.rglob("*"):
-                if candidate.is_file() and candidate.name.casefold() in {value.casefold() for value in executable_names}:
+                if candidate.name.casefold() in {value.casefold() for value in executable_names} and candidate.is_file():
                     return str(candidate)
         except (OSError, PermissionError):
             continue
@@ -407,6 +411,11 @@ class DurationConverterApp:
         options.grid_columnconfigure(1, weight=1)
         options.grid_columnconfigure(2, weight=0)
 
+        personalized_actions = Frame(self.root, bg="#F5F6FA")
+        personalized_actions.pack(fill="x", padx=16, pady=(0, 6))
+        self.load_personalized_button = Button(personalized_actions, text="CARREGAR DA ABA DUBLAGEM PERSONALIZADA", command=lambda: self.project_actions.get("load_converter_from_personalized", self.load_from_personalized)(), bg="#D97706", activebackground="#B45309", fg="white", relief="flat", font=("Segoe UI", 8, "bold"), padx=9, pady=6, cursor="hand2")
+        self.load_personalized_button.pack(side="left")
+
         actions = Frame(self.root, bg="#F5F6FA")
         actions.pack(fill="x", padx=16, pady=(0, 6))
         Button(actions, text="CARREGAR DA ABA REVISÃO", command=lambda: self.project_actions.get("load_converter_from_review", self.load_from_review)(), bg="#D97706", activebackground="#B45309", fg="white", relief="flat", font=("Segoe UI", 8, "bold"), padx=9, pady=6, cursor="hand2").pack(side="left", padx=(0, 6))
@@ -496,7 +505,7 @@ class DurationConverterApp:
         Entry(panel, textvariable=directory_var, state="readonly", readonlybackground="#FFFFFF", fg="#64748B", relief="flat", font=("Segoe UI", 8)).pack(fill="x", padx=8, pady=(0, 4))
         list_frame = Frame(panel, bg="#FFFFFF")
         list_frame.pack(fill="both", expand=True, padx=8, pady=(0, 5))
-        listbox = Listbox(list_frame, selectmode="extended", activestyle="none", height=10, font=("Segoe UI", 9), bg="#FFFFFF", fg="#1F2937", selectbackground="#DBEAFE", selectforeground="#1F2937")
+        listbox = Listbox(list_frame, selectmode="extended", exportselection=False, activestyle="none", height=10, font=("Segoe UI", 9), bg="#FFFFFF", fg="#1F2937", selectbackground="#DBEAFE", selectforeground="#1F2937")
         scrollbar = Scrollbar(list_frame, orient="vertical", command=listbox.yview)
         listbox.configure(yscrollcommand=scrollbar.set)
         listbox.pack(side="left", fill="both", expand=True)
@@ -586,6 +595,14 @@ class DurationConverterApp:
             menu.grab_release()
         return "break"
 
+    def _prepare_loaded_playback(self, kind: str):
+        files = self.original_files if kind == "original" else self.dubbed_files
+        pairs = {}
+        for index, path in enumerate(files):
+            selected, counterpart = self._context_audio_paths(kind, index)
+            pairs[path] = (selected, counterpart) if kind == "original" else (counterpart, selected)
+        self.audio_player.set_loaded_audio_pairs(pairs)
+
     def play_selected_kind(self, kind: str):
         files = self.original_files if kind == "original" else self.dubbed_files
         listbox = self.original_listbox if kind == "original" else self.dubbed_listbox
@@ -595,11 +612,13 @@ class DurationConverterApp:
         index = int(selection[0])
         path = files[index]
         collection = "ÁUDIOS ORIGINAIS" if kind == "original" else "ÁUDIOS DUBLADOS"
+        self._prepare_loaded_playback(kind)
         self.audio_player.play_one(path, f"{collection} ({len(files)})", playlist=files, index=index)
 
     def play_all_kind(self, kind: str):
         files = self.original_files if kind == "original" else self.dubbed_files
         label = "ÁUDIOS ORIGINAIS" if kind == "original" else "ÁUDIOS DUBLADOS"
+        self._prepare_loaded_playback(kind)
         self.audio_player.play_all(files, f"{label} ({len(files)})")
 
     def enable_drag_drop(self, widget, kind: str):
@@ -768,6 +787,32 @@ class DurationConverterApp:
 
     def load_from_batch(self):
         self.load_project_defaults("CLONAGEM + DUBLAGEM")
+
+    def load_from_personalized(self):
+        """Carrega os WAVs finalizados pela aba Personalizada e seus originais."""
+        if self.running:
+            self.status_var.set("Aguarde a conversão terminar antes de carregar outros áudios.")
+            return
+        original_dir = self.project_root / "WAV ORIGINAIS"
+        dubbed_dir = self.project_root / "dublados personalizados"
+        # A síntese e o ajuste de expressão usam WAVs temporários ocultos.
+        dubbed_files = [path for path in list_audio_files(dubbed_dir)
+                        if not path.name.startswith(".")]
+        keys = {relative_audio_key(path, dubbed_dir) for path in dubbed_files}
+        original_files = [path for path in list_audio_files(original_dir, exclude_converted=True)
+                          if relative_audio_key(path, original_dir) in keys]
+        self.set_audio_files("original", original_files, str(original_dir), base_dir=original_dir)
+        self.set_audio_files("dubbed", dubbed_files, str(dubbed_dir), base_dir=dubbed_dir)
+        pairs = len(set(self.original_by_stem) & set(self.dubbed_by_stem))
+        if not dubbed_files:
+            message = "Nenhum áudio em dublados personalizados. Gere os áudios na aba DUBLAGEM PERSONALIZADA e carregue novamente."
+        else:
+            message = f"Carregado da aba DUBLAGEM PERSONALIZADA: {len(dubbed_files)} dublados e {pairs} pares. Confira os pares antes de converter."
+            missing = len(set(self.dubbed_by_stem) - set(self.original_by_stem))
+            if missing:
+                message += f" {missing} dublado(s) sem original correspondente."
+        self.status_var.set(message)
+        self.append_log(message)
 
     def _log_central(self, message, tag="normal") -> None:
         callback = getattr(self, "central_log_callback", None)
