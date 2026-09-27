@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Dublaskizon
+Comment=Dublagem, revisão e conversão de áudio e vídeo
+Exec=Dublaskizon
+Icon=Dublaskizon
+Terminal=false
+Categories=AudioVideo;Audio;Utility;
+

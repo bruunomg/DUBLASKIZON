@@ -1,0 +1,8 @@
+# Dependências Python opcionais para a ferramenta REDIMENSIONAR ÁUDIO PARA CLONAR
+pydub>=0.25.1
+ffmpeg-python>=0.2.0
+numpy>=1.24
+scipy>=1.10
+
+# Requisito externo obrigatório para conversão e leitura de metadados:
+# FFmpeg e FFprobe devem estar instalados e disponíveis no PATH.
