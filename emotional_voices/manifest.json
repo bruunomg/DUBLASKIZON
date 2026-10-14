@@ -1,0 +1,137 @@
+{
+  "version": 1,
+  "voices": {
+    "masculina": {
+      "neutro": {
+        "file": "masculina_neutro.wav",
+        "source": "emoUERJ",
+        "original_files": [
+          "emoUERJ/m01n13.wav",
+          "emoUERJ/m01n05.wav"
+        ],
+        "language": "pt-BR",
+        "duration": 4.795827664399093,
+        "sha256": "4ebce0003af438b600b77a6194768ead6fda7d090090bce57d9efc7e31df7519"
+      },
+      "alegre": {
+        "file": "masculina_alegre.wav",
+        "source": "emoUERJ",
+        "original_files": [
+          "emoUERJ/m01h11.wav"
+        ],
+        "language": "pt-BR",
+        "duration": 4.75,
+        "sha256": "a3ac03b6dedda35e292152ef1e1f8537be03fb91ca1c46323cc873cc852393d6"
+      },
+      "triste": {
+        "file": "masculina_triste.wav",
+        "source": "emoUERJ",
+        "original_files": [
+          "emoUERJ/m01s12.wav"
+        ],
+        "language": "pt-BR",
+        "duration": 5.0140589569161,
+        "sha256": "218e8188b376620817f2a8512c47a9ff887f8f77541226c7c2fc2ca33f2ee4a3"
+      },
+      "raiva": {
+        "file": "masculina_raiva.wav",
+        "source": "emoUERJ",
+        "original_files": [
+          "emoUERJ/m01a12.wav"
+        ],
+        "language": "pt-BR",
+        "duration": 4.3750113378684805,
+        "sha256": "bc96c1faba85756eba38aac7d164f1c3b2ec799838d73552a633b95bcfb21151"
+      },
+      "sussurro": {
+        "file": "thorsten_sussurro.wav",
+        "source": "Thorsten-Voice TV-44kHz-Full",
+        "language": "de",
+        "transcript": "Tragen Sie die Adressen Ihrer Straße bitte in OpenStreetMap ein!",
+        "id": "9d3b4713-9500-eb8d-5162-553b5bbd0627---0dab10b16c7b606c059abe21d1eb2900",
+        "sha256": "53a6d0edfca6fcee6745a396090cc21e312fce59378bcb59a1c21deb4644cef3"
+      },
+      "surpreso": {
+        "file": "thorsten_surpreso.wav",
+        "source": "Thorsten-Voice TV-44kHz-Full",
+        "language": "de",
+        "transcript": "Warum können Telefone mit Android sich nicht als ganz normale Massenspeichermedien ausweisen?",
+        "id": "9d622c71-6847-38ef-c2fd-5c7370339249---8c20f475dbb2dcc5939f749a76221c84",
+        "sha256": "94fdf3b7a313587d345854a05e85ac1069d523176d19a40b82259bbb3544c529"
+      }
+    },
+    "feminina": {
+      "neutro": {
+        "file": "feminina_neutro.wav",
+        "source": "emoUERJ",
+        "original_files": [
+          "emoUERJ/w01n10.wav"
+        ],
+        "language": "pt-BR",
+        "duration": 4.84891156462585,
+        "sha256": "c74da98064c4668a15c5141c5f8cc78b55f2bb6159ace752ede9847641cc4043"
+      },
+      "alegre": {
+        "file": "feminina_alegre.wav",
+        "source": "emoUERJ",
+        "original_files": [
+          "emoUERJ/w01h03.wav",
+          "emoUERJ/w01h04.wav"
+        ],
+        "language": "pt-BR",
+        "duration": 5.522993197278912,
+        "sha256": "4a354cb7eb3afc43134cd6dcee5aaee62543e19ce209ac257c7380711259a3c9"
+      },
+      "triste": {
+        "file": "feminina_triste.wav",
+        "source": "emoUERJ",
+        "original_files": [
+          "emoUERJ/w01s07.wav"
+        ],
+        "language": "pt-BR",
+        "duration": 5.045192743764172,
+        "sha256": "0fa1914520756f9ebe75615ea1a4d98520b712221305b3495571c8f944f2d648"
+      },
+      "raiva": {
+        "file": "feminina_raiva.wav",
+        "source": "emoUERJ",
+        "original_files": [
+          "emoUERJ/w01a04.wav"
+        ],
+        "language": "pt-BR",
+        "duration": 3.790952380952381,
+        "sha256": "7adb597c649bbd442161762de1557747e44ac6ae3ba0178f411f858735ce0191"
+      },
+      "sussurro": {
+        "file": "thorsten_sussurro.wav",
+        "source": "Thorsten-Voice TV-44kHz-Full",
+        "language": "de",
+        "transcript": "Tragen Sie die Adressen Ihrer Straße bitte in OpenStreetMap ein!",
+        "id": "9d3b4713-9500-eb8d-5162-553b5bbd0627---0dab10b16c7b606c059abe21d1eb2900",
+        "sha256": "53a6d0edfca6fcee6745a396090cc21e312fce59378bcb59a1c21deb4644cef3"
+      },
+      "surpreso": {
+        "file": "thorsten_surpreso.wav",
+        "source": "Thorsten-Voice TV-44kHz-Full",
+        "language": "de",
+        "transcript": "Warum können Telefone mit Android sich nicht als ganz normale Massenspeichermedien ausweisen?",
+        "id": "9d622c71-6847-38ef-c2fd-5c7370339249---8c20f475dbb2dcc5939f749a76221c84",
+        "sha256": "94fdf3b7a313587d345854a05e85ac1069d523176d19a40b82259bbb3544c529"
+      }
+    }
+  },
+  "sources": [
+    {
+      "name": "emoUERJ",
+      "url": "https://zenodo.org/records/5427549",
+      "license": "CC BY 4.0",
+      "authors": "Rodrigo Gregory Bastos Germano; Michel Pompeu Tcheou; Felipe da Rocha Henriques; Sergio Pinto Gomes Junior"
+    },
+    {
+      "name": "Thorsten-Voice TV-44kHz-Full",
+      "url": "https://huggingface.co/datasets/Thorsten-Voice/TV-44kHz-Full",
+      "license": "CC0 1.0",
+      "authors": "Thorsten Müller; Dominik Kreutz"
+    }
+  ]
+}

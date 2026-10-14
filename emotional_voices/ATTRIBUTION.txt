@@ -1,0 +1,2 @@
+emoUERJ: Rodrigo Gregory Bastos Germano, Michel Pompeu Tcheou, Felipe da Rocha Henriques, Sergio Pinto Gomes Junior. https://zenodo.org/records/5427549 . CC BY 4.0 https://creativecommons.org/licenses/by/4.0/ . Seleção e união de trechos da mesma emoção e locutor com pausa de 150 ms quando necessário.
+Thorsten-Voice: Thorsten Müller e Dominik Kreutz. https://huggingface.co/datasets/Thorsten-Voice/TV-44kHz-Full . CC0 1.0 https://creativecommons.org/publicdomain/zero/1.0/ . Seleção de gravações originais, sem alteração.

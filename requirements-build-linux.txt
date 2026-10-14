@@ -1,0 +1,4 @@
+# Execute em uma distribuição Linux x86_64 com Python 3.12 ou 3.13.
+-r requirements.txt
+pyinstaller>=6.0
+
