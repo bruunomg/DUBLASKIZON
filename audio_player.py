@@ -4,6 +4,7 @@ Usa FFplay, distribuído com o FFmpeg, ou o reprodutor padrão do Windows, confo
 """
 
 from __future__ import annotations
+import audioop
 
 import os
 import math
@@ -16,6 +17,7 @@ import tempfile
 import threading
 import time
 import wave
+import weakref
 from pathlib import Path
 
 try:
@@ -24,6 +26,7 @@ except ImportError:
     from audio_clip_timeline import AudioClip, split_clip, move_clip, move_clip_group, render_clips, paste_clip
 
 try:
+    import tkinter as tk
     from tkinter import Button, Canvas, DoubleVar, END, Frame, Label, Menu, Scrollbar, StringVar, Text, Toplevel, filedialog, messagebox, ttk
 except ModuleNotFoundError:
     TK_AVAILABLE = False
@@ -106,53 +109,8 @@ def reveal_in_file_manager(path: Path) -> bool:
 
 
 def find_ffplay(project_root: Path | None = None) -> str | None:
-    names = ("ffplay.exe", "ffplay")
-    for name in names:
-        found = shutil.which(name)
-        if found:
-            return found
-    module_dir = Path(__file__).resolve().parent
-    app_dir = Path(os.environ.get("DUBLASKIZON_APP_DIR", module_dir)).expanduser()
-    # Diretórios amplos (APP_DIR e a raiz do projeto) são consultados somente
-    # diretamente. A busca recursiva fica restrita às pastas portáteis de
-    # ferramentas, evitando percorrer milhares de WAVs ao abrir OUVIR CENA.
-    direct_roots = [app_dir, module_dir]
-    tool_roots = [
-        app_dir / "ferramentas_audio",
-        app_dir / "tools",
-        module_dir / "ferramentas_audio",
-        module_dir / "tools",
-    ]
-    if project_root is not None:
-        project = Path(project_root).expanduser()
-        direct_roots.append(project)
-        tool_roots.extend([project / "ferramentas_audio", project / "tools"])
-    seen: set[str] = set()
-    for root in direct_roots:
-        key = os.path.normcase(os.path.abspath(str(root)))
-        if key in seen:
-            continue
-        seen.add(key)
-        for candidate_name in names:
-            candidate = root / candidate_name
-            if candidate.is_file():
-                return str(candidate)
-    for root in tool_roots:
-        key = os.path.normcase(os.path.abspath(str(root)))
-        if key in seen:
-            continue
-        seen.add(key)
-        for candidate_name in names:
-            candidate = root / candidate_name
-            if candidate.is_file():
-                return str(candidate)
-        try:
-            for candidate in root.rglob("*"):
-                if candidate.is_file() and candidate.name.casefold() in {name.casefold() for name in names}:
-                    return str(candidate)
-        except (OSError, PermissionError):
-            pass
-    return None
+    from shared_audio_tools import find_tool
+    return find_tool('ffplay',project_root)
 
 
 def process_scene_volume(track, decibels):
@@ -197,6 +155,68 @@ def process_scene_volume(track, decibels):
         result=values.astype('<i'+str(width)).tobytes()
     result,clips=preserve_processed_clips(track,result)
     return result,clips,applied
+
+
+def process_scene_internal_silence(track):
+    """Remove long internal pauses; keep utterance margins and 60 ms separators."""
+    import numpy as np
+    from pydub import AudioSegment
+    from personalized_dubbing_tab import _silero_speech_regions, _speech_regions, _protected_speech_regions
+    audio = AudioSegment(data=track['frames'], sample_width=track['sample_width'],
+                         frame_rate=track['sample_rate'], channels=track['channels'])
+    mono = audio.set_channels(1).set_sample_width(2)
+    pcm = np.frombuffer(mono.raw_data, dtype=np.int16)
+    try:
+        regions, _ = _silero_speech_regions(pcm, pcm, track['sample_rate'])
+    except (RuntimeError, OSError, subprocess.TimeoutExpired):
+        regions = _speech_regions(pcm, track['sample_rate'])
+    if not regions:
+        raise RuntimeError('Nenhuma fala detectada; silêncio não removido e edição preservada.')
+    protection_pcm = pcm.copy()
+    # Opposite stereo phases may cancel in mono; never delete that channel signal.
+    channels_pcm = np.frombuffer(audio.set_sample_width(2).raw_data, dtype=np.int16).reshape(-1, track['channels'])
+    protection_pcm = np.clip(np.max(np.abs(channels_pcm.astype(np.int32)),axis=1),0,32767).astype(np.int16)
+    regions = _protected_speech_regions(protection_pcm, regions, track['sample_rate'])
+    if not regions:
+        raise RuntimeError('Nenhuma fala utilizável detectada; edição preservada.')
+    frame_bytes = track['channels'] * track['sample_width']
+    # This button removes only the middle gaps; preserve the outer edges.
+    regions[0] = (0, regions[0][1]); regions[-1] = (regions[-1][0], len(pcm))
+    silence = (b'\x80' if track['sample_width']==1 else b'\x00'*track['sample_width']) * track['channels']
+    separator = silence * round(track['sample_rate'] * .06)
+    return separator.join(track['frames'][a*frame_bytes:b*frame_bytes] for a,b in regions)
+
+
+def process_scene_alignment(track, original):
+    """Align an editor snapshot; never overwrite either source audio."""
+    from personalized_dubbing_tab import _align_speech_regions, _ffmpeg_path
+    from pydub import AudioSegment
+    ffmpeg = _ffmpeg_path()
+    if not ffmpeg or original is None:
+        raise RuntimeError('Original e FFmpeg são necessários para organizar as ondas.')
+    with tempfile.TemporaryDirectory(prefix='dublaskizon-organizar-') as folder:
+        source, target = Path(folder)/'entrada.wav', Path(folder)/'saida.wav'
+        AudioSegment(data=track['frames'], sample_width=track['sample_width'],
+                     frame_rate=track['sample_rate'], channels=track['channels']).export(source, format='wav')
+        if not _align_speech_regions(source, original, target, ffmpeg, max_change=100):
+            raise RuntimeError('Não foi possível detectar fala nos dois áudios; edição preservada.')
+        result = AudioSegment.from_file(target).set_frame_rate(track['sample_rate']).set_channels(track['channels']).set_sample_width(track['sample_width'])
+        return result.raw_data
+
+
+def process_exact_original_duration(track, project, seconds):
+    rate=track['sample_rate'];width=track['channels']*track['sample_width']
+    total=round(seconds*rate)
+    if total<1 or not track['frames']:raise ValueError('Duração original ou áudio dublado indisponível.')
+    current=len(track['frames'])//width
+    silence=(b'\x80' if track['sample_width']==1 else b'\x00'*track['sample_width'])*track['channels']
+    if current<=total:
+        raw=track['frames']+silence*(total-current)
+        return raw,tuple(track.get('clips') or (AudioClip(1,0,raw),))
+    working=dict(track)
+    while total/(len(working['frames'])//width)<.5:
+        working['frames'],working['clips']=process_scene_audio(working,project,.5,preserve_clips=True)
+    return process_scene_audio(working,project,total/(len(working['frames'])//width),preserve_clips=True)
 
 
 def process_scene_audio(track: dict, project_root, duration_factor=None, preserve_clips=False):
@@ -290,6 +310,15 @@ def preserve_processed_clips(track, raw, trim_start=0, stretch=False):
     return result, tuple(updated)
 
 
+_PLAYER_INSTANCES=weakref.WeakSet()
+
+def set_global_playback_mode(root, mode):
+    root._dublaskizon_playback_mode=mode
+    for player in list(_PLAYER_INSTANCES):
+        parent=player.parent
+        while parent is not None and parent is not root:parent=getattr(parent,'master',None)
+        if parent is root:player.set_playback_mode(mode)
+
 class AudioPlayerManager:
     def __init__(self, parent, project_root: Path | None = None, status_callback=None):
         self.parent = parent
@@ -318,6 +347,12 @@ class AudioPlayerManager:
         self._project_audio_index: dict[str, dict[str, list[Path]]] = {}
         self._ffplay_path: str | None = None
         self.playback_mode = "ffplay"
+        ancestor=parent
+        while ancestor is not None:
+            if hasattr(ancestor,'_dublaskizon_playback_mode'):
+                self.playback_mode=ancestor._dublaskizon_playback_mode;break
+            ancestor=getattr(ancestor,'master',None)
+        _PLAYER_INSTANCES.add(self)
         self.current_source_kind = "unknown"
         self.dubbed_folder_name = "dublado"
         self.current_index = -1
@@ -351,6 +386,8 @@ class AudioPlayerManager:
         self.waveform_zoom_var = None
         self.waveform_zoom_status = None
         self.waveform_scrollbar = None
+        self.waveform_navigation = None
+        self.waveform_vertical_view = None
         self.waveform_progress = {"original": 0.0, "dubbed": 0.0}
         self.waveform_active_kind: str | None = None
         self.waveform_active_path: Path | None = None
@@ -446,6 +483,13 @@ class AudioPlayerManager:
             except Exception:
                 pass
         self._refresh_scene_text()
+        if not self.audio_edit_dirty:
+            self.audio_edit_working.clear()
+            self.audio_edit_undo_stack.clear()
+            self.audio_edit_redo_stack.clear()
+            if self.audio_edit_mode:
+                self._load_edit_track('original')
+                self._load_edit_track('dubbed')
         self._refresh_waveforms()
         self._update_audio_edit_buttons()
         self._update_mode_buttons()
@@ -577,6 +621,7 @@ class AudioPlayerManager:
             container.columnconfigure(0, weight=1)
             container.columnconfigure(1, weight=1)
             container.columnconfigure(2, weight=1)
+            container.columnconfigure(3, weight=1)
             if auto_var is not None:
                 widget = ttk.Checkbutton(basic_row, text=i18n.tr("Abrir Audacity após redublar"), variable=auto_var, command=auto_command)
                 widget.grid(row=0, column=0, sticky='w', padx=(0, 18), pady=(2, 4))
@@ -586,11 +631,11 @@ class AudioPlayerManager:
                 widget.grid(row=0, column=1, sticky='w', pady=(2, 4))
                 self.review_preference_widgets.append(widget)
             if request_character_var is not None:
-                widget=ttk.Checkbutton(request_row,text=i18n.tr("Pedido para alterar personagem da dublagem personalizada"),variable=request_character_var,onvalue="1",offvalue="0")
+                widget=ttk.Checkbutton(request_row,text=i18n.tr("Alterar personagem da dublagem"),variable=request_character_var,onvalue="1",offvalue="0")
                 widget.grid(row=1, column=0, sticky='w', padx=(0, 12), pady=(2, 4))
                 self.review_preference_widgets.append(widget)
             if request_translation_var is not None:
-                widget=ttk.Checkbutton(request_row,text=i18n.tr("Pedido para transcrever e traduzir o original"),variable=request_translation_var,onvalue="1",offvalue="0")
+                widget=ttk.Checkbutton(request_row,text=i18n.tr("Transcrever e traduzir original"),variable=request_translation_var,onvalue="1",offvalue="0")
                 widget.grid(row=1, column=1, sticky='w', pady=(2, 4))
                 self.review_preference_widgets.append(widget)
             for column, (name, label) in enumerate((('align_original_var', 'Alinhar ritmo e duração ao original'), ('translate_missing_var', 'Transcrever e traduzir quando faltar TXT'))):
@@ -599,23 +644,60 @@ class AudioPlayerManager:
                     widget = ttk.Checkbutton(container, text=i18n.tr(label), variable=variable, onvalue='1', offvalue='0')
                     widget.grid(row=column, column=2, sticky='w', padx=(12,0), pady=(2,4))
                     self.review_preference_widgets.append(widget)
+            natural=self.review_preferences.get('preserve_original_voice_var')
+            if natural is not None:
+                widget=ttk.Checkbutton(container,text=i18n.tr('Manter voz natural do áudio original'),variable=natural,onvalue='1',offvalue='0')
+                widget.grid(row=0,column=3,sticky='w',padx=(8,0),pady=(2,4))
+                self.review_preference_widgets.append(widget)
             container.pack(fill="x", pady=(0, 4), before=controls)
         except Exception:
             pass
 
-    def _notify_scene_selection(self) -> None:
-        if not callable(self.selection_callback):
+    def follow_scene_selection(self, scene_key, playlist, scene_keys):
+        """Follow an owning list only while its scene window is already open."""
+        if getattr(self, '_notifying_scene_selection', False):
             return
+        try:
+            if self.window is None or not self.window.winfo_exists():
+                return
+        except Exception:
+            return
+        keys = [str(key) for key in scene_keys]
+        if str(scene_key) not in keys:
+            return
+        index = keys.index(str(scene_key))
+        if self.navigation_context_keys == keys:
+            if self.current_context_key != str(scene_key):
+                self.navigate(index - self.current_index)
+            return
+        if not self._prepare_audio_edit_scene_change():
+            return
+        self.navigation_paths = [Path(os.path.abspath(os.path.expanduser(str(path)))) for path in playlist]
+        self.navigation_context_keys = keys
+        self.original_navigation_paths = [None] * len(keys)
+        self.dubbed_navigation_paths = [None] * len(keys)
+        self._resolved_pair_indices.clear()
+        self.current_index = index
+        self.navigate(0)
+
+    def _notify_scene_selection(self) -> None:
+        if not callable(self.selection_callback) or getattr(self, '_notifying_scene_selection', False):
+            return
+        self._notifying_scene_selection = True
         try:
             self.selection_callback(self.current_context_key, self.current_index)
         except Exception:
             pass
+        finally:
+            self._notifying_scene_selection = False
 
     def _invoke_review_action(self, action_name: str) -> None:
         callback = self.review_actions.get(action_name)
         if not callable(callback):
             return
         controller=getattr(self,'translation_controller',None)
+        if controller is not None:
+            controller.active_scene_player = self
         if controller is not None and getattr(self, 'show_original_text', False):
             controller.player_text_override = None
         if controller is not None and action_name in {'redub','redub_other','redub_personalized'} and self.scene_text_box is not None and not getattr(self, 'show_original_text', False):
@@ -799,6 +881,11 @@ class AudioPlayerManager:
             self.emit_status("Reprodução parada")
 
     def _destroy_window(self, clear_pending: bool):
+        drawer=getattr(self,'review_drawer',None)
+        if drawer is not None:drawer.close()
+        self.review_drawer=None
+        treated=getattr(self,'audacity_ui',None)
+        if treated is not None:treated.cancel.set()
         # Fechar uma janela antiga não pode apagar a fila recém-carregada.
         self.stop(announce=False)
         if clear_pending:
@@ -839,6 +926,8 @@ class AudioPlayerManager:
         self.waveform_zoom_var = None
         self.waveform_zoom_status = None
         self.waveform_scrollbar = None
+        self.waveform_navigation = None
+        self.waveform_vertical_view = None
         self.waveform_progress = {"original": 0.0, "dubbed": 0.0}
         self.waveform_active_kind = None
         self.waveform_active_path = None
@@ -936,31 +1025,18 @@ class AudioPlayerManager:
                     raw = wav_file.readframes(block_size)
                     if not raw:
                         break
-                    frame_bytes = sample_width * channels
-                    peaks = []
-                    for offset in range(0, len(raw) - frame_bytes + 1, frame_bytes):
-                        frame = raw[offset:offset + frame_bytes]
-                        values = []
-                        for channel in range(channels):
-                            chunk = frame[channel * sample_width:(channel + 1) * sample_width]
-                            if sample_width == 1:
-                                value = int(chunk[0]) - 128
-                                channel_scale = 128.0
-                            elif sample_width == 2:
-                                value = int.from_bytes(chunk, "little", signed=True)
-                                channel_scale = scale
-                            elif sample_width == 3:
-                                value = int.from_bytes(chunk + (b"\xff" if chunk[-1] & 0x80 else b"\x00"), "little", signed=True)
-                                channel_scale = 1 << 23
-                            else:
-                                value = int.from_bytes(chunk, "little", signed=True)
-                                channel_scale = scale
-                            values.append(abs(value) / channel_scale)
-                        peaks.append(max(values) if values else 0.0)
-                    samples.append(min(1.0, max(peaks) if peaks else 0.0))
+                    if sample_width == 1:raw=audioop.bias(raw,1,-128)
+                    samples.append(min(1.0,audioop.max(raw,sample_width)/scale))
                 return {"samples": samples, "duration": duration, "sample_rate": sample_rate, "channels": channels}
         except (OSError, EOFError, wave.Error, ValueError):
-            return None
+            # Some engines write float WAV, unsupported by the stdlib wave reader.
+            try:
+                from pydub import AudioSegment
+                decoded = AudioSegment.from_file(path).set_sample_width(2)
+                return AudioPlayerManager._waveform_from_pcm(decoded.raw_data, decoded.channels,
+                                                            2, decoded.frame_rate, points)
+            except Exception:
+                return None
 
     @staticmethod
     def _waveform_from_pcm(raw: bytes, channels: int, sample_width: int, sample_rate: int, points: int = 700):
@@ -978,27 +1054,8 @@ class AudioPlayerManager:
         samples = []
         for block_index in range(0, frame_count, block_size):
             block = raw[block_index * frame_bytes:min(frame_count, block_index + block_size) * frame_bytes]
-            peak = 0.0
-            for offset in range(0, len(block) - frame_bytes + 1, frame_bytes):
-                frame = block[offset:offset + frame_bytes]
-                frame_peak = 0.0
-                for channel in range(channels):
-                    chunk = frame[channel * sample_width:(channel + 1) * sample_width]
-                    if sample_width == 1:
-                        value = int(chunk[0]) - 128
-                        channel_scale = 128.0
-                    elif sample_width == 2:
-                        value = int.from_bytes(chunk, "little", signed=True)
-                        channel_scale = scale
-                    elif sample_width == 3:
-                        value = int.from_bytes(chunk + (bytes((255,)) if chunk[-1] & 0x80 else bytes((0,))), "little", signed=True)
-                        channel_scale = 1 << 23
-                    else:
-                        value = int.from_bytes(chunk, "little", signed=True)
-                        channel_scale = scale
-                    frame_peak = max(frame_peak, abs(value) / channel_scale)
-                peak = max(peak, frame_peak)
-            samples.append(min(1.0, peak))
+            if sample_width == 1:block=audioop.bias(block,1,-128)
+            samples.append(min(1.0,audioop.max(block,sample_width)/scale))
             if len(samples) >= points:
                 break
         return {"samples": samples, "duration": duration, "sample_rate": sample_rate, "channels": channels}
@@ -1029,7 +1086,17 @@ class AudioPlayerManager:
             self.audio_edit_working[kind] = track
             return track
         except (OSError, EOFError, wave.Error, ValueError):
-            return None
+            try:
+                from pydub import AudioSegment
+                decoded = AudioSegment.from_file(path).set_sample_width(2)
+                track = dict(path=Path(path).resolve(), frames=decoded.raw_data,
+                             channels=decoded.channels, sample_width=2, sample_rate=decoded.frame_rate,
+                             comptype='NONE', compname='not compressed')
+                track['saved_clips'] = self._track_clips(track)
+                self.audio_edit_working[kind] = track
+                return track
+            except Exception:
+                return None
 
     def _remove_audio_edit_preview(self) -> None:
         preview = self.audio_edit_preview_path
@@ -1223,7 +1290,7 @@ class AudioPlayerManager:
             if clip is not None:self._select_clip(clip,event.state)
             return
         self.selected_clip_ids=set();self.clip_selection_anchor=None
-        for other_kind in ("original", "dubbed"):
+        for other_kind in self.waveform_canvases:
             if other_kind != kind:
                 self.waveform_selection_ranges[other_kind] = None
                 self._draw_waveform(other_kind)
@@ -1317,7 +1384,7 @@ class AudioPlayerManager:
             return 'break'
         selected = self._edit_selection_frames(kind) if kind else None
         if selected is None:
-            self._set_audio_edit_status("Selecione um trecho em ORIGINAL ou DUBLADO para copiar.")
+            self._set_audio_edit_status("Selecione um trecho em qualquer onda para copiar.")
             return "break"
         track, start_frame, end_frame, frame_bytes = selected
         if end_frame <= start_frame:
@@ -1439,7 +1506,7 @@ class AudioPlayerManager:
         self._set_audio_edit_status(f"Trecho colado no DUBLADO: {self._format_wave_duration(len(clip['frames']) / frame_bytes / target['sample_rate'])}.")
         return "break"
 
-    def _process_scene_audio_edit(self, duration_factor=None, volume_db=None):
+    def _process_scene_audio_edit(self, duration_factor=None, volume_db=None, align_original=False, remove_internal_silence=False, exact_original=False):
         if not self.audio_edit_mode or getattr(self, "audio_transform_busy", False):
             return
         track = self.audio_edit_working.get("dubbed")
@@ -1451,6 +1518,8 @@ class AudioPlayerManager:
         self._update_audio_edit_buttons()
         self._set_audio_edit_status("Processando DUBLADO…")
         snapshot = dict(track)
+        original = self._current_audio_path('original') if align_original or exact_original else None
+        original_seconds=(self.waveform_data.get('original') or {}).get('duration',0) if exact_original else 0
         clip_snapshot = self._track_clips(track)
         duration_base=None;duration_ratio=None
         if duration_factor is not None and volume_db is None:
@@ -1465,7 +1534,15 @@ class AudioPlayerManager:
         done = threading.Event()
         def work():
             try:
-                if volume_db is not None:
+                if exact_original:
+                    outcome['frames'],outcome['clips']=process_exact_original_duration(snapshot,self.project_root,original_seconds)
+                elif remove_internal_silence:
+                    outcome['frames'] = process_scene_internal_silence(snapshot)
+                    outcome['clips'] = (AudioClip(1, 0, outcome['frames']),)
+                elif align_original:
+                    outcome['frames'] = process_scene_alignment(snapshot, original)
+                    outcome['clips'] = (AudioClip(1, 0, outcome['frames']),)
+                elif volume_db is not None:
                     outcome["frames"],outcome["clips"],outcome["gain_db"]=process_scene_volume(snapshot,volume_db)
                 else:
                     outcome["frames"], outcome["clips"] = process_scene_audio(duration_base if duration_base is not None else snapshot, self.project_root, duration_ratio if duration_ratio is not None else duration_factor, preserve_clips=True)
@@ -1483,6 +1560,8 @@ class AudioPlayerManager:
                 return
             if track["frames"] != snapshot["frames"] or self._track_clips(track) != clip_snapshot:
                 self._set_audio_edit_status("O áudio mudou durante o processamento. Repita o ajuste.")
+            elif 'warning' in outcome:
+                self._set_audio_edit_status(outcome['warning'])
             elif "error" in outcome:
                 self._set_audio_edit_status("Falha no ajuste: " + outcome["error"])
                 messagebox.showerror("Editar áudio", outcome["error"], parent=self.window)
@@ -1491,14 +1570,20 @@ class AudioPlayerManager:
                     self._set_edit_frames("dubbed", track, outcome["frames"], clips=outcome["clips"])
                 if duration_base is not None:
                     track['duration_base']=duration_base;track['duration_ratio']=duration_ratio
-                if volume_db is not None:
+                if exact_original:
+                    label='Duração igualada ao original; áudio menor recebe silêncio somente no final'
+                elif remove_internal_silence:
+                    label = 'Silêncios do meio removidos; margens da fala e pausas de 60 ms preservadas'
+                elif align_original:
+                    label = 'Ondas organizadas nos intervalos de fala do original'
+                elif volume_db is not None:
                     gain=outcome['gain_db']
                     label=f"Volume do DUBLADO: {gain:+.2f} dB aplicado"
                     if volume_db>0 and gain<volume_db-0.001:
                         label+=" (limite seguro atingido ou áudio silencioso)"
                 else:
                     label = "Silêncio das extremidades removido" if duration_factor is None else f"Duração: {duration_ratio*100:.0f}% da base; método da pasta maior, sem reprocessar cliques anteriores"
-                self._set_audio_edit_status(label + ". Divisões preservadas. Ouça o resultado e use SALVAR. DESFAZER reverte o ajuste.")
+                self._set_audio_edit_status(label + ('. Divisões recalculadas.' if align_original or remove_internal_silence else '. Divisões preservadas.') + ' Ouça e use SALVAR. DESFAZER reverte o ajuste.')
             self._update_audio_edit_buttons()
         threading.Thread(target=work, daemon=True).start()
         self.parent.after(75, finish)
@@ -1615,7 +1700,7 @@ class AudioPlayerManager:
             clips = self._track_clips(track) if clips is None else clips
             width = max(180, canvas.winfo_width()) - 4
             scale = width * getattr(self, "waveform_zoom", 1.0) / self._clip_timeline_seconds() / track["sample_rate"]
-            colors = button_style(self.theme, "success")
+            colors = button_style(self.theme, "highlight" if getattr(self,'original_reference_editor',False) else "success")
             frame_bytes = self._edit_frame_bytes(track)
             for index, clip in enumerate(clips):
                 left, right = 2 + clip.start * scale, 2 + clip.end(frame_bytes) * scale
@@ -1718,22 +1803,100 @@ class AudioPlayerManager:
             self._set_audio_edit_status("Não foi possível mover o trecho: " + str(exc))
             self._draw_clip_timeline()
 
+    def _save_trash_preference(self):
+        try:
+            path=Path(self.project_root)/'Dublaskizon_ouvir_cena.json'
+            path.write_text(json.dumps({'confirm_trash':self.trash_confirm_var.get()=='1'}),encoding='utf-8')
+        except OSError as error:self._set_audio_edit_status(str(error))
+
+    def _trash_current_scene(self):
+        owners=[getattr(self,'translation_controller',None)]+[getattr(callback,'__self__',None) for callback in self.review_actions.values()]
+        if self.audio_edit_dirty or getattr(self,'audio_transform_busy',False) or any(getattr(owner,'busy',False) for owner in owners if owner):
+            self._set_audio_edit_status('Salve ou desfaça a edição e aguarde a dublagem antes de mover a cena.');return
+        if self.scene_text_path and self.scene_text_box is not None:
+            try:
+                if self.scene_text_box.get('1.0','end-1c').strip()!=self.scene_text_path.read_text(encoding='utf-8-sig').strip():
+                    self._set_audio_edit_status('Salve a alteração do TXT antes de mover a cena.');return
+            except (OSError,UnicodeError):
+                self._set_audio_edit_status('Não foi possível conferir o TXT; cena preservada.');return
+        if getattr(self,'is_part_window',False):return
+        original=self._current_audio_path('original')
+        try:
+            from project_trash import scene_files,move_scene
+            root=Path(self.project_root)
+            key=original.relative_to(root/'WAV ORIGINAIS').with_suffix('').as_posix() if original is not None and original.is_relative_to(root/'WAV ORIGINAIS') else self.current_context_key
+            if not key:raise ValueError('Nenhuma cena do projeto selecionada.')
+            files=scene_files(root,key)
+            if not files:raise ValueError('Nenhum arquivo da cena encontrado.')
+            if self.trash_confirm_var.get()=='1' and not messagebox.askyesno('Lixeira do projeto',f'Mover {len(files)} arquivos da cena {key} para lixeira do projeto?\nÁudios e TXT manterão nomes e pastas. Nenhum arquivo será apagado permanentemente.',parent=self.window):return
+            self.stop(announce=False)
+            moved=move_scene(root,key)
+            self.emit_status(f'Cena {key}: {len(moved)} arquivos movidos para lixeira do projeto.')
+            previous=self.current_index
+            self.navigate(1 if self.current_index+1<len(self.navigation_paths) else -1)
+            if self.current_index==previous:self.close_window()
+        except (OSError,ValueError,RuntimeError) as error:self._set_audio_edit_status(str(error))
+
+    def _switch_dubbed_version(self, latest=False):
+        if getattr(self,'original_reference_editor',False):
+            self._set_audio_edit_status('A recuperação é somente para o áudio dublado, não para o recorte original.')
+            return
+        owners=[getattr(self,'translation_controller',None)]+[getattr(callback,'__self__',None) for callback in self.review_actions.values()]
+        if self.audio_edit_dirty or getattr(self,'audio_transform_busy',False) or any(getattr(owner,'busy',False) for owner in owners if owner):
+            self._set_audio_edit_status('Salve ou desfaça a edição e aguarde o processamento antes de recuperar uma versão.')
+            return
+        target=self._current_audio_path('dubbed')
+        if target is None:return
+        try:
+            from audio_versions import switch
+            self.stop(announce=False)
+            switch(target,self.project_root or target.parent,latest=latest)
+            self.audio_edit_working.clear()
+            self.audio_edit_undo_stack.clear()
+            self.audio_edit_redo_stack.clear()
+            self.refresh_current_scene()
+            self._set_audio_edit_status(('Dublagem mais atual restaurada' if latest else 'Dublagem anterior recuperada')+': '+str(target))
+        except (OSError,ValueError,wave.Error,EOFError) as error:
+            self._set_audio_edit_status(str(error))
+
+    def _reflow_audio_versions(self, bar, heading, row):
+        try:
+            required=bar.winfo_reqwidth()+12
+            for widget in heading.pack_slaves():
+                if widget is bar:continue
+                padding=widget.pack_info().get('padx',0)
+                padding=padding if isinstance(padding,(tuple,list)) else (padding,padding)
+                required+=widget.winfo_reqwidth()+sum(int(v) for v in padding)+8
+            mode='inline' if heading.winfo_width()>=required else 'wrapped'
+            if getattr(bar,'layout_mode',None)==mode:return
+            bar.pack_forget()
+            if mode=='inline':bar.pack(in_=heading,side='left',padx=(12,0))
+            else:bar.pack(in_=row,side='top',anchor='w',before=self.clip_timeline_canvas,padx=(12,0),pady=(3,2))
+            bar.layout_mode=mode
+        except Exception:
+            pass
+
     def _update_audio_edit_buttons(self) -> None:
         has_selection = any(selection is not None for selection in self.waveform_selection_ranges.values())
         has_nonempty_selection = any(selection is not None and abs(float(selection[1]) - float(selection[0])) > 0.0001 for selection in self.waveform_selection_ranges.values())
         transform_enabled = self.audio_edit_mode and bool(self.audio_edit_working.get("dubbed")) and not getattr(self, "audio_transform_busy", False)
         for button, enabled in (
+            (getattr(self,'audio_restore_previous_button',None), self._current_audio_path('dubbed') is not None and not getattr(self,'original_reference_editor',False)),
+            (getattr(self,'audio_restore_latest_button',None), self._current_audio_path('dubbed') is not None and not getattr(self,'original_reference_editor',False)),
+            (getattr(self,'audio_exact_duration_button',None), transform_enabled and self._current_audio_path('original') is not None),
+            (getattr(self, 'audio_auto_align_button', None), transform_enabled and self._current_audio_path('original') is not None),
             (getattr(self, "audio_volume_minus_button", None), transform_enabled),
             (getattr(self, "audio_volume_plus_button", None), transform_enabled),
             (getattr(self, "audio_split_button", None), transform_enabled),
             (getattr(self, "audio_duration_minus_button", None), transform_enabled),
             (getattr(self, "audio_duration_plus_button", None), transform_enabled),
             (getattr(self, "audio_trim_silence_button", None), transform_enabled),
+            (getattr(self, 'audio_internal_silence_button', None), transform_enabled),
             (self.audio_undo_button, self.audio_edit_mode and bool(self.audio_edit_undo_stack)),
             (self.audio_redo_button, self.audio_edit_mode and bool(self.audio_edit_redo_stack)),
             (self.audio_cut_button, self.audio_edit_mode and self.waveform_selection_kind == "dubbed" and has_nonempty_selection),
             (self.audio_delete_button, self.audio_edit_mode and self.waveform_selection_kind == "dubbed" and has_nonempty_selection),
-            (self.audio_copy_button, self.audio_edit_mode and self.waveform_selection_kind in {"original", "dubbed"} and has_nonempty_selection),
+            (self.audio_copy_button, self.audio_edit_mode and self.waveform_selection_kind in self.waveform_canvases and has_nonempty_selection),
             (self.audio_paste_button, self.audio_edit_mode and self.audio_clip_buffer is not None and has_selection),
             (self.audio_save_button, self.audio_edit_mode and self.audio_edit_dirty),
         ):
@@ -1876,6 +2039,17 @@ class AudioPlayerManager:
                     pass
             return None
 
+    def _open_background_editor(self):
+        try:
+            from background_audio import BackgroundEditor
+            existing = getattr(self, 'background_editor', None)
+            if existing is not None and existing.window.winfo_exists():
+                existing.window.lift()
+                return
+            self.background_editor = BackgroundEditor(self, self.background_gain_var.get())
+        except Exception as exc:
+            messagebox.showerror('Som de fundo', str(exc), parent=self.window)
+
     def _play_edit_preview(self, kind: str, start_seconds: float = 0.0) -> bool:
         # Uma nova reprodução precisa invalidar o processo antigo antes de
         # recriar o preview; caso contrário o FFplay pode continuar lendo a
@@ -1908,7 +2082,7 @@ class AudioPlayerManager:
         if not self.audio_edit_mode:
             return None
         active_kind = self.waveform_active_kind
-        if active_kind in {"original", "dubbed"} and self.waveform_active_path is not None:
+        if active_kind in self.waveform_canvases and self.waveform_active_path is not None:
             elapsed = max(0.0, time.monotonic() - self.waveform_active_started_at)
             paused_at = min(self.waveform_active_duration, self.waveform_active_offset + elapsed)
             paused_path = self.waveform_active_path
@@ -1952,6 +2126,9 @@ class AudioPlayerManager:
                     raise wave.Error("cabeçalho WAV salvo não confere")
                 if check_file.getnframes() != len(track["frames"]) // self._edit_frame_bytes(track):
                     raise wave.Error("quantidade de frames WAV salva não confere")
+            if not getattr(self,'original_reference_editor',False):
+                from audio_versions import archive
+                archive(target,self.project_root or target.parent)
             backup = self._archive_audio_edit_backup(target)
             os.replace(temporary, target)
             layout_warning = ""
@@ -2002,7 +2179,8 @@ class AudioPlayerManager:
             return float(x)
 
     def _audio_view_canvases(self):
-        return list(self.waveform_canvases.values()) + ([self.clip_timeline_canvas] if getattr(self, "clip_timeline_canvas", None) is not None else [])
+        ruler = getattr(self, "waveform_navigation", None)
+        return ([ruler.canvas] if ruler is not None else []) + list(self.waveform_canvases.values()) + ([self.clip_timeline_canvas] if getattr(self, "clip_timeline_canvas", None) is not None else [])
 
     def _configure_audio_view(self, canvas):
         try:
@@ -2095,7 +2273,7 @@ class AudioPlayerManager:
 
     def _seek_from_waveform(self, kind: str, event) -> None:
         """Inicia a faixa no instante correspondente ao ponto clicado."""
-        if kind not in {"original", "dubbed"}:
+        if kind not in {"original", "dubbed", "instrumental", "vocals", "suppression"}:
             return
         if self.playback_mode == "windows":
             self.emit_status("A busca por clique nas ondas exige o player FFplay interno.")
@@ -2143,10 +2321,14 @@ class AudioPlayerManager:
             center = height / 2.0
             amplitude = max(8.0, height * 0.42)
             role = "accent" if kind == "original" else "success"
+            if kind=='dubbed' and getattr(self,'original_reference_editor',False):role='highlight'
             try:
                 color = button_style(self.theme, role)["bg"]
             except Exception:
                 color = "#7C3AED" if kind == "original" else "#15803D"
+            if kind in {'instrumental','vocals','suppression'}:
+                from audacity_scene_ui import COLORS
+                color=COLORS[kind]
             plot_width = self._waveform_plot_width(kind, width)
             # Draw only the visible peaks; retain detail at high zoom without thousands of Tk items.
             view_left = self._audio_canvas_x(canvas, 0)
@@ -2183,6 +2365,9 @@ class AudioPlayerManager:
                 canvas.create_line(2, height - 4, progress_x, height - 4, fill=color, width=4, tags="progress")
                 canvas.create_line(progress_x, 4, progress_x, height - 5, fill=color, width=2, tags="progress")
                 canvas.create_oval(progress_x - 4, height - 8, progress_x + 4, height, fill=color, outline=color, tags="progress")
+            navigation=getattr(self,"waveform_navigation",None)
+            if navigation is not None:
+                navigation.draw();navigation.mark(kind)
         except Exception:
             pass
 
@@ -2191,6 +2376,10 @@ class AudioPlayerManager:
             "original": self._current_audio_path("original"),
             "dubbed": self._current_audio_path("dubbed"),
         }
+        treated=getattr(self,'audacity_ui',None)
+        if treated is not None:
+            treated.refresh()
+            paths.update({kind:treated.paths.get(kind) for kind in ('instrumental','vocals','suppression')})
         for kind, path in paths.items():
             working = self.audio_edit_working.get(kind) if self.audio_edit_mode else None
             if working is not None:
@@ -2226,6 +2415,10 @@ class AudioPlayerManager:
         parts = getattr(self, "scene_parts_ui", None)
         if parts is not None:
             parts.refresh()
+        editor_refresh=getattr(self,'scene_editor_refresh',None)
+        if callable(editor_refresh):
+            editor_refresh()
+            return
         if self.scene_text_box is None:
             return
         key = self._scene_text_key()
@@ -2463,7 +2656,7 @@ class AudioPlayerManager:
         """Cria apenas os indicadores compactos de clonagem e dublagem."""
         input_border = self.theme.get("border", "#CBD5E1")
         muted = self.theme.get("muted", "#64748B")
-        frame = Frame(parent, bg=surface, height=54)
+        frame = Frame(parent, bg=surface, height=64)
         frame.pack(side="left", fill="x", expand=True, padx=4)
         frame.pack_propagate(False)
         self.review_progress_frame = frame
@@ -2484,26 +2677,41 @@ class AudioPlayerManager:
         style.configure("AudioReviewClone.Horizontal.TProgressbar", troughcolor=input_border, background=clone_color, lightcolor=clone_color, darkcolor=clone_color)
         style.configure("AudioReviewDub.Horizontal.TProgressbar", troughcolor=input_border, background=dub_color, lightcolor=dub_color, darkcolor=dub_color)
         clone_column = Frame(frame, bg=surface)
-        clone_column.pack(side="left", fill="both", expand=True, padx=(0, 4))
+        clone_column.pack(side="top", fill="x", expand=True)
         self.review_progress_widgets.append(clone_column)
         clone_label = Label(clone_column, text=i18n.tr("CLONANDO REFERÊNCIA"), bg=surface, fg=muted, font=("Segoe UI", 7, "bold"), anchor="w")
-        clone_label.pack(fill="x")
+        clone_label.pack(side='left')
         self.review_progress_widgets.append(clone_label)
         self.review_clone_var = DoubleVar(value=0.0)
         self.review_clone_bar = ttk.Progressbar(clone_column, length=100, orient="horizontal", mode="determinate", maximum=100, variable=self.review_clone_var, style="AudioReviewClone.Horizontal.TProgressbar")
-        self.review_clone_bar.pack(fill="x", pady=(2, 0))
+        self.review_clone_bar.pack(side='left', fill="x", expand=True, padx=4)
         dub_column = Frame(frame, bg=surface)
-        dub_column.pack(side="left", fill="both", expand=True, padx=(4, 0))
+        dub_column.pack(side="top", fill="x", expand=True)
         self.review_progress_widgets.append(dub_column)
         dub_label = Label(dub_column, text=i18n.tr("DUBLANDO CENA"), bg=surface, fg=muted, font=("Segoe UI", 7, "bold"), anchor="w")
-        dub_label.pack(fill="x")
+        dub_label.pack(side='left')
         self.review_progress_widgets.append(dub_label)
         self.review_dub_var = DoubleVar(value=0.0)
         self.review_dub_bar = ttk.Progressbar(dub_column, length=100, orient="horizontal", mode="determinate", maximum=100, variable=self.review_dub_var, style="AudioReviewDub.Horizontal.TProgressbar")
-        self.review_dub_bar.pack(fill="x", pady=(2, 0))
+        self.review_dub_bar.pack(side='left', fill="x", expand=True, padx=4)
+        if self.audacity_ui is not None:self.audacity_ui.attach_progress(frame)
         self._refresh_review_snapshot()
 
+    def set_editor_mode(self, mode):
+        if mode not in ('simple','advanced'):return
+        if mode==getattr(self,'editor_mode','advanced'):return
+        if getattr(self,'audio_transform_busy',False) or getattr(getattr(self,'audacity_ui',None),'busy',False) or getattr(getattr(self,'scene_parts_ui',None),'busy',False):
+            messagebox.showinfo('Editor','Aguarde o processamento atual antes de trocar de editor.',parent=self.window)
+            return
+        if not self._allow_translation_switch():return
+        if not self._prepare_audio_edit_scene_change():return
+        self.editor_mode=mode
+        self.show_window(self.pending_title or 'OUVIR CENA','')
+
     def show_window(self, title: str, initial_text: str):
+        if getattr(self,'editor_mode','advanced')=='simple' and not getattr(self,'is_part_window',False):
+            from simple_scene_editor import show_simple_window
+            return show_simple_window(self,title,initial_text)
         if not TK_AVAILABLE:
             return
         # Preserva pending_paths: play_one/play_all já colocaram os arquivos na fila.
@@ -2511,11 +2719,18 @@ class AudioPlayerManager:
         window = Toplevel(self.parent)
         window.title(i18n.tr(title))
         try:
-            available_height = max(600, int(window.winfo_screenheight()) - 80)
+            screen_width, screen_height = window.winfo_screenwidth(), window.winfo_screenheight()
+            available_height = max(360, int(screen_height) - 100)
         except Exception:
             available_height = 760
-        window.geometry(f"{1100 if getattr(self, 'is_part_window', False) else 1220}x{min(600, available_height)}")
-        window.minsize(900 if getattr(self, "is_part_window", False) else 1020, min(600, available_height))
+            screen_width, screen_height = 1920, 1080
+        opening_width = min(screen_width-40, max(1100, round(screen_width*.675)))
+        opening_height = min(available_height, max(820, round(screen_height*.83)))
+        opening_x = min(round(screen_width*.232), screen_width-opening_width-20)
+        opening_y = min(round(screen_height*.055), screen_height-opening_height-60)
+        opening_geometry = f'{opening_width}x{opening_height}+{max(0,opening_x)}+{max(0,opening_y)}'
+        window.geometry(opening_geometry)
+        window.minsize(min(900, screen_width-40), min(500, available_height))
         window.resizable(True, True)
         # Mantém a decoração normal do Windows para que o botão nativo de
         # maximizar/restaurar apareça junto de minimizar e X FECHAR.
@@ -2533,6 +2748,10 @@ class AudioPlayerManager:
         except Exception:
             pass
         self.window = window
+        previous_audacity=getattr(self,'audacity_ui',None)
+        if previous_audacity is not None:previous_audacity.cancel.set()
+        from audacity_scene_ui import AudacitySceneUI
+        self.audacity_ui=AudacitySceneUI(self) if not getattr(self,'is_part_window',False) else None
         self.window_status = StringVar(value=i18n.tr(initial_text))
         surface = self.theme.get("surface", "#FFFFFF")
         text = self.theme.get("text", "#1F2937")
@@ -2548,6 +2767,11 @@ class AudioPlayerManager:
         self.window_content = Frame(window, bg=surface, bd=0, highlightthickness=0)
         self.window_content.pack(fill="both", expand=True, padx=3, pady=3)
         content = self.window_content
+        controller=getattr(self,'translation_controller',None)
+        if not getattr(self,'is_part_window',False) and controller is not None and all(hasattr(controller,name) for name in ('scene_list','scene_sort_var','audio_source_var','review_totals_var')):
+            from scene_review_drawer import SceneReviewDrawer
+            self.review_drawer=SceneReviewDrawer(self,controller,content)
+            content=self.review_drawer.main
         if not getattr(self, "is_part_window", False):
             try:
                 from .scene_parts import ScenePartsUI
@@ -2556,33 +2780,116 @@ class AudioPlayerManager:
             if not hasattr(self, "scene_parts_ui"):
                 self.scene_parts_ui = ScenePartsUI(self)
             content = self.scene_parts_ui.attach(content)
-        self.waveform_panel = Frame(content, bg=surface, bd=1, relief="solid")
-        self.waveform_panel.pack(side="top", fill="x", expand=False, padx=14, pady=(0, 8))
+        wave_host=content
+        if self.audacity_ui is not None:
+            wave_outer=Frame(content,bg=surface)
+            wave_outer.pack(side='top',fill='x',padx=14,pady=(0,8))
+            wave_view=Canvas(wave_outer,bg=surface,highlightthickness=0,height=350)
+            from waveform_navigation import scroll_vertical
+            wave_scroll=Scrollbar(wave_outer,orient='vertical',command=lambda *args:scroll_vertical(self,*args))
+            wave_view.configure(yscrollcommand=wave_scroll.set)
+            wave_view.pack(side='left',fill='both',expand=True)
+            wave_scroll.pack(side='right',fill='y')
+            wave_host=wave_view
+            self.waveform_vertical_view=wave_view
+        self.waveform_panel = Frame(wave_host, bg=surface, bd=1, relief="solid")
+        if self.audacity_ui is None:
+            self.waveform_panel.pack(side="top", fill="x", expand=False, padx=14, pady=(0, 8))
+        else:
+            wave_item=wave_view.create_window(0,0,window=self.waveform_panel,anchor='nw')
+            def fit_wave_area(_event=None):
+                try:
+                    wave_view.itemconfigure(wave_item,width=max(1,wave_view.winfo_width()))
+                    other=sum(w.winfo_reqheight()+12 for w in content.pack_slaves() if w not in (wave_outer,text_panel))
+                    height=max(100,min(self.waveform_panel.winfo_reqheight(),content.winfo_height()-other-text_panel.winfo_reqheight()-40))
+                    if int(wave_view.cget('height'))!=height:wave_view.configure(height=height)
+                    wave_view.configure(scrollregion=wave_view.bbox('all'))
+                    scroll_vertical(self)
+                except (NameError,tk.TclError):pass
+            wave_view.bind('<Configure>',fit_wave_area)
+            self.waveform_panel.bind('<Configure>',fit_wave_area)
+            content.bind('<Configure>',fit_wave_area,add='+')
         self.waveform_widgets = [self.waveform_panel]
-        waveform_title = Label(self.waveform_panel, text=i18n.tr("FORMAS DE ONDA E COMPRIMENTO"), bg=surface, fg=text, font=("Segoe UI", 9, "bold"), anchor="w")
-        waveform_title.pack(fill="x", padx=10, pady=(7, 3))
-        self.waveform_widgets.append(waveform_title)
         zoom_row = Frame(self.waveform_panel, bg=surface)
-        zoom_row.pack(fill="x", padx=10, pady=(0, 4))
+        zoom_row.pack(fill="x", padx=10, pady=(4, 4))
+        try:confirm=json.loads((Path(self.project_root)/'Dublaskizon_ouvir_cena.json').read_text(encoding='utf-8')).get('confirm_trash',True)
+        except (OSError,ValueError,TypeError):confirm=True
+        self.trash_confirm_var=StringVar(value='1' if confirm else '0')
+        self.trash_confirm_button=ttk.Checkbutton(zoom_row,text='Confirmar ao mover',variable=self.trash_confirm_var,command=self._save_trash_preference)
+        self.project_trash_button=Button(zoom_row,text='MOVER ORIGINAL + DUBLADO + TXT PARA LIXEIRA DO PROJETO',wraplength=220,command=self._trash_current_scene,relief='flat',font=('Segoe UI',7,'bold'),padx=4,pady=1)
+        apply_button_style(self.project_trash_button,self.theme,'warning')
+        self.project_trash_button.pack(side='left',padx=(0,4))
+        self.trash_confirm_button.pack(side='left',padx=(0,8))
+        from review_memory_ui import mount_scene_controls
+        self.scene_memory_controls=mount_scene_controls(self,zoom_row)
+        if getattr(self,'is_part_window',False):self.project_trash_button.configure(state='disabled')
         self.waveform_widgets.append(zoom_row)
-        Label(zoom_row, text="ZOOM HORIZONTAL  −", bg=surface, fg=text, font=("Segoe UI", 8, "bold")).pack(side="left")
+        zoom_extra = Frame(self.waveform_panel, bg=surface)
+        zoom_tools = Frame(self.waveform_panel, bg=surface)
+        zoom_tools.pack(in_=zoom_row, side='left', fill='x', expand=True)
+        Label(zoom_tools, text="ZOOM HORIZONTAL −", bg=surface, fg=text, font=("Segoe UI", 7, "bold")).pack(side="left")
         self.waveform_zoom_var = DoubleVar(value=0.0)
         self.waveform_zoom_status = StringVar(value="100%")
-        self.waveform_zoom_slider = Canvas(zoom_row, height=26, width=230, bg=surface, highlightthickness=0, cursor="hand2", takefocus=True)
+        self.waveform_zoom_slider = Canvas(zoom_tools, height=24, width=70, bg=surface, highlightthickness=0, cursor="hand2", takefocus=True)
         self.waveform_zoom_slider.bind("<Configure>", lambda _event:self._draw_zoom_slider())
         self.waveform_zoom_slider.bind("<Button-1>", self._zoom_slider_pointer)
         self.waveform_zoom_slider.bind("<B1-Motion>", self._zoom_slider_pointer)
         self.waveform_zoom_slider.bind("<Left>", lambda _event:self._set_waveform_zoom(self.waveform_zoom/1.1))
         self.waveform_zoom_slider.bind("<Right>", lambda _event:self._set_waveform_zoom(self.waveform_zoom*1.1))
         self.waveform_zoom_slider.bind("<Home>", lambda _event:self._set_waveform_zoom(1.0))
-        self.waveform_zoom_slider.pack(side="left", fill="x", expand=True, padx=7)
-        Label(zoom_row, text="+", bg=surface, fg=text, font=("Segoe UI", 10, "bold")).pack(side="left")
-        Label(zoom_row, textvariable=self.waveform_zoom_status, bg=surface, fg=text, width=6, font=("Segoe UI", 8)).pack(side="left", padx=6)
-        reset_zoom = Button(zoom_row, text="100%", command=lambda:self._set_waveform_zoom(1.0), relief="flat", padx=7, pady=2)
+        self.waveform_zoom_slider.pack(side="left", fill="x", expand=True, padx=3)
+        Label(zoom_tools, text="+", bg=surface, fg=text, font=("Segoe UI", 10, "bold")).pack(side="left")
+        Label(zoom_tools, textvariable=self.waveform_zoom_status, bg=surface, fg=text, width=4, font=("Segoe UI", 7)).pack(side="left", padx=3)
+        reset_zoom = Button(zoom_tools, text="100%", command=lambda:self._set_waveform_zoom(1.0), relief="flat", padx=7, pady=2)
         apply_button_style(reset_zoom, self.theme, "secondary")
         reset_zoom.pack(side="right")
+        zoom_tools.layout_mode='inline'
+        def reflow_zoom(_event=None):
+            try:
+                required=sum(w.winfo_reqwidth()+12 for w in (self.project_trash_button,self.trash_confirm_button,self.scene_memory_controls))+zoom_tools.winfo_reqwidth()+12
+                mode='inline' if required<=zoom_row.winfo_width() else 'wrapped'
+                if mode==zoom_tools.layout_mode:return
+                zoom_tools.pack_forget()
+                if mode=='inline':
+                    zoom_extra.pack_forget()
+                    zoom_tools.pack(in_=zoom_row,side='left',fill='x',expand=True)
+                else:
+                    zoom_extra.pack(fill='x',padx=10,pady=(0,4),after=zoom_row)
+                    zoom_tools.pack(in_=zoom_extra,fill='x')
+                zoom_tools.layout_mode=mode
+            except tk.TclError:pass
+        zoom_row.bind('<Configure>',reflow_zoom,add='+')
         edit_toolbar = Frame(self.waveform_panel, bg=surface)
         edit_toolbar.pack(fill="x", padx=10, pady=(0, 5))
+        organize_row=Frame(self.waveform_panel,bg=surface)
+        version_controls=Frame(self.waveform_panel,bg=surface)
+        for attribute,label,latest in (('audio_restore_previous_button','RECUPERAR DUBLADO ANTERIOR',False),('audio_restore_latest_button','VOLTAR AO DUBLADO MAIS ATUAL',True)):
+            outline=Frame(version_controls,bg='#DC2626',padx=2,pady=2)
+            outline.pack(side='left',padx=3)
+            button=Button(outline,text=label,command=lambda latest=latest:self._switch_dubbed_version(latest),relief='flat',font=('Segoe UI',7,'bold'),padx=5,pady=3)
+            apply_button_style(button,self.theme,'success')
+            button.pack()
+            setattr(self,attribute,button)
+        version_controls.pack(in_=edit_toolbar,side='left',padx=(0,12))
+        version_controls.layout_mode='inline'
+        def reflow_versions(_event=None):
+            try:
+                required=version_controls.winfo_reqwidth()+28
+                for widget in edit_toolbar.pack_slaves():
+                    if widget is version_controls or widget.pack_info()['side'] not in ('left','right'):continue
+                    required+=widget.winfo_reqwidth()+20
+                mode='inline' if required<=edit_toolbar.winfo_width() else 'wrapped'
+                if mode==version_controls.layout_mode:return
+                version_controls.pack_forget()
+                if mode=='inline':
+                    organize_row.pack_forget()
+                    version_controls.pack(in_=edit_toolbar,side='left',padx=(0,12))
+                else:
+                    organize_row.pack(fill='x',padx=10,pady=(0,4),before=edit_toolbar)
+                    version_controls.pack(in_=organize_row,side='left')
+                version_controls.layout_mode=mode
+            except Exception:pass
+        edit_toolbar.bind('<Configure>',reflow_versions,add='+')
         self.waveform_widgets.append(edit_toolbar)
         self.audio_edit_status_var = StringVar(value=i18n.tr("Clique em EDITAR para selecionar trechos nas ondas."))
         edit_status = Label(edit_toolbar, textvariable=self.audio_edit_status_var, bg=surface, fg=self.theme.get("muted", "#64748B"), font=("Segoe UI", 7), anchor="w")
@@ -2591,7 +2898,7 @@ class AudioPlayerManager:
         # O modo EDITAR/SAIR DO EDITAR fica separado das ações destrutivas e
         # de edição. As ações permanecem juntas, com SALVAR abrindo o grupo
         # um pouco mais à esquerda, conforme o layout da janela de referência.
-        edit_mode_button = Button(edit_toolbar, text=i18n.tr("EDITAR"), command=self._toggle_audio_edit, relief="flat", font=("Segoe UI", 7, "bold"), padx=7, pady=2)
+        edit_mode_button = Button(edit_toolbar, text=i18n.tr("EDITAR"), command=self._toggle_audio_edit, relief="flat", font=("Segoe UI", 7, "bold"), padx=7, pady=6)
         apply_button_style(edit_mode_button, self.theme, "accent")
         edit_mode_button.pack(side="right", padx=(16, 0))
         self.audio_edit_button = edit_mode_button
@@ -2599,6 +2906,7 @@ class AudioPlayerManager:
         edit_actions = Frame(edit_toolbar, bg=surface)
         edit_actions.pack(side="right")
         edit_buttons = (
+            ('audio_auto_align_button','ORGANIZAR ONDAS',lambda:self._process_scene_audio_edit(align_original=True),'success'),
             ("audio_undo_button", "DESFAZER", self._undo_audio_edit, "secondary"),
             ("audio_redo_button", "REFAZER", self._redo_audio_edit, "secondary"),
             ("audio_save_button", "SALVAR", self._save_audio_edit, "primary"),
@@ -2617,11 +2925,14 @@ class AudioPlayerManager:
             # DESFAZER e REFAZER ficam juntos; o grupo recebe uma lacuna
             # maior antes de SALVAR, e SALVAR também fica afastado de COLAR.
             gap_after_button = 12 if attribute in {"audio_redo_button", "audio_save_button"} else 2
+            if attribute == 'audio_auto_align_button':
+                gap_after_button = 24
             if attribute in {"audio_trim_silence_button", "audio_duration_plus_button"}:
                 gap_after_button = 24
             if attribute == "audio_duration_minus_button":
                 gap_after_button = 0
             button.pack(side="left", padx=(0, gap_after_button))
+            if attribute == 'audio_save_button':button.configure(pady=6)
             setattr(self, attribute, button)
         self._update_audio_edit_buttons()
         waveform_labels = (
@@ -2629,12 +2940,17 @@ class AudioPlayerManager:
             ("dubbed", i18n.tr("DUBLADO"), i18n.tr("▶  INICIAR DUBLADO")),
         )
         for kind, label, start_label in waveform_labels:
+            if kind=='dubbed' and getattr(self,'original_reference_editor',False):
+                label='RECORTE DO ORIGINAL — EDITÁVEL'
+                start_label='▶ OUVIR RECORTE'
             row = Frame(self.waveform_panel, bg=surface)
             row.pack(fill="x", padx=10, pady=(0, 4))
             heading = Frame(row, bg=surface)
             heading.pack(fill="x")
             label_widget = Label(heading, text=f"{label}  —  {start_label}", bg=surface, fg=text, font=("Segoe UI", 8, "bold"), anchor="w")
             label_widget.pack(side="left")
+            if kind == 'original' and self.audacity_ui is not None:
+                self.audacity_ui.attach_heading(heading,row)
             duration_var = StringVar(value=i18n.tr("Duração: calculando..."))
             self.waveform_duration_vars[kind] = duration_var
             duration_label = Label(heading, textvariable=duration_var, bg=surface, fg=self.theme.get("muted", "#64748B"), font=("Segoe UI", 8), anchor="e")
@@ -2642,9 +2958,18 @@ class AudioPlayerManager:
             self.waveform_widgets.extend((row, heading, label_widget, duration_label))
             self.waveform_duration_labels[kind] = duration_label
             if kind == "dubbed":
+                heading = Frame(row, bg=surface)
+                heading.pack(fill='x', pady=(2, 2))
+                self.waveform_widgets.append(heading)
+                background_bar = Frame(row, bg=surface)
+                background_bar.pack(fill='x', before=heading, pady=(2, 2))
+                self.background_gain_var = DoubleVar(value=-18.0)
+                Label(background_bar, text='FUNDO dB:', bg=surface, fg=text, font=('Segoe UI', 7, 'bold')).pack(side='left')
+                ttk.Spinbox(background_bar, from_=-60, to=6, increment=1, width=5, textvariable=self.background_gain_var).pack(side='left', padx=3)
+                Button(background_bar, text='COLOCAR COMO SOM DE FUNDO EM CIMA DO DUBLADO', command=self._open_background_editor, bg='#FDBA74', font=('Segoe UI', 7, 'bold'), relief='flat', pady=2).pack(side='left', padx=3)
                 self.audio_split_button = Button(heading, text=i18n.tr("DIVIDIR (Ctrl+I)"), command=self._split_dubbed_clip, state="disabled", relief="flat", font=("Segoe UI", 7, "bold"), padx=8, pady=2)
                 self.audio_split_button.configure(bg='#B5E61D', activebackground='#A2CF18', fg='#172033', disabledforeground='#52627A')
-                self.audio_split_button.pack(side="left", padx=14)
+                self.audio_split_button.pack(side="left", padx=(0,24))
                 for attribute,label,db in (("audio_volume_minus_button","− VOLUME",-1.0),("audio_volume_plus_button","VOLUME +",1.0)):
                     button=Button(heading,text=i18n.tr(label),command=lambda gain=db:self._process_scene_audio_edit(volume_db=gain),state="disabled",relief="flat",font=("Segoe UI",7,"bold"),padx=7,pady=2)
                     apply_button_style(button,self.theme,"success")
@@ -2652,6 +2977,7 @@ class AudioPlayerManager:
                     setattr(self,attribute,button)
                 for attribute, label, command, role in (
                     ('audio_trim_silence_button', 'CORTAR SILÊNCIO INÍCIO/FIM', self._process_scene_audio_edit, 'white'),
+                    ('audio_internal_silence_button', 'REMOVER SILÊNCIOS DO MEIO', lambda: self._process_scene_audio_edit(remove_internal_silence=True), 'warning'),
                     ('audio_duration_minus_button', '−', lambda:self._process_scene_audio_edit(.99), 'success'),
                     ('audio_duration_plus_button', '+', lambda:self._process_scene_audio_edit(1.01), 'success')):
                     if attribute == 'audio_duration_plus_button':
@@ -2660,8 +2986,15 @@ class AudioPlayerManager:
                         self.waveform_widgets.append(label_widget)
                     button=Button(heading,text=label,command=command,relief='flat',font=('Segoe UI',7,'bold'),padx=7,pady=2)
                     apply_button_style(button,self.theme,role)
-                    button.pack(side='left',padx=(20,0) if attribute != 'audio_duration_plus_button' else (0,0))
+                    button.pack(side='left',padx=(4,0) if attribute != 'audio_duration_plus_button' else (0,0))
                     setattr(self,attribute,button)
+                exact_bar=Frame(row,bg=surface)
+                self.audio_exact_duration_button=Button(exact_bar,text='DURAÇÃO EXATA DO ORIGINAL',command=lambda:self._process_scene_audio_edit(exact_original=True),relief='flat',font=('Segoe UI',7,'bold'),padx=7,pady=2)
+                apply_button_style(self.audio_exact_duration_button,self.theme,'success')
+                self.audio_exact_duration_button.pack()
+                exact_bar.pack(in_=heading,side='left',padx=5)
+                exact_bar.layout_mode='inline'
+                heading.bind('<Configure>',lambda event,bar=exact_bar,head=heading,row=row:self._reflow_audio_versions(bar,head,row),add='+')
                 self._update_audio_edit_buttons()
                 self.clip_drag = None
                 self.clip_timeline_canvas = Canvas(row, height=28, highlightthickness=0, bg=self.theme.get("input", "#FFFFFF"), cursor="hand2", takefocus=True)
@@ -2679,6 +3012,9 @@ class AudioPlayerManager:
                 self.clip_timeline_canvas.bind("<Control-z>", self._undo_audio_edit)
                 self.clip_timeline_canvas.bind("<Control-y>", self._redo_audio_edit)
                 self.clip_timeline_canvas.bind("<space>", self._toggle_edit_play_pause)
+            if kind == 'original':
+                from waveform_navigation import WaveformNavigation
+                self.waveform_navigation=WaveformNavigation(self,row)
             canvas = Canvas(row, width=900, height=62, highlightthickness=0, bd=1, relief="solid", bg=self.theme.get("input", "#FFFFFF"))
             canvas.pack(fill="x", expand=True, pady=(2, 0))
             self.waveform_canvases[kind] = canvas
@@ -2701,52 +3037,59 @@ class AudioPlayerManager:
         self.waveform_scrollbar = Scrollbar(self.waveform_panel, orient="horizontal", command=self._scroll_audio_views)
         self.waveform_scrollbar.pack(fill="x", padx=10, pady=(0, 5))
         self.waveform_canvases["original"].configure(xscrollcommand=self.waveform_scrollbar.set)
+        if self.audacity_ui is not None:self.audacity_ui.attach_tracks(self.waveform_panel)
+        from waveform_navigation import bind_wheel
+        bind_wheel(self,self.waveform_panel)
+        if self.waveform_vertical_view is not None:bind_wheel(self,self.waveform_vertical_view)
         text_panel = Frame(content, bg=surface, bd=1, relief="solid", height=190)
         # Em uma janela maximizada, o painel de texto absorve o espaço livre
         # entre as ondas e os controles inferiores; assim não sobra um vazio
         # central e o rodapé permanece acima da barra de tarefas.
         text_panel.pack(side="top", fill="both", expand=True, padx=14, pady=(0, 8))
         text_panel.pack_propagate(False)
-        text_header = Frame(text_panel, bg=surface)
-        text_header.pack(fill="x", padx=10, pady=(8, 2))
-        Label(text_header, text=i18n.tr("TEXTO EM PORTUGUÊS — EDITÁVEL"), bg=surface, fg=text, font=("Segoe UI", 9, "bold"), anchor="w").pack(side="left")
-        self.scene_text_title_var = StringVar(value="")
-        Label(text_header, textvariable=self.scene_text_title_var, bg=surface, fg=text, font=("Segoe UI", 9), anchor="e").pack(side="right", fill="x", expand=True, padx=(12, 0))
-        controller=getattr(self,'translation_controller',None)
-        if controller is not None:
-            translation_row=Frame(text_panel,bg=surface)
-            translation_row.pack(fill='x',padx=10,pady=(3,3))
-            ttk.Checkbutton(translation_row,text=i18n.tr('Usar no redublar'),variable=controller.use_other_translation_var,onvalue='1',offvalue='0',command=self._toggle_scene_translation).pack(side='right',anchor='n',padx=(8,0))
-            text_switches=Frame(translation_row,bg=surface)
-            text_switches.pack(side='left',anchor='n',padx=(0,8))
-            for label, command in [('MOSTRAR TEXTO DA TRADUÇÃO PRINCIPAL',self._show_main_scene_translation),('MOSTRAR TEXTO ORIGINAL',self._show_original_scene_text)]:
-                button=Button(text_switches,text=i18n.tr(label),command=command,relief='flat',font=('Segoe UI',8,'bold'),padx=7,pady=1)
-                apply_button_style(button,self.theme,'primary')
-                button.pack(fill='x',pady=(0,1))
-            try:
-                from .ui_theme import horizontal_folder_strip
-            except ImportError:
-                from ui_theme import horizontal_folder_strip
-            folder_strip, self.scene_translation_folders_bar=horizontal_folder_strip(translation_row,self.theme)
-            folder_strip.pack(side='left',fill='x',expand=True,anchor='n')
-            self._refresh_scene_translation_folders()
-        scene_text_frame = Frame(text_panel, bg=surface)
-        scene_text_frame.pack(fill="both", expand=True, padx=10, pady=(2, 0))
-        self.scene_text_box = Text(scene_text_frame, height=4, wrap="word", undo=True, font=("Segoe UI", 10), bg=self.theme.get("input", "#FFFFFF"), fg=self.theme.get("text", "#1F2937"), insertbackground=self.theme.get("text", "#1F2937"), relief="solid", bd=1)
-        scene_text_scroll = Scrollbar(scene_text_frame, orient="vertical", command=self.scene_text_box.yview)
-        self.scene_text_box.configure(yscrollcommand=scene_text_scroll.set)
-        self.scene_text_box.pack(side="left", fill="both", expand=True)
-        scene_text_scroll.pack(side="right", fill="y")
-        text_footer = Frame(text_panel, bg=surface)
-        text_footer.pack(fill="x", padx=10, pady=(4, 8))
-        self.scene_text_status_var = StringVar(value="")
-        Label(text_footer, textvariable=self.scene_text_status_var, bg=surface, fg=self.theme.get("text", "#1F2937"), font=("Segoe UI", 8), anchor="w").pack(side="left", fill="x", expand=True)
-        self.scene_text_save_button = Button(text_footer, text=i18n.tr("Salvar alteração"), command=self._save_scene_text_from_window, relief="flat", font=("Segoe UI", 8, "bold"), padx=10, pady=4)
-        apply_button_style(self.scene_text_save_button, self.theme, "primary")
-        self.scene_text_save_button.pack(side="right")
+        factory=getattr(self,'scene_editor_factory',None)
+        if callable(factory):factory(text_panel)
+        else:
+            text_header = Frame(text_panel, bg=surface)
+            text_header.pack(fill="x", padx=10, pady=(8, 2))
+            Label(text_header, text=i18n.tr("TEXTO EM PORTUGUÊS — EDITÁVEL"), bg=surface, fg=text, font=("Segoe UI", 9, "bold"), anchor="w").pack(side="left")
+            self.scene_text_title_var = StringVar(value="")
+            Label(text_header, textvariable=self.scene_text_title_var, bg=surface, fg=text, font=("Segoe UI", 9), anchor="e").pack(side="right", fill="x", expand=True, padx=(12, 0))
+            controller=getattr(self,'translation_controller',None)
+            if controller is not None:
+                translation_row=Frame(text_panel,bg=surface)
+                translation_row.pack(fill='x',padx=10,pady=(3,3))
+                ttk.Checkbutton(translation_row,text=i18n.tr('Usar no redublar'),variable=controller.use_other_translation_var,onvalue='1',offvalue='0',command=self._toggle_scene_translation).pack(side='right',anchor='n',padx=(8,0))
+                text_switches=Frame(translation_row,bg=surface)
+                text_switches.pack(side='left',anchor='n',padx=(0,8))
+                for label, command in [('MOSTRAR TEXTO DA TRADUÇÃO PRINCIPAL',self._show_main_scene_translation),('MOSTRAR TEXTO ORIGINAL',self._show_original_scene_text)]:
+                    button=Button(text_switches,text=i18n.tr(label),command=command,relief='flat',font=('Segoe UI',8,'bold'),padx=7,pady=1)
+                    apply_button_style(button,self.theme,'primary')
+                    button.pack(fill='x',pady=(0,1))
+                try:
+                    from .ui_theme import horizontal_folder_strip
+                except ImportError:
+                    from ui_theme import horizontal_folder_strip
+                folder_strip, self.scene_translation_folders_bar=horizontal_folder_strip(translation_row,self.theme)
+                folder_strip.pack(side='left',fill='x',expand=True,anchor='n')
+                self._refresh_scene_translation_folders()
+            scene_text_frame = Frame(text_panel, bg=surface)
+            scene_text_frame.pack(fill="both", expand=True, padx=10, pady=(2, 0))
+            self.scene_text_box = Text(scene_text_frame, height=4, wrap="word", undo=True, font=("Segoe UI", 10), bg=self.theme.get("input", "#FFFFFF"), fg=self.theme.get("text", "#1F2937"), insertbackground=self.theme.get("text", "#1F2937"), relief="solid", bd=1)
+            scene_text_scroll = Scrollbar(scene_text_frame, orient="vertical", command=self.scene_text_box.yview)
+            self.scene_text_box.configure(yscrollcommand=scene_text_scroll.set)
+            self.scene_text_box.pack(side="left", fill="both", expand=True)
+            scene_text_scroll.pack(side="right", fill="y")
+            text_footer = Frame(text_panel, bg=surface)
+            text_footer.pack(fill="x", padx=10, pady=(4, 8))
+            self.scene_text_status_var = StringVar(value="")
+            Label(text_footer, textvariable=self.scene_text_status_var, bg=surface, fg=self.theme.get("text", "#1F2937"), font=("Segoe UI", 8), anchor="w").pack(side="left", fill="x", expand=True)
+            self.scene_text_save_button = Button(text_footer, text=i18n.tr("Salvar alteração"), command=self._save_scene_text_from_window, relief="flat", font=("Segoe UI", 8, "bold"), padx=10, pady=4)
+            apply_button_style(self.scene_text_save_button, self.theme, "primary")
+            self.scene_text_save_button.pack(side="right")
         self._refresh_scene_text()
         self._refresh_waveforms()
-        controls = Frame(content, bg=surface, height=68)
+        controls = Frame(content, bg=surface, height=78)
         controls.pack(side="bottom", fill="x", padx=14, pady=(0, 12))
         controls.pack_propagate(False)
         self.previous_button = Button(controls, text=i18n.tr("◀ ANTERIOR"), command=lambda: self.navigate(-1), relief="flat", padx=8, pady=5)
@@ -2763,12 +3106,19 @@ class AudioPlayerManager:
         self.start_button = Button(play_modes, text=i18n.tr("▶  INICIAR DUBLADO"), command=self.start_pending, relief="flat", padx=12, pady=3)
         apply_button_style(self.start_button, self.theme, "success")
         self.start_button.pack(side="top", fill="x", pady=(3, 0))
+        if getattr(self,'is_part_window',False):
+            self.start_button.configure(text='▶ INICIAR PARTE DO RECORTE' if getattr(self, 'original_reference_editor', False) else '▶ INICIAR PARTE DO DUBLADO')
+            if getattr(self, 'original_reference_editor', False):
+                apply_button_style(self.start_button, self.theme, 'highlight')
+        if self.audacity_ui is not None:self.audacity_ui.attach_playback(controls)
         self.stop_button = Button(controls, text=i18n.tr("PARAR"), command=self.stop, relief="flat", padx=12, pady=5)
         apply_button_style(self.stop_button, self.theme, "danger")
         self.stop_button.pack(side="left", padx=3)
         if callable(self.review_snapshot_provider):
             self._build_review_progress_controls(controls, surface, text)
-        audio_controls = Frame(content, bg=surface, height=88)
+        elif self.audacity_ui is not None:
+            self.audacity_ui.attach_progress(controls)
+        audio_controls = Frame(content, bg=surface, height=48)
         audio_controls.pack(side="bottom", fill="x", padx=10, pady=(0, 5))
         audio_controls.pack_propagate(False)
         audio_definitions = (
@@ -2777,26 +3127,36 @@ class AudioPlayerManager:
             ("copy_name", "COPIAR NOME DO ÁUDIO"),
             ("copy_dubbed", "COPIAR LOCAL DO ÁUDIO DUBLADO"),
             ("copy_original", "COPIAR LOCAL DO ÁUDIO ORIGINAL"),
-            ("copy_part_all", "COPIAR PARTE INTEIRA") if getattr(self, "is_part_window", False) else ("dub_part", "DUBLAR PARTE DO TXT"),
+            *((('copy_part_all','COPIAR PARTE INTEIRA'),) if getattr(self,'is_part_window',False) else ()),
         )
         for column in range(3):
             audio_controls.grid_columnconfigure(column, weight=1, uniform="audio_action")
         for index, (action_name, label) in enumerate(audio_definitions):
             row, column = divmod(index, 3)
+            container = audio_controls
+            if action_name == 'dub_part':
+                container = Frame(audio_controls, bg=surface)
+                container.grid(row=row,column=column,sticky='nsew',padx=2,pady=2)
             button = Button(
-                audio_controls,
+                container,
                 text=i18n.tr(label),
                 command=lambda name=action_name: self._audio_context_action(name),
                 relief="flat",
                 font=("Segoe UI", 8, "bold"),
                 padx=8,
-                pady=4,
+                pady=0,
                 wraplength=280,
                 justify="center",
             )
             role = "success" if action_name in {"dub_part", "copy_part_all"} else "neutral"
             apply_button_style(button, self.theme, role)
-            button.grid(row=row, column=column, sticky="nsew", padx=2, pady=2)
+            if action_name == 'dub_part':
+                button.pack(side='left',fill='both',expand=True,padx=1)
+                button.configure(text='DUBLAR PARTE\nDO TXT',wraplength=150)
+                original_button=Button(container,text='DUBLAR PARTE DO\nÁUDIO ORIGINAL',command=lambda:self._audio_context_action('dub_original_part'),font=('Segoe UI',8,'bold'),relief='flat',bg='#A78BFA',fg='#111827',activebackground='#C4B5FD')
+                original_button.pack(side='left',fill='both',expand=True,padx=1)
+            else:
+                button.grid(row=row, column=column, sticky="nsew", padx=2, pady=2)
             self.audio_action_buttons.append((button, role))
         audio_controls.grid_rowconfigure(0, weight=1)
         audio_controls.grid_rowconfigure(1, weight=1)
@@ -2804,7 +3164,8 @@ class AudioPlayerManager:
             review_controls = Frame(content, bg=surface)
             review_controls.pack(side="bottom", fill="x", padx=10, pady=(0, 5))
             self.review_preferences_frame = Frame(review_controls, bg=surface)
-            self.review_controls_buttons = Frame(review_controls, bg=surface)
+            self.review_controls_buttons = Frame(review_controls, bg=surface, height=42)
+            self.review_controls_buttons.pack_propagate(False)
             self.review_controls_buttons.pack(side="bottom", fill="x")
             definitions = (
                 ("open_audacity", "Abrir ORIGINAL + DUBLAGEM no Audacity", "warning"),
@@ -2815,14 +3176,38 @@ class AudioPlayerManager:
                 ("redub_other", "REDUBLAR COM OUTRO ÁUDIO", "accent"),
             )
             for action_name, label, role in definitions:
+                if getattr(self,'original_reference_editor',False) and action_name == 'redub':
+                    label='SALVAR E DUBLAR RECORTE'
+                    role='highlight'
                 callback = self.review_actions.get(action_name)
                 if not callable(callback):
                     continue
-                button = Button(self.review_controls_buttons, text=i18n.tr(label), command=lambda name=action_name: self._invoke_review_action(name), relief="flat", font=("Segoe UI", 8, "bold"), padx=6, pady=4)
+                button = Button(self.review_controls_buttons, text=i18n.tr(label), command=lambda name=action_name: self._invoke_review_action(name), relief="flat", font=("Segoe UI", 8, "bold"), padx=6, pady=4, wraplength=150)
                 apply_button_style(button, self.theme, role)
-                button.pack(side="left", fill="x", expand=True, padx=2)
+                button.pack(side="left", fill="both", expand=True, padx=2)
                 self.review_action_buttons.append((button, role))
             self._refresh_review_preferences()
+        if not getattr(self,'is_part_window',False):
+            parts_bar=self.review_controls_buttons if self.review_actions else Frame(content,bg=surface,height=48)
+            if not self.review_actions:
+                parts_bar.pack(side='bottom',fill='x',padx=10,pady=(0,4))
+                parts_bar.pack_propagate(False)
+            self.part_action_buttons=[]
+            for label,action,role in [('DUBLAR PARTE\nDO TXT','dub_part','success'),('DUBLAR PARTE DO\nÁUDIO ORIGINAL','dub_original_part','accent')]:
+                border=Frame(parts_bar,bg='#FACC15',padx=2,pady=2)
+                border.pack(side='left',fill='both',expand=True,padx=2)
+                button=Button(border,text=label,command=lambda a=action:self._audio_context_action(a),relief='flat',font=('Segoe UI',7,'bold'),wraplength=100,padx=3,pady=1)
+                apply_button_style(button,self.theme,role)
+                button.pack(fill='both',expand=True)
+                self.part_action_buttons.append(button)
+                self.audio_action_buttons.append((button,role))
+            for button,role in self.review_action_buttons:button.configure(font=('Segoe UI',7,'bold'),wraplength=90,pady=2)
+            def fit_action_height(_event=None):
+                try:
+                    height=max([b.winfo_reqheight() for b,_ in self.review_action_buttons]+[b.winfo_reqheight()+4 for b in self.part_action_buttons])+2
+                    parts_bar.configure(height=max(42,height))
+                except tk.TclError:pass
+            parts_bar.bind('<Configure>',fit_action_height,add='+')
         self.close_button = Button(controls, text=i18n.tr("X  FECHAR"), command=self.close_window, relief="flat", padx=12, pady=5)
         apply_button_style(self.close_button, self.theme, "secondary")
         self.close_button.pack(side="right", padx=0)
@@ -2832,9 +3217,11 @@ class AudioPlayerManager:
             window.update_idletasks()
             requested_height = max(560, int(window.winfo_reqheight()))
             fitted_height = min(requested_height, available_height)
-            window.geometry(f"{1100 if getattr(self, 'is_part_window', False) else 1220}x{fitted_height}")
-            window.minsize(900 if getattr(self, "is_part_window", False) else 1020, fitted_height)
+            window.geometry(opening_geometry)
             window.update_idletasks()
+            if self.audacity_ui is not None:
+                fit_wave_area()
+                window.update_idletasks()
         except Exception:
             pass
         return window
@@ -2950,7 +3337,7 @@ class AudioPlayerManager:
                 for widget, role in (
                     (self.previous_button, "secondary"),
                     (self.next_button, "secondary"),
-                    (self.start_button, "success"),
+                    (self.start_button, "highlight" if getattr(self, "original_reference_editor", False) else "success"),
                     (self.original_button, "accent"),
                     (self.stop_button, "danger"),
                     (self.close_button, "secondary"),
@@ -2983,6 +3370,8 @@ class AudioPlayerManager:
             pass
 
     def _current_audio_path(self, kind: str | None = None) -> Path | None:
+        if kind in {'instrumental','vocals','suppression'}:
+            return getattr(getattr(self,'audacity_ui',None),'paths',{}).get(kind)
         index = self.current_index
         if index < 0 or index >= len(self.navigation_paths):
             return None
@@ -3005,6 +3394,9 @@ class AudioPlayerManager:
             self.emit_status(f"Não foi possível copiar: {exc}")
 
     def _audio_context_action(self, action: str) -> None:
+        if action == 'dub_original_part':
+            self.scene_parts_ui.composer_original()
+            return
         if action == "dub_part":
             self.scene_parts_ui.composer()
             return
@@ -3113,11 +3505,19 @@ class AudioPlayerManager:
 
     def _find_original_audio(self, path: Path) -> Path | None:
         """Localiza o WAV de mesmo nome na pasta WAV ORIGINAIS do projeto."""
+        drawer=getattr(self,'review_drawer',None)
+        if drawer is not None:
+            pair=drawer.resolve_pair(path)
+            if pair is not None:return pair[0]
         if getattr(self, "loaded_audio_pairs", None) is not None:
             return self.loaded_audio_pairs.get(Path(path).resolve(), (None, None))[0]
         return self._find_project_audio_by_stem("WAV ORIGINAIS", path)
 
     def _find_dubbed_audio(self, path: Path) -> Path | None:
+        drawer=getattr(self,'review_drawer',None)
+        if drawer is not None:
+            pair=drawer.resolve_pair(path)
+            if pair is not None:return pair[1]
         if getattr(self, "loaded_audio_pairs", None) is not None:
             return self.loaded_audio_pairs.get(Path(path).resolve(), (None, None))[1]
         return self._find_project_audio_by_stem(self.dubbed_folder_name, path)
@@ -3189,6 +3589,7 @@ class AudioPlayerManager:
         self.stop(announce=False)
         self.current_index = target_index
         self.current_context_key = self.navigation_context_keys[target_index] if target_index < len(self.navigation_context_keys) else None
+        self._resolved_pair_indices.discard(target_index)
         self._resolve_navigation_pair(target_index)
         self._set_current_mode_paths(target_index, path)
         self.stop_event.clear()
@@ -3202,10 +3603,13 @@ class AudioPlayerManager:
         self.emit_status(f"Áudio carregado: {path.name}")
         self._notify_scene_selection()
 
-    def play_one(self, path: Path, title: str = "OUVIR ÁUDIO", playlist: list[Path] | None = None, index: int | None = None, scene_key: str | None = None, scene_keys: list[str] | None = None):
+    def play_one(self, path: Path, title: str = "OUVIR ÁUDIO", playlist: list[Path] | None = None, index: int | None = None, scene_key: str | None = None, scene_keys: list[str] | None = None, force_editor: bool = False):
         path = Path(path).expanduser().resolve()
         if not path.is_file():
             self.emit_status(f"Arquivo de áudio não encontrado: {path}")
+            return
+        if self.playback_mode == "windows" and not force_editor:
+            self._start_paths([path], "original" if "WAV ORIGINAIS" in path.parts else "dubbed")
             return
         if self.playback_mode == "windows":
             # O modo Windows não precisa da janela de controles do FFplay:
@@ -3261,6 +3665,8 @@ class AudioPlayerManager:
         if not valid_paths:
             self.emit_status("Nenhum áudio disponível para reprodução")
             return
+        if self.playback_mode == "windows":
+            self._start_paths(valid_paths,"dubbed");return
         self.stop(announce=False)
         self.navigation_paths = valid_paths
         self.navigation_context_keys = [str(key) for key in scene_keys] if scene_keys is not None else [None] * len(valid_paths)
@@ -3285,6 +3691,9 @@ class AudioPlayerManager:
         self._notify_scene_selection()
 
     def _start_paths(self, paths: list[Path], kind: str, start_seconds: float = 0.0):
+        kind = {"dublada": "dubbed", "dublado": "dubbed"}.get(kind, kind)
+        if start_seconds == 0 and kind in self.waveform_canvases:
+            self._scroll_audio_views("moveto", 0.0)
         # Copia e valida novamente a fila no momento do clique, sem depender do texto da janela.
         valid_paths = [Path(path).expanduser().resolve() for path in paths if Path(path).expanduser().is_file()]
         if not valid_paths:
@@ -3315,7 +3724,7 @@ class AudioPlayerManager:
         self.emit_status(f"Iniciando reprodução {kind} de {len(valid_paths)} áudio(s)...")
         self.playback_id += 1
         playback_id = self.playback_id
-        self.thread = threading.Thread(target=self._play_thread, args=(valid_paths, playback_id, "original" if kind == "original" else "dubbed", max(0.0, float(start_seconds or 0.0))), daemon=True)
+        self.thread = threading.Thread(target=self._play_thread, args=(valid_paths, playback_id, kind, max(0.0, float(start_seconds or 0.0))), daemon=True)
         self.thread.start()
 
     def start_pending(self):
@@ -3326,7 +3735,7 @@ class AudioPlayerManager:
             self._play_edit_preview("dubbed", self._edit_selection_start("dubbed"))
             return
         paths = self.dubbed_pending_paths or self.pending_paths
-        self._start_paths(paths, "dublada")
+        self._start_paths(paths, "dubbed")
 
     def start_original_pending(self):
         self.audio_paused_kind = None
@@ -3419,3 +3828,37 @@ class AudioPlayerManager:
             self.parent.after(0, restore_buttons)
         except Exception:
             pass
+
+
+def apply_dubbed_finishing(path,project_root,trim=False,max_volume=False,backup=True):
+    """Reuse scene editor DSP on one WAV, atomically; preserve previous version."""
+    path=Path(path).resolve()
+    if any(part.casefold()=='wav originais' for part in path.parts):raise ValueError('Este ajuste é somente para áudio dublado.')
+    initial=path.stat();signature=(initial.st_size,initial.st_mtime_ns)
+    with wave.open(str(path),'rb') as source:
+        if source.getcomptype()!='NONE':raise ValueError('O áudio precisa ser WAV PCM.')
+        track={'frames':source.readframes(source.getnframes()),'sample_rate':source.getframerate(),'channels':source.getnchannels(),'sample_width':source.getsampwidth()}
+        expected=source.getnframes()*source.getnchannels()*source.getsampwidth()
+    if not track['frames'] or len(track['frames'])!=expected:raise ValueError('Áudio vazio ou incompleto; arquivo preservado.')
+    previous=track['frames'];gain=0.0
+    if trim:track['frames'],_clips=process_scene_audio(track,project_root,preserve_clips=True)
+    if max_volume:
+        # Each call is the exact scene editor gain with its -1 dBFS ceiling.
+        for _ in range(8):
+            track['frames'],_clips,applied=process_scene_volume(track,24)
+            gain+=applied
+            if applied<23.999:break
+    if track['frames']==previous:return {'changed':False,'gain_db':gain,'removed_seconds':0.0}
+    removed=(len(previous)-len(track['frames']))/(track['sample_rate']*track['channels']*track['sample_width'])
+    descriptor,tempname=tempfile.mkstemp(prefix='.__acabamento_',suffix='.wav',dir=path.parent);os.close(descriptor);temp=Path(tempname)
+    try:
+        with wave.open(str(temp),'wb') as output:
+            output.setnchannels(track['channels']);output.setsampwidth(track['sample_width']);output.setframerate(track['sample_rate']);output.writeframes(track['frames'])
+        current=path.stat()
+        if (current.st_size,current.st_mtime_ns)!=signature:raise ValueError('O áudio mudou durante o ajuste; arquivo atual preservado.')
+        if backup:
+            from audio_versions import archive
+            archive(path,project_root)
+        os.replace(temp,path)
+    finally:temp.unlink(missing_ok=True)
+    return {'changed':True,'gain_db':gain,'removed_seconds':removed}

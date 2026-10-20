@@ -246,26 +246,8 @@ def portable_tool_roots(project_root: Path | None = None) -> list[Path]:
 
 
 def executable_path(name: str, project_root: Path | None = None) -> str | None:
-    found = shutil.which(name) or shutil.which(f"{name}.exe")
-    if found:
-        return found
-    executable_names = {name, f"{name}.exe"}
-    for root in portable_tool_roots(project_root):
-        for executable_name in executable_names:
-            candidate = root / executable_name
-            if candidate.is_file():
-                return str(candidate)
-        # Broad project/app roots contain thousands of audio files. Only tool
-        # directories are recursive; executables at the root were checked above.
-        if root.name.casefold() not in {TOOLS_DIR_NAME.casefold(), "tools", "sox"}:
-            continue
-        try:
-            for candidate in root.rglob("*"):
-                if candidate.name.casefold() in {value.casefold() for value in executable_names} and candidate.is_file():
-                    return str(candidate)
-        except (OSError, PermissionError):
-            continue
-    return None
+    from shared_audio_tools import find_tool
+    return find_tool(name,project_root)
 
 
 class DurationConverterApp:
@@ -1038,10 +1020,8 @@ class DurationConverterApp:
         return [(stem, self.original_by_stem[stem], self.dubbed_by_stem[stem]) for stem in stems]
 
     def tool_storage_dir(self) -> Path:
-        app_dir = Path(os.environ.get("DUBLASKIZON_APP_DIR", Path(__file__).resolve().parent)).expanduser().resolve()
-        target = app_dir / TOOLS_DIR_NAME
-        target.mkdir(parents=True, exist_ok=True)
-        return target
+        from shared_audio_tools import prepare_storage
+        return prepare_storage(self.project_root)
 
     def safe_extract_zip(self, archive_path: Path, destination: Path):
         destination.mkdir(parents=True, exist_ok=True)

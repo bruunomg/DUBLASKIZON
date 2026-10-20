@@ -132,8 +132,9 @@ class AudioProcessingError(RuntimeError):
 
 class AudioCloneProcessor:
     def __init__(self, ffmpeg: str | None = None, ffprobe: str | None = None, silence_db: int = -35, silence_seconds: float = 0.20):
-        self.ffmpeg = ffmpeg or "ffmpeg"
-        self.ffprobe = ffprobe or "ffprobe"
+        from shared_audio_tools import find_tool
+        self.ffmpeg = ffmpeg or find_tool("ffmpeg") or "ffmpeg"
+        self.ffprobe = ffprobe or find_tool("ffprobe") or "ffprobe"
         self.silence_db = int(silence_db)
         self.silence_seconds = max(0.05, float(silence_seconds))
 

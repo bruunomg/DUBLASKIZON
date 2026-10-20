@@ -18,6 +18,20 @@ CURRENT_LANGUAGE = "pt"
 
 # As chaves permanecem em português para que o modo original nunca seja perdido.
 _TRANSLATIONS: dict[str, dict[str, str]] = {
+    "TEXTO PARA FALA": {"en": "TEXT TO SPEECH", "ru": "ТЕКСТ В РЕЧЬ", "es": "TEXTO A VOZ"},
+    "CARREGAR DA PASTA WAV ORIGINAIS": {"en": "LOAD FROM WAV ORIGINAIS", "ru": "ЗАГРУЗИТЬ ИЗ WAV ORIGINAIS", "es": "CARGAR DESDE WAV ORIGINAIS"},
+    "ADICIONAR ÁUDIO ORIGINAL": {"en": "ADD ORIGINAL AUDIO", "ru": "ДОБАВИТЬ ОРИГИНАЛ", "es": "AÑADIR AUDIO ORIGINAL"},
+    "ADICIONAR VOZ MODELO": {"en": "ADD VOICE MODEL", "ru": "ДОБАВИТЬ ОБРАЗЕЦ ГОЛОСА", "es": "AÑADIR MODELO DE VOZ"},
+    "ABRIR SAÍDAS": {"en": "OPEN OUTPUTS", "ru": "ОТКРЫТЬ РЕЗУЛЬТАТЫ", "es": "ABRIR SALIDAS"},
+    "ÁUDIOS ORIGINAIS / NORMAIS": {"en": "ORIGINAL / REGULAR AUDIO", "ru": "ОРИГИНАЛЬНЫЕ АУДИО", "es": "AUDIOS ORIGINALES / NORMALES"},
+    "VOZES DO SISTEMA — OmniVoice": {"en": "SYSTEM VOICES — OmniVoice", "ru": "СИСТЕМНЫЕ ГОЛОСА — OmniVoice", "es": "VOCES DEL SISTEMA — OmniVoice"},
+    "ESCOLHIDAS POR MIM": {"en": "CHOSEN BY ME", "ru": "МОИ ГОЛОСА", "es": "ELEGIDAS POR MÍ"},
+    "ORIGINAL": {"en": "ORIGINAL", "ru": "ОРИГИНАЛ", "es": "ORIGINAL"},
+    "DO SISTEMA": {"en": "SYSTEM", "ru": "СИСТЕМНЫЙ", "es": "DEL SISTEMA"},
+    "ESCOLHIDO POR MIM": {"en": "CHOSEN BY ME", "ru": "ВЫБРАННЫЙ МНОЙ", "es": "ELEGIDO POR MÍ"},
+    "TEXTO EDITÁVEL": {"en": "EDITABLE TEXT", "ru": "РЕДАКТИРУЕМЫЙ ТЕКСТ", "es": "TEXTO EDITABLE"},
+    "DUBLAR": {"en": "GENERATE VOICE", "ru": "СОЗДАТЬ РЕЧЬ", "es": "GENERAR VOZ"},
+    "OUVIR RESULTADO": {"en": "LISTEN TO RESULT", "ru": "СЛУШАТЬ РЕЗУЛЬТАТ", "es": "ESCUCHAR RESULTADO"},
     "Dublaskizon": {"en": "Dublaskizon", "ru": "Dublaskizon", "es": "Dublaskizon"},
     "  Apenas troca o formato; não altera a duração": {"en": "  Only changes the format; does not alter the duration", "ru": "  Только меняет формат; длительность не изменяется", "es": "  Solo cambia el formato; no modifica la duración"},
     "OmniVoice + Audacity — dublagem e revisão em um único aplicativo": {
@@ -718,6 +732,8 @@ for _source, _en, _ru, _es in [
     ('ADICIONAR VÍDEOS','ADD VIDEOS','ДОБАВИТЬ ВИДЕО','AÑADIR VÍDEOS'),
     ('APLICAR DUBLAGEM','APPLY DUBBING','ПРИМЕНИТЬ ДУБЛЯЖ','APLICAR DOBLAJE'),
     ('CONVERSÃO DE FORMATOS','FORMAT CONVERSION','КОНВЕРТАЦИЯ ФОРМАТОВ','CONVERSIÓN DE FORMATOS'),
+    ('MANTER VOZ NATURAL DO ÁUDIO ORIGINAL','PRESERVE THE ORIGINAL AUDIO VOICE CHARACTER','СОХРАНЯТЬ ХАРАКТЕР ГОЛОСА ИСХОДНОГО АУДИО','CONSERVAR EL CARÁCTER DE LA VOZ DEL AUDIO ORIGINAL'),
+    ('DESINSTALAR TUDO','UNINSTALL EVERYTHING','УДАЛИТЬ ВСЁ','DESINSTALAR TODO'),
     ('CONVERTER VÍDEO PARA FICAR MAIS LEVE','COMPRESS VIDEO','СЖАТЬ ВИДЕО','COMPRIMIR VÍDEO'),
     ('COPIAR PARTE INTEIRA','COPY ENTIRE PART','КОПИРОВАТЬ ВСЮ ЧАСТЬ','COPIAR PARTE COMPLETA'),
     ('DUBLADOS PERSONALIZADOS','CUSTOM DUBS','ПОЛЬЗОВАТЕЛЬСКИЙ ДУБЛЯЖ','DOBLAJES PERSONALIZADOS'),

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+from app_version import APP_TITLE
 import os
 import queue
 from datetime import datetime
@@ -32,7 +33,7 @@ BASE_WINDOW_WIDTH = 1440
 BASE_WINDOW_HEIGHT = 980
 BASE_MIN_WIDTH = 1160
 BASE_MIN_HEIGHT = 760
-PROJECT_FOLDERS = ("WAV ORIGINAIS", "TXT TEXTO PORTUGUES", "TXT TEXTO ORIGINAL", "TXT TEXTO do WAV TRANSCRITO e TRADUZIDO", "OUTRAS TRADUÇÕES", "dublado", "dublados personalizados", "MODELOS DE VOZ PERSONALIZADOS", "revisoes", "REDIMENSIONAR ÁUDIO PARA CLONAR")
+PROJECT_FOLDERS = ("WAV ORIGINAIS", "TXT TEXTO PORTUGUES", "TXT TEXTO ORIGINAL", "TXT TEXTO do WAV TRANSCRITO e TRADUZIDO", "OUTRAS TRADUÇÕES", "dublado", "dublados personalizados", "MODELOS DE VOZ PERSONALIZADOS", "TEXTO PARA FALA", "revisoes", "REDIMENSIONAR ÁUDIO PARA CLONAR")
 THEMES = {
     "claro": {
         "mode": "claro", "root": "#F5F6FA", "surface": "#FFFFFF", "panel": "#FFFFFF", "text": "#1F2937",
@@ -136,8 +137,11 @@ try:
     import personalized_dubbing_tab  # type: ignore
     import video_converter_tab
     import video_audio_swap_tab
+    import audio_frequency_separator_tab
+    import text_to_speech_tab
+    import transcription_tab
 except ImportError:
-    from . import batch_tab, review_tab, duration_converter_tab, format_converter_tab, wem_filter_tab, voice_clone_tab, personalized_dubbing_tab, video_converter_tab, video_audio_swap_tab
+    from . import batch_tab, review_tab, duration_converter_tab, format_converter_tab, wem_filter_tab, voice_clone_tab, personalized_dubbing_tab, video_converter_tab, video_audio_swap_tab, audio_frequency_separator_tab, text_to_speech_tab, transcription_tab
 
 
 if tk is not None:
@@ -150,6 +154,7 @@ if tk is not None:
             self.canvas.pack(side="left", fill="both", expand=True)
             self.scrollbar_visible = False
             self.inner = tk.Frame(self.canvas, bg=background)
+            self.fit_viewport=False
             self.window_id = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
             self.inner.bind("<Configure>", self._on_inner_configure)
             self.canvas.bind("<Configure>", self._on_canvas_configure)
@@ -162,6 +167,8 @@ if tk is not None:
 
         def _on_canvas_configure(self, event):
             self.canvas.itemconfigure(self.window_id, width=event.width)
+            if self.fit_viewport:
+                self.canvas.itemconfigure(self.window_id,height=max(event.height,self.inner.winfo_reqheight()))
             self.after_idle(self._update_scrollbar)
 
         def _on_scroll(self, first, last):
@@ -178,6 +185,10 @@ if tk is not None:
                 return
             if not bbox:
                 return
+            if self.fit_viewport:
+                target=max(self.canvas.winfo_height(),self.inner.winfo_reqheight())
+                self.canvas.itemconfigure(self.window_id,height=target)
+                bbox=self.canvas.bbox('all')
             content_height = max(0, bbox[3] - bbox[1])
             viewport_height = max(1, self.canvas.winfo_height())
             should_show = content_height > viewport_height + 18
@@ -227,6 +238,20 @@ if tk is not None:
 else:
     class ScrollableFrame:
         pass
+
+
+def compact_clone_spacing(parent, factor):
+    """Pack margins are separate from widget padding; scale their original values."""
+    for widget in parent.winfo_children():
+        if widget.winfo_manager()=='pack':
+            info=widget.pack_info()
+            if not hasattr(widget,'_clone_pack_pady'):
+                value=info.get('pady',0)
+                widget._clone_pack_pady=tuple(int(v) for v in widget.tk.splitlist(str(value))) if not isinstance(value,(tuple,list)) else tuple(map(int,value))
+            base=widget._clone_pack_pady
+            value=tuple(max(0,round(v*factor)) for v in base)
+            widget.pack_configure(pady=value[0] if len(value)==1 else value)
+        compact_clone_spacing(widget,factor)
 
 
 class TerminalApp:
@@ -333,6 +358,7 @@ class TerminalApp:
             line = f"[{stamp}] [{source}] {str(text).rstrip()}\n"
             self.global_log_box.configure(state="normal")
             self.global_log_box.insert("end", line)
+            if int(self.global_log_box.index('end-1c').split('.')[0])>1500:self.global_log_box.delete('1.0','300.0')
             self.global_log_box.see("end")
             self.global_log_box.configure(state="disabled")
         except tk.TclError:
@@ -380,7 +406,7 @@ class TerminalApp:
         try:
             if not self.parent.winfo_exists():
                 return
-            while True:
+            for _ in range(200):
                 self.append_global_log(*self.global_log_queue.get_nowait())
         except queue.Empty:
             pass
@@ -739,8 +765,9 @@ class ContextHelpManager:
 class DublaskizonApp:
     def __init__(self, root: Tk):
         self.root = root
-        self.root.title("Dublaskizon")
+        self.root.title(APP_TITLE)
         apply_window_icon(self.root)
+        self.root._dublaskizon_app=self
         self.root.geometry(f"{BASE_WINDOW_WIDTH}x{BASE_WINDOW_HEIGHT}")
         self.root.minsize(BASE_MIN_WIDTH, BASE_MIN_HEIGHT)
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -788,6 +815,15 @@ class DublaskizonApp:
         self.voice_clone_app = None
         self.voice_clone_scroll = None
         self.voice_clone_frame = None
+        self.frequency_separator_app = None
+        self.frequency_separator_scroll = None
+        self.frequency_separator_frame = None
+        self.text_to_speech_app = None
+        self.text_to_speech_scroll = None
+        self.text_to_speech_frame = None
+        self.transcription_app = None
+        self.transcription_scroll = None
+        self.transcription_frame = None
         self.help_active = False
         self.central_log_queue = queue.Queue()
         self.help_manager = ContextHelpManager(self)
@@ -808,7 +844,8 @@ class DublaskizonApp:
         self.brand_line = brand_line
         brand_line.pack(fill="x", padx=20, pady=(6, 8))
         tk.Label(brand_line, text="DUBLASKIZON", bg="#172033", fg="white", font=("Segoe UI", 22, "bold")).pack(side="left")
-        tk.Label(brand_line, text="OmniVoice + Audacity — dublagem e revisão em um único aplicativo", bg="#172033", fg="#CBD5E1", font=("Segoe UI", 11)).pack(side="left", padx=(18, 0), pady=(5, 0))
+        self.brand_description=tk.Label(brand_line,text="OmniVoice + Audacity\nDublagem e revisão em um único aplicativo",bg="#172033",fg="#CBD5E1",font=("Segoe UI",7),justify="left")
+        self.brand_description.pack(side="left",padx=(10,8))
 
         tabs_shell = tk.Frame(root, bg="#E2E8F0")
         tabs_shell.pack(fill="x", padx=10, pady=(8, 0))
@@ -819,7 +856,8 @@ class DublaskizonApp:
         self.tabs_canvas.configure(xscrollcommand=tab_scroll.set)
         tabs_bar = tk.Frame(self.tabs_canvas, bg="#E2E8F0")
         self.tabs_bar = tabs_bar
-        self.tabs_canvas.create_window((0, 0), window=tabs_bar, anchor="nw")
+        self.tabs_window_id = self.tabs_canvas.create_window((0, 0), window=tabs_bar, anchor="nw")
+        self.tabs_canvas.bind("<Configure>",lambda _event:self.fit_tab_buttons())
         tabs_bar.bind("<Configure>", lambda event: self.tabs_canvas.configure(scrollregion=self.tabs_canvas.bbox("all"), height=tabs_bar.winfo_reqheight()))
         self.clone_tab_button = tk.Button(tabs_bar, text="CLONAGEM + DUBLAGEM", command=lambda: self.select_tab(self.clone_scroll), bg="#2563EB", activebackground="#1D4ED8", fg="white", activeforeground="white", relief="sunken", font=("Segoe UI", 10, "bold"), padx=11, pady=6, width=21, cursor="hand2")
         self.clone_tab_button.pack(side="left", padx=(0, 4))
@@ -827,6 +865,10 @@ class DublaskizonApp:
         self.review_tab_button.pack(side="left", padx=(4, 0))
         self.personalized_tab_button = tk.Button(tabs_bar, text="DUBLAGEM PERSONALIZADA", command=lambda: self.select_tab(self.personalized_scroll), bg="#8B5CF6", activebackground="#7C3AED", fg="white", activeforeground="white", relief="raised", font=("Segoe UI", 8, "bold"), padx=9, pady=0, width=16, height=2, wraplength=120, justify="center", cursor="hand2")
         self.personalized_tab_button.pack(side="left", padx=(4, 0))
+        self.text_to_speech_tab_button = tk.Button(tabs_bar, text="TEXTO PARA FALA", command=lambda: self.select_tab(self.text_to_speech_scroll), bg="#DB2777", fg="white", font=("Segoe UI", 8, "bold"), padx=8, pady=5, width=20, cursor="hand2")
+        self.text_to_speech_tab_button.pack(side="left", padx=(4, 0))
+        self.transcription_tab_button=tk.Button(tabs_bar,text='TRANSCREVER E TRADUZIR',command=lambda:self.select_tab(self.transcription_scroll),bg='#278D9F',fg='white',font=('Segoe UI',8,'bold'),padx=8,pady=5,width=22,cursor='hand2')
+        self.transcription_tab_button.pack(side='left',padx=(4,0))
         self.converter_tab_button = tk.Button(tabs_bar, text="CONVERTER\nDURAÇÃO", command=lambda: self.select_tab(self.converter_scroll), bg="#F97316", activebackground="#EA580C", fg="white", activeforeground="white", relief="raised", font=("Segoe UI", 10, "bold"), padx=11, pady=6, width=21, cursor="hand2")
         self.converter_tab_button.pack(side="left", padx=(4, 0))
         self.format_tab_button = tk.Button(tabs_bar, text="CONVERTER\nFORMATOS", command=lambda: self.select_tab(self.format_scroll), bg="#14B8A6", activebackground="#0F766E", fg="white", activeforeground="white", relief="raised", font=("Segoe UI", 10, "bold"), padx=11, pady=6, width=21, cursor="hand2")
@@ -841,14 +883,23 @@ class DublaskizonApp:
         self.video_tab_button.pack(side="left", padx=(0, 4))
         self.swap_tab_button = tk.Button(tools_bar, text="TROCAR AUDIO DO VÍDEO", command=lambda: self.select_tab(self.swap_scroll), bg="#7C3AED", fg="white", font=("Segoe UI", 8, "bold"), padx=8, pady=5, width=25, wraplength=170, cursor="hand2")
         self.swap_tab_button.pack(side="left", padx=(0, 4))
+        self.frequency_separator_tab_button = tk.Button(tools_bar, text="SEPARAR ÁUDIO IGUAL\nPOR FREQUÊNCIA IDÊNTICA", command=lambda: self.select_tab(self.frequency_separator_scroll), bg="#0369A1", fg="white", font=("Segoe UI", 8, "bold"), padx=8, pady=5, width=27, wraplength=190, cursor="hand2")
+        self.frequency_separator_tab_button.pack(side="left", padx=(0, 4))
         self.commands_tab_button = tk.Button(tools_bar, text="COMANDOS", command=lambda: self.select_tab(self.terminal_scroll), bg="#F59E0B", fg="#3B2500", font=("Segoe UI", 8, "bold"), padx=8, pady=5, width=18, cursor="hand2")
         self.commands_tab_button.pack(side="left")
+        tab_scroll.pack_forget()
+        self.root.after_idle(self.fit_tab_buttons)
 
         scale_panel = tk.Frame(brand_line, bg="#172033")
         self.scale_panel = scale_panel
-        scale_panel.pack(side="right", padx=(8, 0), pady=(0, 0))
+        scale_panel.pack(side="left",fill="x",expand=True,padx=(4,0))
         self.refresh_screen_button = tk.Button(scale_panel, text="ATUALIZAR TELA", command=self.refresh_screen, bg="#0F766E", activebackground="#115E59", fg="white", activeforeground="white", relief="flat", font=("Segoe UI", 8, "bold"), padx=7, pady=3, cursor="hand2")
         self.refresh_screen_button.pack(side="left", padx=(0, 5))
+        from warm_inference import review_memory_cache
+        from review_memory_ui import mount_controls
+        self.review_memory_controls=mount_controls(self,scale_panel,review_memory_cache)
+        self.open_editor_button=tk.Button(scale_panel,text='OUVIR CENA - EDITOR',command=self.open_scene_editor,bg='#0891B2',fg='white',relief='flat',font=('Segoe UI',8,'bold'),padx=7,pady=3)
+        self.open_editor_button.pack(side='left',before=self.review_memory_controls,padx=(0,5))
         self.help_button = tk.Button(scale_panel, text="? AJUDA", command=self.toggle_help, bg="#D97706", activebackground="#B45309", fg="white", activeforeground="white", relief="flat", font=("Segoe UI", 8, "bold"), padx=7, pady=3, cursor="hand2")
         self.help_button.pack(side="left", padx=(0, 5))
         self.requirements_button = tk.Button(scale_panel, text="REQUISITOS", command=self.show_dependency_assistant, bg="#0F766E", activebackground="#115E59", fg="white", activeforeground="white", relief="flat", font=("Segoe UI", 8, "bold"), padx=7, pady=3, cursor="hand2")
@@ -870,6 +921,31 @@ class DublaskizonApp:
         self.player_mode_button = tk.Button(scale_panel, command=self.toggle_player_mode, bg="#7C3AED", activebackground="#6D28D9", fg="white", activeforeground="white", relief="flat", font=("Segoe UI", 8, "bold"), padx=7, pady=3, cursor="hand2")
         self.player_mode_button.pack(side="left", padx=(6, 0))
         self.update_player_mode_button()
+        toolbar_controls=list(scale_panel.pack_slaves())
+        for widget in toolbar_controls:widget.pack_forget()
+        scale_panel.pack_propagate(False)
+        def fit_toolbar(event=None):
+            try:
+                if not all(widget.winfo_exists() for widget in toolbar_controls):return
+            except tk.TclError:return
+            width=max(400,scale_panel.winfo_width());groups=[];group=[];used=0
+            for widget in toolbar_controls:
+                needed=widget.winfo_reqwidth()+8
+                if group and used+needed>width:groups.append(group);group=[];used=0
+                group.append(widget);used+=needed
+            if group:groups.append(group)
+            y=0
+            for group in groups:
+                height=max(w.winfo_reqheight() for w in group)+4
+                x=max(0,width-sum(w.winfo_reqwidth()+8 for w in group))
+                for widget in group:
+                    widget.place(x=x+4,y=y+(height-widget.winfo_reqheight())//2)
+                    x+=widget.winfo_reqwidth()+8
+                y+=height
+            if int(scale_panel.cget('height'))!=y:scale_panel.configure(height=y)
+        scale_panel.bind('<Configure>',fit_toolbar)
+        for widget in toolbar_controls:widget.bind('<Configure>',fit_toolbar,add='+')
+        self.root.after_idle(fit_toolbar)
 
         self.content = tk.Frame(root, bg="#F5F6FA")
         self.content.pack(fill="both", expand=True, padx=10, pady=(0, 6))
@@ -877,6 +953,11 @@ class DublaskizonApp:
         footer = tk.Frame(root, bg="#EEF2F7")
         self.footer = footer
         footer.pack(fill="x")
+        try:
+            from .list_selection_status import install_selection_status
+        except ImportError:
+            from list_selection_status import install_selection_status
+        self.selection_count_label = install_selection_status(self.root, footer)
         self.footer_label = tk.Label(footer, text="Projeto atual:", bg="#EEF2F7", fg="#475569", font=("Segoe UI", 8, "bold"))
         self.footer_label.pack(side="left", padx=(12, 4), pady=4)
         self.project_footer_entry = tk.Entry(footer, font=("Segoe UI", 8), relief="flat", bd=0, readonlybackground="#EEF2F7", fg="#475569", width=150)
@@ -884,6 +965,13 @@ class DublaskizonApp:
         self.project_footer_entry.configure(state="readonly")
 
         # A estrutura só é criada por uma ação explícita do usuário.
+        # Mostra o casco da aplicação antes das varreduras iniciais. Em projetos
+        # muito grandes isto impede a janela branca de "não respondendo".
+        self.root.update_idletasks()
+        try:
+            self.root.update()
+        except tk.TclError:
+            pass
         self.rebuild_views()
         self.apply_scale(self.scale_percent, resize_window=True, save=False)
         self.apply_language(self.language_code, save=False)
@@ -1054,6 +1142,22 @@ class DublaskizonApp:
                 candidates.extend((base / "VoiceStudio", base / "Programs" / "VoiceStudio", base / "OmniVoiceStudio"))
         return any(path.exists() for path in candidates)
 
+    def open_scene_editor(self):
+        review=getattr(self,'review_app',None)
+        player=getattr(review,'audio_player',None)
+        if player is None:return
+        stem=review.current_stem()
+        path=review.current_scene_playback_path(stem) if stem else None
+        if path is not None:
+            player.play_one(path,'OUVIR CENA — EDITOR',scene_key=stem,force_editor=True)
+        else:
+            player.show_window('OUVIR CENA — EDITOR','Carregue áudios no projeto para começar a editar.')
+
+    def prepare_selected_model(self,model):
+        self.show_dependency_assistant()
+        callback=getattr(self,'dependency_prepare_model',None)
+        if callback:callback(model)
+
     def show_dependency_assistant(self) -> None:
         from dependency_setup import show_assistant
         show_assistant(self)
@@ -1078,7 +1182,9 @@ class DublaskizonApp:
             pass
 
     def apply_player_mode(self) -> None:
-        for app in (self.batch_app, self.review_app, self.personalized_app, self.converter_app, self.format_app, self.voice_clone_app):
+        from audio_player import set_global_playback_mode
+        set_global_playback_mode(self.root,self.player_mode)
+        for app in (self.batch_app, self.review_app, self.personalized_app, self.converter_app, self.format_app, self.voice_clone_app, getattr(self,"transcription_app",None)):
             player = getattr(app, "audio_player", None)
             if player is not None and hasattr(player, "set_playback_mode"):
                 player.set_playback_mode(self.player_mode)
@@ -1133,7 +1239,7 @@ class DublaskizonApp:
             self.help_manager.update_language()
         if hasattr(self, "scale_percent_button"):
             self.scale_percent_button.configure(text=f"{i18n.tr('ESCALA DA TELA')}: {self.scale_percent}%")
-        self.root.title(f"{i18n.tr('Dublaskizon')} — {self.project_root.name}")
+        self.root.title(f"{APP_TITLE} — {self.project_root.name}")
         if save:
             self.save_language()
 
@@ -1153,7 +1259,8 @@ class DublaskizonApp:
     def refresh_screen(self) -> None:
         apps = (getattr(self, name, None) for name in (
             'batch_app', 'personalized_app', 'review_app', 'converter_app',
-            'format_app', 'video_app', 'swap_app', 'voice_clone_app'))
+            'format_app', 'video_app', 'swap_app', 'voice_clone_app', 'frequency_separator_app',
+            'text_to_speech_app','transcription_app'))
         if any(getattr(app, flag, False) for app in apps
                for flag in ('running', 'busy', 'dependencies_running')):
             # Rebuilding widgets destroys queues, editors and active job controllers.
@@ -1176,7 +1283,7 @@ class DublaskizonApp:
             return
         self.rebuild_views()
         self.apply_language(self.language_code, save=False)
-        target = {"clone": self.clone_scroll, "review": self.review_scroll, "personalized": self.personalized_scroll, "terminal": self.terminal_scroll, "converter": self.converter_scroll, "format": self.format_scroll, "video": self.video_scroll, "swap": self.swap_scroll, "wem_filter": self.wem_filter_scroll, "voice_clone": self.voice_clone_scroll}[active_name]
+        target = {"clone": self.clone_scroll, "review": self.review_scroll, "personalized": self.personalized_scroll, "terminal": self.terminal_scroll, "converter": self.converter_scroll, "format": self.format_scroll, "video": self.video_scroll, "swap": self.swap_scroll, "wem_filter": self.wem_filter_scroll, "voice_clone": self.voice_clone_scroll, "frequency_separator": self.frequency_separator_scroll, "text_to_speech": self.text_to_speech_scroll,"transcription":self.transcription_scroll}[active_name]
         self.select_tab(target)
         self.status_refresh_message()
         if hasattr(self, "help_manager"):
@@ -1278,6 +1385,9 @@ class DublaskizonApp:
             (self.swap_scroll, "swap"),
             (self.wem_filter_scroll, "wem_filter"),
             (self.voice_clone_scroll, "voice_clone"),
+            (self.frequency_separator_scroll, "frequency_separator"),
+            (self.text_to_speech_scroll, "text_to_speech"),
+            (self.transcription_scroll,"transcription"),
             (self.terminal_scroll, "terminal"),
         )
         for view, key in mapping:
@@ -1353,10 +1463,10 @@ class DublaskizonApp:
                     apply_button_style(widget, theme, role)
             self.update_tab_buttons()
             apply_button_style_to_tree(self.root, theme)
-            for app in (getattr(self, "batch_app", None), getattr(self, "review_app", None), getattr(self, "personalized_app", None), getattr(self, "terminal_app", None), getattr(self, "converter_app", None), getattr(self, "format_app", None), getattr(self, "video_app", None), getattr(self, "swap_app", None), getattr(self, "wem_filter_app", None), getattr(self, "voice_clone_app", None)):
+            for app in (getattr(self, "batch_app", None), getattr(self, "review_app", None), getattr(self, "personalized_app", None), getattr(self, "terminal_app", None), getattr(self, "converter_app", None), getattr(self, "format_app", None), getattr(self, "video_app", None), getattr(self, "swap_app", None), getattr(self, "wem_filter_app", None), getattr(self, "voice_clone_app", None), getattr(self, "frequency_separator_app", None), getattr(self, "text_to_speech_app", None),getattr(self,"transcription_app",None)):
                 if app is not None and hasattr(app, "apply_theme"):
                     app.apply_theme(theme)
-            for scroll in (getattr(self, "clone_scroll", None), getattr(self, "review_scroll", None), getattr(self, "personalized_scroll", None), getattr(self, "terminal_scroll", None), getattr(self, "converter_scroll", None), getattr(self, "format_scroll", None), getattr(self, "video_scroll", None), getattr(self, "swap_scroll", None), getattr(self, "wem_filter_scroll", None), getattr(self, "voice_clone_scroll", None)):
+            for scroll in (getattr(self, "clone_scroll", None), getattr(self, "review_scroll", None), getattr(self, "personalized_scroll", None), getattr(self, "terminal_scroll", None), getattr(self, "converter_scroll", None), getattr(self, "format_scroll", None), getattr(self, "video_scroll", None), getattr(self, "swap_scroll", None), getattr(self, "wem_filter_scroll", None), getattr(self, "voice_clone_scroll", None), getattr(self, "frequency_separator_scroll", None), getattr(self, "text_to_speech_scroll", None),getattr(self,"transcription_scroll",None)):
                 if scroll is not None and scroll.winfo_exists():
                     scroll.set_background(theme["root"])
             if hasattr(self, "help_manager"):
@@ -1469,14 +1579,32 @@ class DublaskizonApp:
             self._scale_font_targets.pop(key, None)
             self._scale_padding_targets.pop(key, None)
 
-        # Uma única linha: dimensões idênticas para todas as abas, inclusive em outras escalas.
-        for name in ("clone", "review", "personalized", "converter", "format", "wem_filter", "voice_clone", "video", "swap", "commands"):
-            button = getattr(self, name + "_tab_button", None)
-            if button is not None:
-                button.configure(font=("Segoe UI", max(8, round(9 * self.scale_percent / 100)), "bold"),
-                                 width=19, height=2, padx=10, pady=7, wraplength=max(100, round(136 * self.scale_percent / 100)))
-                button.pack_configure(padx=(0, 6))
+        if hasattr(self,'clone_frame'):
+            compact_clone_spacing(self.clone_frame,max(.35,min(1.0,raw_factor)))
+
+        # Fit the whole row to its real viewport, rather than fixed character widths.
+        if hasattr(self,'tabs_canvas'):
+            self.fit_tab_buttons()
         self.root.update_idletasks()
+
+    def fit_tab_buttons(self):
+        if not hasattr(self,'commands_tab_button'):return
+        names=("clone", "review", "personalized", "text_to_speech", "transcription", "converter", "format", "wem_filter", "voice_clone", "video", "swap", "frequency_separator", "commands")
+        available=max(1,self.tabs_canvas.winfo_width())
+        if available<100:return
+        cell=available/len(names)
+        size=9 if cell>=145 else 8 if cell>=105 else 7
+        height=3 if cell>=115 else 4 if cell>=90 else 5
+        for name in names:
+            button=getattr(self,name+'_tab_button')
+            if button.winfo_manager()=='pack':button.pack_forget()
+        for index,name in enumerate(names):
+            button=getattr(self,name+'_tab_button')
+            button.configure(font=('Segoe UI',size,'bold'),width=0,height=height,padx=2,pady=3,wraplength=max(35,int(cell)-12))
+            button.grid(row=0,column=index,sticky='nsew',padx=(0,2 if index<len(names)-1 else 0))
+            self.tabs_bar.columnconfigure(index,weight=1,uniform='main_tabs')
+        self.tabs_canvas.itemconfigure(self.tabs_window_id,width=available)
+        self.tabs_canvas.xview_moveto(0)
 
     def resize_window_to_scale(self) -> None:
         # Em níveis baixos preserva uma janela utilizável e compacta o conteúdo;
@@ -1522,7 +1650,7 @@ class DublaskizonApp:
             self._scaling_in_progress = False
 
     def refresh_scrollbars(self):
-        for scroll_frame in (getattr(self, "clone_scroll", None), getattr(self, "review_scroll", None), getattr(self, "converter_scroll", None), getattr(self, "format_scroll", None), getattr(self, "video_scroll", None), getattr(self, "swap_scroll", None), getattr(self, "wem_filter_scroll", None), getattr(self, "voice_clone_scroll", None)):
+        for scroll_frame in (getattr(self, "clone_scroll", None), getattr(self, "review_scroll", None), getattr(self, "converter_scroll", None), getattr(self, "format_scroll", None), getattr(self, "video_scroll", None), getattr(self, "swap_scroll", None), getattr(self, "wem_filter_scroll", None), getattr(self, "voice_clone_scroll", None), getattr(self, "frequency_separator_scroll", None), getattr(self, "text_to_speech_scroll", None),getattr(self,"transcription_scroll",None)):
             if scroll_frame is not None and scroll_frame.winfo_exists():
                 scroll_frame.refresh_layout()
 
@@ -1536,12 +1664,16 @@ class DublaskizonApp:
         """Recebe eventos das abas sem tocar em widgets fora da thread Tk."""
         try:
             self.central_log_queue.put((str(source), str(text), str(tag)))
+            batch=getattr(self,'batch_app',None)
+            if batch is not None and str(source)!='CLONAGEM + DUBLAGEM':
+                batch.message_queue.put(('external_log',f'[{source}] {text}',str(tag)))
         except Exception:
             pass
 
     def project_callbacks(self):
         return {
             "central_log": self.central_log,
+            "prepare_model": self.prepare_selected_model,
             "prepare_video_tools": self.prepare_shared_audio_tools,
             "select_project": self.choose_project_folder,
             "use_exe_folder": self.use_exe_folder,
@@ -1623,7 +1755,7 @@ class DublaskizonApp:
                 review.original_text_by_stem = originals
             if other_dir == review.other_translation_dir:
                 review.other_translation_by_stem = alternatives
-            available = set(audio) & set(texts)
+            available = set(audio)
             if getattr(review, 'audio_source_mode', 'normal') == 'custom':
                 available &= set(custom)
             review.default_stems = sorted(available, key=str.casefold)
@@ -1672,6 +1804,13 @@ class DublaskizonApp:
             messagebox.showwarning("Pastas do projeto", f"Não foi possível criar todas as pastas do projeto:\n{exc}", parent=self.root)
 
     def rebuild_views(self):
+        if getattr(getattr(self, "frequency_separator_app", None), "running", False):
+            return
+        if getattr(getattr(self,'transcription_app',None),'running',False):
+            messagebox.showwarning('Processamento ativo','Cancele ou aguarde a transcrição/tradução terminar.',parent=self.root)
+            return
+        if getattr(getattr(self, "text_to_speech_app", None), "running", False):
+            return
         if getattr(self.swap_app, "running", False):
             return
         if self.swap_app is not None:
@@ -1684,7 +1823,9 @@ class DublaskizonApp:
             return
         if (self.batch_app is not None and getattr(self.batch_app, "running", False)) or (self.converter_app is not None and getattr(self.converter_app, "running", False)) or (self.format_app is not None and getattr(self.format_app, "running", False)):
             return
-        for old_view in (self.clone_scroll, self.review_scroll, self.personalized_scroll, self.terminal_scroll, self.converter_scroll, self.format_scroll, self.video_scroll, self.swap_scroll, self.wem_filter_scroll, self.voice_clone_scroll):
+        if self.text_to_speech_app is not None:
+            self.text_to_speech_app.audio_player.close_window()
+        for old_view in (self.clone_scroll, self.review_scroll, self.personalized_scroll, self.terminal_scroll, self.converter_scroll, self.format_scroll, self.video_scroll, self.swap_scroll, self.wem_filter_scroll, self.voice_clone_scroll, self.frequency_separator_scroll, self.text_to_speech_scroll,self.transcription_scroll):
             if old_view is not None:
                 old_view.destroy()
 
@@ -1705,6 +1846,10 @@ class DublaskizonApp:
         self.swap_scroll = ScrollableFrame(self.content, background=theme["root"])
         self.wem_filter_scroll = ScrollableFrame(self.content, background=theme["root"])
         self.voice_clone_scroll = ScrollableFrame(self.content, background=theme["root"])
+        self.frequency_separator_scroll = ScrollableFrame(self.content, background=theme["root"])
+        self.text_to_speech_scroll = ScrollableFrame(self.content, background=theme["root"])
+        self.transcription_scroll = ScrollableFrame(self.content,background=theme["root"])
+        self.clone_scroll.fit_viewport=True
         self.clone_frame = self.clone_scroll.inner
         self.review_frame = self.review_scroll.inner
         self.personalized_frame = self.personalized_scroll.inner
@@ -1715,13 +1860,25 @@ class DublaskizonApp:
         self.swap_frame = self.swap_scroll.inner
         self.wem_filter_frame = self.wem_filter_scroll.inner
         self.voice_clone_frame = self.voice_clone_scroll.inner
+        self.frequency_separator_frame = self.frequency_separator_scroll.inner
+        self.text_to_speech_frame = self.text_to_speech_scroll.inner
+        self.transcription_frame=self.transcription_scroll.inner
         self.clone_scroll.pack(fill="both", expand=True)
         self.active_scroll = self.clone_scroll
+        from generation_progress import configure_process_sink
+        configure_process_sink(lambda source,text:self.central_log(source,text))
         callbacks = self.project_callbacks()
         # O BatchApp converte formatos não-WAV antes de a Revisão montar sua lista.
         # Assim, as duas abas passam a enxergar os WAVs com exatamente os mesmos stems dos TXT.
-        self.batch_app = batch_tab.BatchApp(self.clone_frame, embedded=True, project_actions=callbacks)
-        self.review_app = review_tab.ReviewApp(self.review_frame, embedded=True, project_actions=callbacks)
+        self.batch_app = batch_tab.BatchApp(self.clone_frame, embedded=True, project_actions=callbacks, skip_legacy_migration=True)
+        # Reaproveita o índice já obtido pela aba de clonagem. Antes, os mesmos
+        # 17 mil áudios e textos eram percorridos novamente ao criar a Revisão.
+        self.review_app = review_tab.ReviewApp(
+            self.review_frame,
+            embedded=True,
+            project_actions=callbacks,
+            scene_index=(self.batch_app.audio_by_stem, self.batch_app.text_by_stem),
+        )
         self.personalized_app = personalized_dubbing_tab.PersonalizedDubbingApp(self.personalized_frame, embedded=True, project_root=self.project_root, project_actions=callbacks, review_app=self.review_app)
         self.batch_app.set_review_audio_target(self.review_app)
         self.terminal_app = TerminalApp(self.terminal_frame, self.root, theme, global_log_queue=self.central_log_queue, central_log_callback=self.central_log)
@@ -1732,6 +1889,11 @@ class DublaskizonApp:
         self.swap_app = video_audio_swap_tab.VideoAudioSwapApp(self.swap_frame, project_root=self.project_root, project_actions=callbacks)
         self.wem_filter_app = wem_filter_tab.WemFilterApp(self.wem_filter_frame, embedded=True, project_root=self.project_root, project_actions=callbacks)
         self.voice_clone_app = voice_clone_tab.VoiceClonePreprocessorApp(self.voice_clone_frame, embedded=True, project_root=self.project_root, project_actions=callbacks)
+        self.frequency_separator_app = audio_frequency_separator_tab.AudioFrequencySeparatorApp(self.frequency_separator_frame, project_root=self.project_root, project_actions=callbacks)
+        self.text_to_speech_app = text_to_speech_tab.TextToSpeechApp(self.text_to_speech_frame, project_root=self.project_root, project_actions=callbacks, theme=theme)
+        self.transcription_app=transcription_tab.TranscriptionApp(self.transcription_frame,self.project_root,callbacks,theme)
+        self.batch_app.choose_preparation_theme=self.transcription_app.choose_batch_theme
+        self.batch_app.preparation_theme_ready=lambda profile:(self.transcription_app.events.put(('context_research',profile)),self.transcription_app.events.put(('theme_ready',)))
         self.apply_player_mode()
         # As três abas compartilham a mesma pasta de ferramentas e o mesmo download.
         self.converter_app.dependencies_button.configure(command=self.prepare_shared_audio_tools)
@@ -1882,6 +2044,15 @@ class DublaskizonApp:
         self.set_project_root(APP_DIR, create_structure=True)
 
     def set_project_root(self, project_root: Path, create_structure: bool = True):
+        if getattr(getattr(self,'transcription_app',None),'running',False):
+            messagebox.showwarning('Processamento ativo','Cancele ou aguarde a transcrição/tradução terminar.',parent=self.root)
+            return
+        if getattr(getattr(self, "text_to_speech_app", None), "running", False):
+            messagebox.showwarning("Texto para fala", "Aguarde ou cancele a geração antes de trocar o projeto.", parent=self.root)
+            return
+        if getattr(getattr(self, "frequency_separator_app", None), "running", False):
+            messagebox.showwarning("Separação em andamento", "Aguarde ou cancele a separação antes de trocar o projeto.", parent=self.root)
+            return
         if getattr(self.video_app, "running", False) or getattr(self.swap_app, "running", False):
             messagebox.showwarning("Vídeo em execução", "Aguarde ou cancele a conversão antes de trocar o projeto.", parent=self.root)
             return
@@ -1897,7 +2068,7 @@ class DublaskizonApp:
         if create_structure:
             self.ensure_project_structure()
         self.rebuild_views()
-        self.root.title(f"{i18n.tr('Dublaskizon')} — {self.project_root.name}")
+        self.root.title(f"{APP_TITLE} — {self.project_root.name}")
 
     def open_tutorial(self):
         if not TUTORIAL_PATH.is_file():
@@ -1946,6 +2117,12 @@ class DublaskizonApp:
             self.wem_filter_app.refresh_for_project()
         elif scroll_frame is self.voice_clone_scroll:
             self.voice_clone_app.refresh_for_project()
+        elif scroll_frame is self.frequency_separator_scroll:
+            self.frequency_separator_app.refresh_for_project()
+        elif scroll_frame is self.transcription_scroll:
+            self.transcription_app.refresh_for_project()
+        elif scroll_frame is self.text_to_speech_scroll:
+            self.text_to_speech_app.refresh_for_project()
         if hasattr(self, "help_manager"):
             self.help_manager.update_tab()
 
@@ -1955,7 +2132,8 @@ class DublaskizonApp:
         self.update_tab_buttons()
         for name, app_name in (("clone","batch_app"),("review","review_app"),("personalized","personalized_app"),
                                ("converter","converter_app"),("format","format_app"),("video","video_app"),
-                               ("swap","swap_app"),("wem_filter","wem_filter_app"),("voice_clone","voice_clone_app")):
+                               ("swap","swap_app"),("wem_filter","wem_filter_app"),("voice_clone","voice_clone_app"),
+                               ("frequency_separator","frequency_separator_app"),("text_to_speech","text_to_speech_app"),("transcription","transcription_app")):
             app=getattr(self,app_name,None)
             active=any(bool(getattr(app,flag,False)) for flag in ('running','busy','dependencies_running','_scan_running'))
             if active and self.active_scroll is not getattr(self,name+'_scroll',None) and self._activity_blink:
@@ -1978,13 +2156,43 @@ class DublaskizonApp:
             (self.swap_tab_button, self.active_scroll is self.swap_scroll),
             (self.wem_filter_tab_button, self.active_scroll is self.wem_filter_scroll),
             (self.voice_clone_tab_button, self.active_scroll is self.voice_clone_scroll),
+            (self.frequency_separator_tab_button, self.active_scroll is self.frequency_separator_scroll),
+            (self.text_to_speech_tab_button, self.active_scroll is self.text_to_speech_scroll),
+            (self.transcription_tab_button,self.active_scroll is self.transcription_scroll),
             (self.commands_tab_button, self.active_scroll is self.terminal_scroll),
         )
+        light_gray_tabs = (self.clone_tab_button, self.review_tab_button,
+                           self.personalized_tab_button, self.text_to_speech_tab_button)
+        medium_gray_tabs = (self.converter_tab_button, self.format_tab_button)
+        lighter_gray_tabs = (self.video_tab_button, self.swap_tab_button,
+                             self.frequency_separator_tab_button)
         for widget, selected in tab_states:
             apply_button_style(widget, theme, "tab_active" if selected else "tab_inactive")
+            if not selected and widget in light_gray_tabs:
+                widget.configure(bg="#CBD5E1", activebackground="#E2E8F0",
+                                 fg="#172033", activeforeground="#172033")
+            elif not selected and widget in medium_gray_tabs:
+                widget.configure(bg="#475569", activebackground="#52627A",
+                                 fg="#F8FAFC", activeforeground="#F8FAFC")
+            elif not selected and widget in lighter_gray_tabs:
+                widget.configure(bg="#64748B", activebackground="#718096",
+                                 fg="#FFFFFF", activeforeground="#FFFFFF")
             widget.configure(relief="sunken" if selected else "raised")
 
     def close(self):
+        if getattr(getattr(self,'transcription_app',None),'running',False):
+            if messagebox.askyesno('Transcrição / tradução','Cancelar o processamento? Aguarde o cancelamento e feche novamente.',parent=self.root):self.transcription_app.cancel()
+            return
+        if getattr(getattr(self, "text_to_speech_app", None), "running", False):
+            if messagebox.askyesno("Texto para fala", "Cancelar a geração atual? Aguarde o cancelamento e feche novamente.", parent=self.root):
+                self.text_to_speech_app.cancel()
+            return
+        if self.text_to_speech_app is not None:
+            self.text_to_speech_app.audio_player.close_window()
+        if getattr(getattr(self, "frequency_separator_app", None), "running", False):
+            if messagebox.askyesno("Separação em andamento", "Cancelar a separação? Aguarde o cancelamento e feche novamente.", parent=self.root):
+                self.frequency_separator_app.cancel_run()
+            return
         if getattr(self.swap_app, "running", False):
             if messagebox.askyesno("Troca de áudio", "Cancelar a operação? Aguarde o cancelamento e feche novamente.", parent=self.root):
                 self.swap_app.cancel_run()
@@ -2032,3 +2240,4 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
+

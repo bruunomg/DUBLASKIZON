@@ -32,6 +32,9 @@ import time
 import re
 import json
 from generation_progress import GenerationProgress
+from warm_inference import warm_batch
+from speech_presence import speech_preflight_batch
+from scene_timeout import scene_lines, SceneTimeout
 import tempfile
 import wave
 import urllib.request
@@ -79,6 +82,8 @@ DEFAULT_MODEL_CHOICES = [
     ("OmniVoice BR-PT v1.5 — recomendado", "edwixx/omnivoice-brpt-v15"),
     ("OmniVoice oficial — russo e 600+ idiomas", "k2-fsa/OmniVoice"),
     ("F5-TTS Russian — russo / inglês (uso não comercial)", "hotstone228/F5-TTS-Russian"),
+    ("F5-TTS PT-BR DirectML — RX 500 / DirectX 12 (experimental)", "firstpixel/F5-TTS-pt-br"),
+    ("Qwen3-TTS 1.7B — português / clonagem de voz", "Qwen/Qwen3-TTS-12Hz-1.7B-Base"),
 ]
 MODEL_CHOICES = list(DEFAULT_MODEL_CHOICES)
 MODE_CHOICES = [
@@ -296,17 +301,8 @@ def character_from_stem(stem: str) -> str:
 
 
 def find_ffmpeg_directory() -> Path | None:
-    found = shutil.which("ffmpeg")
-    if found:
-        return Path(found).resolve().parent
-    roots = [ROOT / "ferramentas_audio", Path(os.environ.get("DUBLASKIZON_APP_DIR", ROOT)) / "ferramentas_audio"]
-    for base in roots:
-        if not base.is_dir():
-            continue
-        for candidate in base.rglob("ffmpeg.exe" if sys.platform.startswith("win") else "ffmpeg"):
-            if candidate.is_file():
-                return candidate.parent
-    return None
+    found=executable_path('ffmpeg',ROOT)
+    return Path(found).resolve().parent if found else None
 
 
 class RoundedProgress:
@@ -386,8 +382,13 @@ def hidden_process_kwargs() -> dict:
 
 
 def find_voice_command(model):
-    from f5_backend import MODEL, inference_command
-    return inference_command() if model == MODEL else find_omnivoice_command()
+    from f5_backend import MODEL as F5_MODEL, inference_command as f5_command
+    from directml_backend import MODEL as DML_MODEL, inference_command as dml_command
+    from qwen_backend import MODEL as QWEN_MODEL, inference_command as qwen_command
+    if model==QWEN_MODEL:return qwen_command()
+    if model==F5_MODEL:return f5_command()
+    if model==DML_MODEL:return dml_command()
+    return find_omnivoice_command()
 
 
 def find_omnivoice_command() -> list[str] | None:
@@ -482,6 +483,10 @@ def discover_model_choices() -> list[tuple[str, str]]:
 
 
 def model_is_cached(model_id: str) -> bool:
+    from qwen_backend import MODEL as QWEN_MODEL, root as qwen_root
+    if model_id==QWEN_MODEL:
+        folder=qwen_root()/'models'/('models--'+model_id.replace('/','--'))/'snapshots'
+        return folder.is_dir() and any(folder.rglob('*.safetensors'))
     encoded = model_id.replace("/", "--")
     return any((cache_root / f"models--{encoded}").is_dir() for cache_root in model_cache_roots())
 
@@ -615,7 +620,7 @@ def natural_key(value: str):
 
 
 class BatchApp:
-    def __init__(self, root, embedded=False, review_callback=None, project_actions=None):
+    def __init__(self, root, embedded=False, review_callback=None, project_actions=None, skip_legacy_migration=False):
         self.root = root
         self.embedded = embedded
         self.review_callback = review_callback
@@ -628,22 +633,31 @@ class BatchApp:
             self.root.minsize(820, 580)
             self.root.protocol("WM_DELETE_WINDOW", self.close_window)
 
-        self.legacy_audio_renames = migrate_legacy_converted_wavs()
+        # Na janela principal a migração já foi executada uma única vez antes de
+        # criar as abas. Evita percorrer projetos grandes duas vezes na abertura.
+        self.legacy_audio_renames = [] if skip_legacy_migration else migrate_legacy_converted_wavs()
         discovered_audio = find_audio_by_stem()
         self.pending_non_wav_audio = [Path(path) for path in discovered_audio.values() if not is_wav_path(path)]
         # WAVs existentes também podem precisar do perfil indicado para referência OmniVoice.
         self.audio_by_stem = {stem: path for stem, path in discovered_audio.items() if is_wav_path(path)}
-        self.pending_wav_audio = [path for path in self.audio_by_stem.values() if wav_needs_omnivoice_adjustment(path)]
+        self.pending_wav_audio = []
+        self._wav_profile_scan_pending = True
         self.initial_audio_conversion_errors: list[str] = [f"WAV legado renomeado: {item}" for item in self.legacy_audio_renames]
         self.initial_conversion_prompted = False
         self.auto_translation_var = StringVar(value="0")
+        self.prepare_texts_first_var=StringVar(value="1")
         self.auto_translation_settings = {}
         self.speech_language_var = StringVar(value='Russo' if i18n.CURRENT_LANGUAGE=='ru' else 'Português (Brasil)')
+        self.preserve_original_voice_var = StringVar(value='0')
+        self.skip_non_speech_var = StringVar(value='0')
+        self.skip_slow_var = StringVar(value='0')
+        self.scene_timeout_var = StringVar(value='120')
+        self.auto_trim_edges_var=StringVar(value='0');self.auto_max_volume_var=StringVar(value='0')
         self.align_audio_var = StringVar(value='0')
         self.align_audio_settings = {'pauses': False, 'max_change': 25}
         self.text_by_stem = find_text_by_stem()
         missing_text = sorted(set(self.audio_by_stem) - set(self.text_by_stem), key=str.casefold)
-        if missing_text:
+        if missing_text and not embedded:
             messagebox.showinfo(
             "Dublagem sem texto em português",
             "Você pode dublar sem TXT de texto português: o Dublaskizon também transcreve o áudio, traduz e depois dubla.\n\nAtive TRANSCREVER E TRADUZIR QUANDO FALTAR TXT e escolha os modelos em CONFIGURAR TRANSCRIÇÃO / TRADUÇÃO. Na primeira utilização, prepare as dependências.",
@@ -722,9 +736,16 @@ class BatchApp:
     def load_voice_settings(self):
         try:
             data = json.loads(VOICE_SETTINGS_FILE.read_text(encoding="utf-8"))
+            self.auto_translation_var.set("1" if data.get("auto_translation_enabled",False) else "0")
             self.auto_translation_settings=dict(data.get("auto_translation_settings",{}))
+            self.prepare_texts_first_var.set("1" if self.auto_translation_settings.get("prepare_before_dubbing",True) else "0")
             self.speech_language_var.set(str(data.get('speech_language', self.auto_translation_settings.get('language', self.speech_language_var.get()))))
+            self.auto_trim_edges_var.set('1' if data.get('auto_trim_edges',False) else '0');self.auto_max_volume_var.set('1' if data.get('auto_max_volume',False) else '0')
             self.align_audio_settings.update(data.get('align_audio_settings', {}))
+            self.preserve_original_voice_var.set('1' if bool(data.get('preserve_original_voice', False)) else '0')
+            self.skip_non_speech_var.set('1' if bool(data.get('skip_non_speech', False)) else '0')
+            self.skip_slow_var.set('1' if bool(data.get('skip_slow', False)) else '0')
+            self.scene_timeout_var.set(str(data.get('scene_timeout',120)))
             profile = str(data.get("default_profile", ""))
             if profile in VOICE_PROFILES:
                 self.voice_profile_var.set(profile)
@@ -750,8 +771,14 @@ class BatchApp:
                 "complement": self.instruct_var.get().strip(),
                 "r_pronunciation": self.selected_r_pronunciation_id(),
                 "characters": self.character_voice_profiles,
+                "auto_translation_enabled":self.auto_translation_var.get()=="1",
                 "auto_translation_settings": getattr(self,"auto_translation_settings",{}),
                 "speech_language": i18n.source_text(self.speech_language_var.get()),
+                "preserve_original_voice": self.preserve_original_voice_var.get() == '1',
+                "skip_non_speech": self.skip_non_speech_var.get() == '1',
+                "skip_slow": self.skip_slow_var.get() == '1',
+                "scene_timeout": self.scene_timeout_var.get(),
+                "auto_trim_edges":self.auto_trim_edges_var.get()=='1',"auto_max_volume":self.auto_max_volume_var.get()=='1',
                 "align_audio_settings": self.align_audio_settings,
             }, ensure_ascii=False, indent=2), encoding="utf-8")
         except OSError as exc:
@@ -908,6 +935,8 @@ class BatchApp:
         return sorted(unique, key=lambda item: str(item).casefold())
 
     def prompt_initial_reference_preparation(self):
+        if getattr(self,'_wav_profile_scan_pending',False):
+            return  # WAV header checks are deferred until the user starts a batch.
         try:
             if not self.root.winfo_exists() or self.initial_conversion_prompted or not self._pending_reference_audio():
                 return
@@ -1247,7 +1276,8 @@ class BatchApp:
             self.tool_alert_after_id = None
 
     def tool_storage_dir(self) -> Path:
-        return ROOT / TOOLS_DIR_NAME
+        from shared_audio_tools import prepare_storage
+        return prepare_storage(ROOT)
 
     def safe_extract_zip(self, archive_path: Path, destination: Path):
         destination.mkdir(parents=True, exist_ok=True)
@@ -1289,6 +1319,9 @@ class BatchApp:
                 return
             tools_dir = self.tool_storage_dir()
             tools_dir.mkdir(parents=True, exist_ok=True)
+            if all(executable_path(name,ROOT) for name in ('ffmpeg','ffprobe','ffplay')):
+                self.message_queue.put(('dependencies_done','Ferramentas compartilhadas já disponíveis; download ignorado.'))
+                return
             archive_path = temp_dir / "ffmpeg.zip"
             request = urllib.request.Request(FFMPEG_WINDOWS_URL, headers={"User-Agent": "Dublaskizon/1.0"})
             with urllib.request.urlopen(request, timeout=120) as response, archive_path.open("wb") as output:
@@ -1332,19 +1365,27 @@ class BatchApp:
         return f"{label} [{cache}]"
 
     def available_translation_stems(self):
-        variable=getattr(self,"auto_translation_var",None)
-        enabled=variable is not None and variable.get()=="1"
-        return sorted(set(self.audio_by_stem) if enabled else set(self.audio_by_stem)&set(self.text_by_stem),key=str.casefold)
+        # Listing/playback must not depend on having a translation ready.
+        return sorted(self.audio_by_stem,key=str.casefold)
 
     def configure_auto_translation(self):
         if self.running:return
         from audio_translation import choose_settings
-        config=choose_settings(self.root,getattr(self,"auto_translation_settings",{}))
+        config=choose_settings(self.root,{**getattr(self,"auto_translation_settings",{}),"prepare_before_dubbing":self.prepare_texts_first_var.get()=="1"})
         if config is not None:
             self.auto_translation_settings=config
+            self.prepare_texts_first_var.set("1" if config.get("prepare_before_dubbing",True) else "0")
             self.speech_language_var.set(config['language'])
+            self.auto_translation_var.set('1')
+            self.stems=self.available_translation_stems();self.run_stems=list(self.stems)
+            self.statuses={stem:self.statuses.get(stem,'pendente') for stem in self.stems};self.populate_queue()
             self.save_voice_settings()
+            self.emit_log('CONFIGURAÇÃO APLICADA: transcrever/traduzir quando faltar TXT ativado. '+('Todos os textos ausentes serão preparados antes da síntese.' if config.get('prepare_before_dubbing',True) else 'Preparação por cena selecionada.'),'info')
         return config
+
+    def save_preparation_choice(self):
+        self.auto_translation_settings={**getattr(self,'auto_translation_settings',{}),'prepare_before_dubbing':self.prepare_texts_first_var.get()=='1'}
+        self.save_voice_settings()
 
     def toggle_auto_translation(self):
         if self.running:
@@ -1357,6 +1398,7 @@ class BatchApp:
         self.run_stems=list(self.stems)
         self.statuses={stem:self.statuses.get(stem,"pendente") for stem in self.stems}
         self.populate_queue()
+        self.save_voice_settings()
 
     def selected_r_pronunciation_id(self) -> str:
         variable = getattr(self, "r_pronunciation_var", None)
@@ -1400,6 +1442,14 @@ class BatchApp:
     def update_model_info(self):
         model_id = self.selected_model_id()
         from f5_backend import MODEL as F5_MODEL
+        from directml_backend import MODEL as DML_MODEL
+        from qwen_backend import MODEL as QWEN_MODEL
+        if model_id == QWEN_MODEL:
+            self.model_info_var.set('Qwen3-TTS: Voice Cloning em português; ambiente próprio em REQUISITOS. NVIDIA CUDA ou CPU; instruções livres não alteram o Base.')
+            return
+        if model_id == DML_MODEL:
+            self.model_info_var.set('Português por DirectML: RX 560/570/580/590 e outras GPUs DirectX 12; teste obrigatório em REQUISITOS.')
+            return
         if model_id == F5_MODEL:
             self.model_info_var.set('F5-TTS Russian: prepare em REQUISITOS; russo / inglês; uso não comercial.')
             return
@@ -1432,6 +1482,10 @@ class BatchApp:
         combo.bind("<Button-5>", lambda _event: "break")
 
     def on_model_changed(self, _event=None):
+        from qwen_backend import MODEL as QWEN_MODEL
+        if self.selected_model_id()==QWEN_MODEL:
+            self.mode_var.set(i18n.tr(next(label for label, mode in MODE_CHOICES if mode=='clone')))
+            self.update_mode_info()
         from f5_backend import MODEL
         if self.selected_model_id() == MODEL:
             self.speech_language_var.set(i18n.tr('Russo'))
@@ -1445,6 +1499,8 @@ class BatchApp:
                 self.instruct_var.set('portuguese accent')
         self.update_model_info()
         self.save_voice_settings()
+        from voice_requirements import prompt
+        prompt(self)
 
     def on_voice_complement_changed(self, *_args):
         raw = self.instruct_var.get().strip().casefold()
@@ -1602,6 +1658,8 @@ class BatchApp:
         options.grid_columnconfigure(2, weight=1)
         options.grid_columnconfigure(3, weight=1)
         options.grid_columnconfigure(4, weight=1)
+        from speech_completeness import mount_controls
+        mount_controls(self.root, ROOT)
         main = Frame(self.root, bg="#F5F6FA")
         main.pack(fill="both", expand=True, padx=16, pady=(0, 10))
 
@@ -1621,12 +1679,13 @@ class BatchApp:
         Button(scenes_header, text="1-9", command=lambda: self.sort_scenes("numeric"), bg="#2563EB", fg="white", relief="flat", padx=6, pady=2, cursor="hand2").pack(side="right")
         list_frame = Frame(left, bg="white")
         list_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-        self.queue_list = Listbox(list_frame, exportselection=False, activestyle="none", font=("Segoe UI", 9), borderwidth=0, highlightthickness=0)
+        self.queue_list = Listbox(list_frame, selectmode='extended', exportselection=False, activestyle="none", font=("Segoe UI", 9), borderwidth=0, highlightthickness=0)
         list_scroll = Scrollbar(list_frame, orient="vertical", command=self.queue_list.yview)
         self.queue_list.configure(yscrollcommand=list_scroll.set)
         self.queue_list.pack(side="left", fill="both", expand=True)
         list_scroll.pack(side="right", fill="y")
         self.queue_list.bind("<Double-Button-1>", self.play_selected_scene)
+        self.queue_list.bind("<<ListboxSelect>>", self._follow_selected_scene)
         self.queue_list.bind("<Button-3>", self.show_scene_context_menu)
         self.enable_drag_drop(self.queue_list)
         self.enable_drag_drop(left)
@@ -1658,9 +1717,13 @@ class BatchApp:
         self.audio_conversion_progress.pack(side="right", padx=(4, 0))
         Label(scene_header, textvariable=self.audio_conversion_status_var, bg="white", fg="#2563EB", font=("Segoe UI", 7), anchor="e").pack(side="right", padx=(4, 0))
 
+        scene_body=Frame(right,bg='white');scene_body.pack(fill='both',expand=True,padx=14,pady=(2,6))
+        scene_body.columnconfigure(0,weight=1);scene_body.columnconfigure(1,weight=0);scene_body.rowconfigure(0,weight=1)
+        left_work=Frame(scene_body,bg='white');left_work.grid(row=0,column=0,sticky='nsew',padx=(0,12))
+        self.scene_work_area=left_work
         progress_bg = surface_color(getattr(self, "theme", {}), "surface", "#FFFFFF")
-        progress_frame = Frame(right, bg=progress_bg)
-        progress_frame.pack(fill="x", padx=14, pady=(2, 10))
+        progress_frame = Frame(left_work, bg=progress_bg)
+        progress_frame.pack(fill="x",pady=(0,4))
         # Duas linhas paralelas: a atividade principal e a etapa automática
         # relacionada ficam visíveis juntas. A largura menor deixa espaço para
         # os controles de início no painel à direita.
@@ -1668,7 +1731,7 @@ class BatchApp:
         progress_grid.pack(fill="x")
         progress_grid.columnconfigure(0, weight=1)
         progress_grid.columnconfigure(1, weight=1)
-        progress_grid.columnconfigure(2, weight=0)
+
 
         def progress_panel(row, column, title, color, attribute, track):
             panel = ttk.Frame(progress_grid)
@@ -1683,44 +1746,71 @@ class BatchApp:
         progress_panel(1, 0, "Dublagem / síntese", "#9B7BC5", "dub_progress", "#F0EAF7")
         progress_panel(1, 1, "Traduzindo", "#BA8834", "translate_progress", "#FFF1D6")
 
-        start_panel = ttk.Frame(progress_grid)
-        start_panel.grid(row=0, column=2, rowspan=2, sticky="nsew", padx=(2, 0))
-        progress_grid.columnconfigure(2, minsize=340)
-        progress_grid.rowconfigure(0, weight=1)
-        progress_grid.rowconfigure(1, weight=1)
+        start_panel = ttk.Frame(scene_body)
+        start_panel.grid(row=0,column=1,sticky="new")
+        scene_body.columnconfigure(1,minsize=340)
+        progress_grid.rowconfigure(0,weight=0)
+        progress_grid.rowconfigure(1,weight=0)
         self.start_button = Button(start_panel, text="INICIAR DUBLAGEM", command=self.start_run,
                                    bg="#C00000", activebackground="#8B0000", fg="white",
                                    activeforeground="white", font=("Segoe UI", 12, "bold"),
-                                   relief="flat", padx=22, pady=18, cursor="hand2")
-        self.start_button.pack(fill="both", expand=True, pady=(16, 5))
+                                   relief="flat", padx=16, pady=7, cursor="hand2")
+        self.start_button.pack(fill="both", expand=True, pady=(3, 3))
+        from speech_completeness import mount_batch_settings
+        self.speech_check_panel=mount_batch_settings(start_panel,ROOT)
+        self.ignore_previous_errors_var = StringVar(value='0')
         ttk.Checkbutton(start_panel, text='ALINHAR RITMO E DURAÇÃO AO ORIGINAL', variable=self.align_audio_var,
                         onvalue='1', offvalue='0').pack(fill='x', pady=(2, 3))
         ttk.Button(start_panel, text='CONFIGURAR ALINHAMENTO', command=self.configure_audio_alignment).pack(fill='x')
+        ttk.Checkbutton(start_panel,text='CORTAR SILÊNCIO INÍCIO/FIM A CADA DUBLAGEM',variable=self.auto_trim_edges_var,onvalue='1',offvalue='0',command=self.save_voice_settings).pack(fill='x')
+        ttk.Checkbutton(start_panel,text='VOLUME MÁXIMO SEGURO A CADA DUBLAGEM',variable=self.auto_max_volume_var,onvalue='1',offvalue='0',command=self.save_voice_settings).pack(fill='x')
         Label(progress_frame, text="Azul = referência/clonagem   Lilás = fala em português   Verde = cena pulada/concluída", bg="white", fg="#6B7280", font=("Segoe UI", 8)).pack(anchor="w", pady=(3, 0))
 
-        controls = Frame(right, bg="white")
-        controls.pack(fill="x", padx=14, pady=(0, 10))
+        controls = Frame(left_work,bg="white")
+        controls.pack(fill="x",pady=(0,5))
+        self.scene_controls=controls
         self.pause_button = Button(controls, text="Pausar", command=self.toggle_pause, bg="#6B7280", fg="white", relief="flat", padx=12, pady=5)
         self.pause_button.pack(side="left", padx=(0, 6))
         self.stop_button = Button(controls, text="Parar após cena", command=self.stop_after_scene, bg="#D97706", fg="white", relief="flat", padx=12, pady=5)
         self.stop_button.pack(side="left", padx=(0, 6))
         self.cancel_button = Button(controls, text="Cancelar", command=self.cancel_run, bg="#C00000", fg="white", relief="flat", padx=12, pady=5)
         self.cancel_button.pack(side="left")
+        ttk.Button(controls, text='RETOMAR PENDENTES', command=self.resume_batch).pack(side='left', padx=4)
+        ttk.Button(controls, text='DUBLAR SELECIONADOS', command=self.start_selected_batch).pack(side='left', padx=4)
+        ttk.Checkbutton(controls, text='IGNORAR ERROS', variable=self.ignore_previous_errors_var,
+                        onvalue='1', offvalue='0').pack(side='left', padx=4)
         # Mantém a largura alinhada, mas deixa o ttk calcular a altura dos
         # dois controles; desativar a propagação aqui fazia o checkbox e o
         # botão de configuração ficarem cortados.
         start_group=ttk.Frame(start_panel)
-        start_group.pack(fill='x', pady=(4, 0))
+        start_group.pack(fill='x',pady=(2,0))
         ttk.Checkbutton(start_group,text="TRANSCREVER E TRADUZIR QUANDO FALTAR TXT",variable=self.auto_translation_var,onvalue="1",offvalue="0",command=self.toggle_auto_translation).pack(fill='x',anchor='w',pady=(0,4))
+        ttk.Checkbutton(start_group,text='TRANSCREVER E TRADUZIR TUDO ANTES DE DUBLAR',variable=self.prepare_texts_first_var,onvalue='1',offvalue='0',command=self.save_preparation_choice).pack(fill='x',anchor='w')
         ttk.Button(start_group,text="CONFIGURAR TRANSCRIÇÃO / TRADUÇÃO",command=self.configure_auto_translation).pack(fill='x',pady=(0,5))
+        ttk.Checkbutton(start_group,text='DETECTAR FALA — PULAR POSSÍVEIS EFEITOS SONOROS',
+                        variable=self.skip_non_speech_var,onvalue='1',offvalue='0',command=self.save_voice_settings).pack(fill='x')
+        timeout_row=ttk.Frame(start_group);timeout_row.pack(fill='x')
+        ttk.Checkbutton(timeout_row,text='PULAR POR DEMORA',variable=self.skip_slow_var,
+                        onvalue='1',offvalue='0',command=self.save_voice_settings).pack(side='left')
+        ttk.Spinbox(timeout_row,from_=15,to=3600,textvariable=self.scene_timeout_var,width=5).pack(side='left')
+        ttk.Label(timeout_row,text='segundos').pack(side='left')
+        ttk.Button(timeout_row,text='DUBLAR PULADOS',command=self.retry_incomplete_batch).pack(side='left',padx=3)
+        self.preserve_original_voice_check=ttk.Checkbutton(start_group,
+            text=i18n.tr('MANTER VOZ NATURAL DO ÁUDIO ORIGINAL'),variable=self.preserve_original_voice_var,
+            onvalue='1',offvalue='0',command=self.save_voice_settings)
+        self.preserve_original_voice_check.pack(fill='x')
+        for widget in (self.queue_list,self.log_box) if hasattr(self,'log_box') else (self.queue_list,):
+            widget.configure(height=2)
         # O botão de início fica junto das quatro barras, acima; este grupo
         # mantém apenas a opção e a configuração da transcrição.
 
-        log_label = Frame(right, bg="white")
-        log_label.pack(fill="x", padx=14)
+        log_label = Frame(left_work,bg="white")
+        log_label.pack(fill="x")
         Label(log_label, text="Processos e mensagens", font=("Segoe UI", 10, "bold"), bg="white", fg="#26364A").pack(side="left")
-        self.log_box = Text(right, height=16, wrap="word", state="disabled", font=("Consolas", 9), bg="#FBFBFD", fg="#374151", relief="flat", borderwidth=0)
-        self.log_box.pack(fill="both", expand=True, padx=14, pady=(4, 12))
+        log_container=Frame(left_work,bg="white");log_container.pack(fill="both",expand=True,pady=(4,0))
+        self.log_box = Text(log_container, height=8, wrap="word", state="disabled", font=("Consolas", 9), bg="#FBFBFD", fg="#374151", relief="flat", borderwidth=0)
+        log_scroll=ttk.Scrollbar(log_container,command=self.log_box.yview);self.log_box.configure(yscrollcommand=log_scroll.set)
+        log_scroll.pack(side="right",fill="y");self.log_box.pack(fill="both",expand=True)
         self.log_box.tag_configure("normal", foreground="#374151")
         self.log_box.tag_configure("ok", foreground="#2E7D32")
         self.log_box.tag_configure("skip", foreground="#2E7D32")
@@ -1949,6 +2039,7 @@ class BatchApp:
             self.audio_player.set_scene_text_integration(self.load_scene_text_for_player, self.save_scene_text_from_player)
             self.audio_player.set_review_snapshot_provider(None)
             return
+        review_app.audio_finishing_allowed=lambda:not self.running
         review_app.translation_settings_provider=lambda:dict(getattr(self,"auto_translation_settings",{}))
         review_app.alignment_settings_provider=lambda:dict(self.align_audio_settings)
         review_app.speech_language_provider=lambda:i18n.source_text(self.speech_language_var.get())
@@ -1985,6 +2076,7 @@ class BatchApp:
             review_app.set_fixed_r_pronunciation_provider(self._fixed_r_pronunciation_for_review)
         self.audio_player.set_review_preferences({
             "auto_open_var": review_app.auto_open_var,
+            "preserve_original_voice_var": self.preserve_original_voice_var,
             "auto_open_command": review_app.toggle_auto_open,
             "request_translation_var": getattr(review_app,"request_translation_var",None),
             "align_original_var": getattr(review_app,'align_original_var',None),
@@ -1993,6 +2085,13 @@ class BatchApp:
             "request_r_var": review_app.request_r_var,
             "request_r_command": review_app.toggle_r_request,
         })
+        review_app.preserve_original_voice_var=self.preserve_original_voice_var
+
+    def _follow_selected_scene(self, _event=None):
+        selection = self.queue_list.curselection()
+        if selection and int(selection[0]) < len(self.stems):
+            stem = self.stems[int(selection[0])]
+            self.audio_player.follow_scene_selection(stem, [OUTPUT_DIR / f'{key}.wav' for key in self.stems], self.stems)
 
     def play_selected_scene(self, _event=None):
         selection = self.queue_list.curselection()
@@ -2042,6 +2141,19 @@ class BatchApp:
         return path.name if path is not None else f"{Path(stem).name}.wav"
 
     def populate_queue(self):
+        from batch_checkpoint import recover_records
+        try:
+            saved = recover_records(ROOT, self.stems, OUTPUT_DIR)
+            from speech_completeness import needs_review
+            for stem in list(saved):
+                if saved[stem] == 'success' and needs_review(OUTPUT_DIR / f'{stem}.wav'):
+                    saved[stem] = 'revisar'
+        except OSError:
+            saved = {}
+        markers = {'error':'[ERRO]', 'success':'[OK]', 'existing':'[EXISTENTE]', 'revisar':'[REVISAR]', 'skipped':'[PULADO]', 'no_speech':'[SEM FALA?]', 'timed_out':'[DEMORA]'}
+        for stem, status in saved.items():
+            if stem in self.statuses:
+                self.statuses[stem] = {'error':'erro','success':'ok','skipped':'pulada'}.get(status,status)
         self.audio_count_var.set(f"{i18n.tr('Áudios carregados:')} {len(self.audio_by_stem)} | {i18n.tr('Cenas prontas:')} {len(self.stems)}")
         self.queue_list.delete(0, END)
         if not self.stems:
@@ -2051,13 +2163,19 @@ class BatchApp:
             return
         queue_color = "#FFFFFF" if self.theme.get("mode") in {"medio", "escuro"} else self.theme.get("input_text", "#374151")
         self.queue_list.configure(fg=queue_color)
-        if self.stems:self.queue_list.insert(END,*(f"[ ] {self.scene_display_name(stem)}" for stem in self.stems))
+        # Uma única chamada Tcl com dezenas de milhares de argumentos deixa o
+        # Windows sem repintar a janela. Lotes moderados reduzem o pico sem mudar
+        # a ordem, a seleção ou a lista usada pelo processamento.
+        if self.stems:
+            for start in range(0, len(self.stems), 1000):
+                chunk = self.stems[start:start + 1000]
+                self.queue_list.insert(END, *(f"{markers.get(saved.get(stem), '[ ]')} {self.scene_display_name(stem)}" for stem in chunk))
         missing_text = sorted(set(self.audio_by_stem) - set(self.text_by_stem))
         missing_audio = sorted(set(self.text_by_stem) - set(self.audio_by_stem))
         if missing_text:
-            self.emit_log("AVISO: áudio sem TXT: " + ", ".join(missing_text), "error")
+            self.emit_log(f"AVISO: {len(missing_text)} áudio(s) sem TXT. Primeiros: " + ", ".join(missing_text[:10]), "error")
         if missing_audio:
-            self.emit_log("AVISO: TXT sem áudio: " + ", ".join(missing_audio), "error")
+            self.emit_log(f"AVISO: {len(missing_audio)} TXT(s) sem áudio. Primeiros: " + ", ".join(missing_audio[:10]), "error")
         self.emit_log(f"{len(self.stems)} pares válidos encontrados.", "info")
         self.emit_log(f"Saída: {OUTPUT_DIR}", "info")
 
@@ -2086,7 +2204,7 @@ class BatchApp:
 
     def poll_messages(self):
         try:
-            while True:
+            for _ in range(200):
                 message = self.message_queue.get_nowait()
                 self.handle_message(message)
         except queue.Empty:
@@ -2095,7 +2213,28 @@ class BatchApp:
 
     def handle_message(self, message):
         kind = message[0]
-        if kind == "log":
+        if kind in ('success', 'error', 'skipped', 'no_speech', 'timed_out'):
+            from batch_checkpoint import record_checkpoint
+            try:
+                status = kind
+                if kind == 'success':
+                    from speech_completeness import needs_review
+                    if needs_review(OUTPUT_DIR / f'{message[1]}.wav'):
+                        status = 'revisar'
+                record_checkpoint(ROOT, message[1], status)
+                position=getattr(self,'_run_positions',{}).get(message[1])
+                if position is not None:
+                    from batch_checkpoint import save_cursor
+                    save_cursor(ROOT, position+1)
+            except OSError as error:
+                self.append_log('Não foi possível salvar o controle do lote: '+str(error), 'error')
+        if kind == 'preparation_theme':
+            callback=getattr(self,'preparation_theme_ready',None)
+            if callback:callback(message[1])
+        elif kind == 'external_log':
+            _,text,tag=message
+            self.append_log(text,tag,relay=False)
+        elif kind == "log":
             _, text, tag = message
             self.append_log(text, tag)
         elif kind == "download_progress":
@@ -2158,19 +2297,21 @@ class BatchApp:
                 self.clone_progress.set(1.0)
                 self.dub_progress.set(max(self.dub_progress.fraction, fraction))
                 self.status_var.set(f"{stem}: dublando em português...")
-        elif kind == "skipped":
+        elif kind in ("skipped", "no_speech", "timed_out"):
             _, stem = message
-            self.statuses[stem] = "pulada"
+            self.statuses[stem] = "demora" if kind == 'timed_out' else ("sem_fala" if kind == 'no_speech' else "pulada")
             self.clone_progress.set(1.0)
             self.dub_progress.set(1.0)
-            self.update_queue_item(stem, "[PULADO]", "#2E7D32")
+            self.update_queue_item(stem, "[DEMORA]" if kind == 'timed_out' else ("[SEM FALA?]" if kind == 'no_speech' else "[PULADO]"), "#2E7D32")
             self.counts["pulados"] += 1
         elif kind == "success":
             _, stem = message
-            self.statuses[stem] = "ok"
+            from speech_completeness import needs_review
+            review = needs_review(OUTPUT_DIR / f'{stem}.wav')
+            self.statuses[stem] = 'revisar' if review else 'ok'
             self.clone_progress.set(1.0)
             self.dub_progress.set(1.0)
-            self.update_queue_item(stem, "[OK]", "#2E7D32")
+            self.update_queue_item(stem, "[REVISAR]" if review else "[OK]", "#B8860B" if review else "#2E7D32")
             self.counts["gerados"] += 1
             self.status_var.set(f"Concluído: {stem}")
             callback = self.project_actions.get('scene_completed')
@@ -2240,10 +2381,12 @@ class BatchApp:
             self.clock_after_id = None
         self.run_started_at = None
 
-    def append_log(self, text, tag="normal"):
-        self._log_central(text, tag)
+    def append_log(self, text, tag="normal",relay=True):
+        if relay:self._log_central(text, tag)
         self.log_box.configure(state="normal")
         self.log_box.insert(END, i18n.tr(str(text)).rstrip() + "\n", tag)
+        if int(self.log_box.index('end-1c').split('.')[0])>1500:
+            self.log_box.delete('1.0','300.0')
         self.log_box.see(END)
         self.log_box.configure(state="disabled")
 
@@ -2271,13 +2414,13 @@ class BatchApp:
         body.pack(fill='both', expand=True)
         ttk.Label(body, text='Ajusta a duração ao original preservando o tom. Não sincroniza palavras ou movimentos da boca.', wraplength=460).pack(anchor='w', pady=(0, 10))
         pauses = BooleanVar(value=bool(self.align_audio_settings.get('pauses', False)))
-        ttk.Checkbutton(body, text='Aproximar pausas e intensidade (experimental)', variable=pauses).pack(anchor='w')
-        ttk.Label(body, text='Essa aproximação pode atenuar sílabas em traduções com ritmo diferente. Desative para ajustar somente a duração.', wraplength=460).pack(anchor='w', pady=6)
+        ttk.Checkbutton(body, text='Alinhar blocos de fala e pausas automaticamente', variable=pauses).pack(anchor='w')
+        ttk.Label(body, text='Reposiciona os blocos de fala nos intervalos do original. Pausas diferentes são agrupadas por ordem; não sincroniza cada palavra. Desative para ajustar somente a duração.', wraplength=460).pack(anchor='w', pady=6)
         ttk.Label(body, text='Limite de alteração de velocidade (%):').pack(anchor='w')
         limit = StringVar(value=str(self.align_audio_settings.get('max_change', 25)))
         ttk.Spinbox(body, from_=5, to=100, textvariable=limit, width=8).pack(anchor='w')
-        ttk.Label(body, text='Acima do limite, a cena será marcada como falha para revisão, sem substituir o áudio anterior. Mudanças durante um lote valem para o próximo lote.', wraplength=460).pack(anchor='w', pady=8)
-        ttk.Label(body, text='Usa FFmpeg já disponível na ferramenta. O modo experimental usa NumPy e pydub; não baixa modelos de IA.', wraplength=460).pack(anchor='w', pady=6)
+        ttk.Label(body, text='Acima do limite, o áudio será salvo com ritmo natural e um aviso, sem falhar por esse motivo. Mudanças durante um lote valem para o próximo lote.', wraplength=460).pack(anchor='w', pady=8)
+        ttk.Label(body, text='Silero VAD detecta fala na CPU; FFmpeg ajusta o tempo. Prepare Silero pelo botão 1 em REQUISITOS. Sem ele, usa detecção por energia com aviso. O modelo fica no ambiente gerenciado e é removido por DESINSTALAR TUDO.', wraplength=460).pack(anchor='w', pady=6)
         ttk.Button(body, text='BAIXAR / PREPARAR FERRAMENTAS', command=self.dependencies_button.invoke).pack(fill='x', pady=5)
         def save():
             try:
@@ -2294,21 +2437,33 @@ class BatchApp:
     def align_generated_audio(self, generated, original):
         options = getattr(self, 'run_alignment_settings', None)
         if not options: return
-        from personalized_dubbing_tab import _audio_duration, _ffmpeg_path, _atempo_chain, match_original_expression
+        from personalized_dubbing_tab import _audio_duration, _ffmpeg_path, _atempo_chain, match_original_expression, AlignmentLimitExceeded
         ffmpeg = _ffmpeg_path()
         if not ffmpeg: raise RuntimeError('FFmpeg ausente. Use BAIXAR / PREPARAR FERRAMENTAS.')
         source_duration, target_duration = _audio_duration(generated), _audio_duration(original)
         if min(source_duration, target_duration) <= 0: raise RuntimeError('Não foi possível medir as durações para alinhar.')
         speed = source_duration / target_duration
-        if abs(speed - 1) * 100 > float(options['max_change']):
-            raise RuntimeError('Alinhamento excede o limite de velocidade configurado; revise o texto/duração da cena.')
+        if not options.get('pauses') and abs(speed - 1) * 100 > float(options['max_change']):
+            message = 'AVISO: alinhamento ultrapassou o limite; áudio gerado será salvo com ritmo natural, sem alterar sua duração.'
+            if hasattr(self, 'queue'):
+                self.queue.put(('log', message))
+            else:
+                print(message, flush=True)
+            return
         aligned = generated.with_name(generated.stem + '.__alinhado.wav')
         try:
             if options.get('pauses'):
-                match_original_expression(generated, original, aligned)
+                try:
+                    match_original_expression(generated, original, aligned, max_change=float(options['max_change']))
+                except AlignmentLimitExceeded as error:
+                    if hasattr(self, 'queue'):
+                        self.queue.put(('log', 'AVISO: ' + str(error)))
+                    else:
+                        print('AVISO: ' + str(error), flush=True)
+                    return
             else:
                 command = [ffmpeg, '-y', '-v', 'error', '-i', str(generated), '-af',
-                           _atempo_chain(speed) + f',apad,atrim=duration={target_duration:.6f}',
+                           _atempo_chain(speed) + f',apad=whole_dur={target_duration:.6f}',
                            '-c:a', 'pcm_s16le', str(aligned)]
                 with tempfile.TemporaryFile() as log:
                     self.current_process = subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, **hidden_process_kwargs())
@@ -2318,16 +2473,63 @@ class BatchApp:
             if self.cancel_requested: raise RuntimeError('Alinhamento cancelado.')
             if not aligned.is_file() or abs(_audio_duration(aligned) - target_duration) > .1:
                 raise RuntimeError('O áudio alinhado não passou na validação de duração.')
+            # Correct FFmpeg frame rounding without cutting synthesized samples.
+            from pydub import AudioSegment
+            import numpy as np
+            reference = AudioSegment.from_file(original).set_frame_rate(24000).set_channels(1).set_sample_width(2)
+            result_audio = AudioSegment.from_file(aligned).set_frame_rate(24000).set_channels(1).set_sample_width(2)
+            samples = np.frombuffer(result_audio.raw_data, dtype=np.int16)
+            target_samples = len(reference.raw_data) // 2
+            if len(samples) != target_samples:
+                if not len(samples) or not target_samples or abs(len(samples)-target_samples)/target_samples > .05:
+                    raise RuntimeError('Alinhamento impreciso; áudio anterior preservado.')
+                fitted = np.interp(np.linspace(0, len(samples)-1, target_samples), np.arange(len(samples)), samples)
+                with aligned.open('wb') as stream:
+                    AudioSegment(data=np.clip(fitted, -32768, 32767).astype(np.int16).tobytes(),
+                                 sample_width=2, frame_rate=24000, channels=1).export(stream, format='wav')
             os.replace(aligned, generated)
         finally:
             self.current_process = None
             aligned.unlink(missing_ok=True)
 
+    def retry_incomplete_batch(self):
+        if self.running:return
+        from batch_checkpoint import load_checkpoint
+        records=load_checkpoint(ROOT)
+        self.run_stems=[stem for stem in self.stems if records.get(stem) in ('no_speech','timed_out','error')]
+        if not self.run_stems:
+            messagebox.showinfo('Pulados','Não há pulados por detecção, demora ou erro registrados.',parent=self.root)
+            return
+        self.force_overwrite=True
+        self._retry_incomplete_next=True
+        self.start_run()
+
+    def resume_batch(self):
+        if self.running:
+            return
+        self._resume_next_batch = True
+        self.start_run()
+
+    def start_selected_batch(self):
+        if self.running:
+            return
+        selection = [self.stems[int(index)] for index in self.queue_list.curselection()]
+        if not selection:
+            messagebox.showinfo('Selecionar áudios', 'Selecione os áudios na lista com Ctrl ou Shift.', parent=self.root)
+            return
+        self._selected_next_batch = selection
+        self.start_run()
+
     def start_run(self):
+        if getattr(getattr(self,'review_audio_target',None),'bulk_finishing_busy',False):
+            messagebox.showinfo('Ajustes de áudio','Aguarde os ajustes de áudio da Revisão terminarem.',parent=self.root);return
         if self.running:
             if self.paused:
                 self.toggle_pause()
             return
+        if getattr(self,'_wav_profile_scan_pending',False):
+            self.pending_wav_audio=[path for path in self.audio_by_stem.values() if wav_needs_omnivoice_adjustment(path)]
+            self._wav_profile_scan_pending=False
         if self.audio_conversion_thread is not None and self.audio_conversion_thread.is_alive():
             messagebox.showwarning("Conversão em andamento", "Aguarde a conversão dos áudios para WAV terminar antes de iniciar a dublagem.", parent=self.root)
             return
@@ -2364,7 +2566,16 @@ class BatchApp:
             self.append_log("ERRO: omnivoice-infer não foi encontrado.", "error")
             return
         from audio_translation import settings, translation_python
+        self.run_trim_edges=self.auto_trim_edges_var.get()=='1';self.run_max_volume=self.auto_max_volume_var.get()=='1'
         self.run_alignment_settings = dict(self.align_audio_settings) if self.align_audio_var.get() == '1' else None
+        self.run_preserve_original_voice = self.preserve_original_voice_var.get() == '1'
+        if self.run_preserve_original_voice and executable_path('ffmpeg', ROOT) is None:
+            messagebox.showerror(
+                'Voz original',
+                'Use BAIXAR / PREPARAR FERRAMENTAS para instalar FFmpeg antes de preservar o caráter da voz original.',
+                parent=self.root,
+            )
+            return
         if self.run_alignment_settings:
             from personalized_dubbing_tab import _ffmpeg_path
             if not _ffmpeg_path():
@@ -2377,12 +2588,24 @@ class BatchApp:
                 except ImportError:
                     messagebox.showerror('Alinhamento', 'Modo experimental requer NumPy e pydub neste Python. Desative a aproximação de pausas para usar apenas duração.', parent=self.root)
                     return
-        self.run_translation_settings = settings(self.auto_translation_settings) if self.auto_translation_var.get()=="1" else None
+        self.run_translation_settings = settings({**self.auto_translation_settings,"prepare_before_dubbing":self.prepare_texts_first_var.get()=="1"}) if self.auto_translation_var.get()=="1" else None
         if self.run_translation_settings:
             try:translation_python()
             except Exception as exc:
                 messagebox.showerror("Transcrição / tradução",str(exc),parent=self.root)
                 return
+        if self.run_translation_settings:
+            answer=messagebox.askyesnocancel('Tema opcional','Deseja cadastrar ou conferir um tema de jogo, filme ou documentário para esta execução?\nSim: abre o tema da aba Transcrever e traduzir e pesquisa pelos transcritos.\nNão: continua sem tema. Cancelar: não inicia a fila.',parent=self.root)
+            if answer is None:
+                self.emit_log('INÍCIO CANCELADO na escolha do tema; nenhum processo iniciado.','info');return
+            profile={}
+            if answer:
+                chooser=getattr(self,'choose_preparation_theme',None)
+                if not callable(chooser):messagebox.showinfo('Tema','Configure o tema na aba Transcrever e traduzir.',parent=self.root);return
+                profile=chooser()
+                if profile is None:return
+            self.run_translation_settings['context_profile']=profile
+            self.emit_log('TEMA DA EXECUÇÃO: '+(profile.get('title') or 'sem tema')+'; aguardando varredura dos TXTs.','info')
         self.selected_model = self.selected_model_id()
         self.run_speech_language = settings({'language':i18n.source_text(self.speech_language_var.get())})['tts_language']
         if self.run_translation_settings:self.run_speech_language=self.run_translation_settings['tts_language']
@@ -2390,11 +2613,21 @@ class BatchApp:
         self.selected_model, _ = synthesis_settings(self.run_speech_language,self.selected_model,'')
         self.selected_mode = self.selected_mode_id()
         from f5_backend import MODEL as F5_MODEL, validate
+        from directml_backend import MODEL as DML_MODEL, validate as validate_dml
         if self.selected_model == F5_MODEL:
             try:validate(self.run_speech_language, self.selected_mode)
             except ValueError as exc:
                 messagebox.showerror('F5-TTS Russian', str(exc), parent=self.root)
                 return
+        if self.selected_model == DML_MODEL:
+            try:validate_dml(self.run_speech_language,self.selected_mode)
+            except ValueError as exc:
+                messagebox.showerror('F5-TTS PT-BR DirectML',str(exc),parent=self.root);return
+        from qwen_backend import MODEL as QWEN_MODEL, validate as validate_qwen
+        if self.selected_model == QWEN_MODEL:
+            try:validate_qwen(self.run_speech_language,self.selected_mode)
+            except ValueError as exc:
+                messagebox.showerror('Qwen3-TTS',str(exc),parent=self.root);return
         self.selected_instruct = self.instruct_var.get().strip()
         self.selected_r_pronunciation = self.selected_r_pronunciation_id()
         selected_profile_instruction = VOICE_PROFILES.get(self.voice_profile_var.get(), "")
@@ -2402,9 +2635,54 @@ class BatchApp:
             messagebox.showwarning("Descrição vazia", "Informe uma descrição para Voice Design antes de iniciar.")
             return
         self.save_voice_settings()
+        self.run_skip_non_speech = hasattr(self, 'skip_non_speech_var') and self.skip_non_speech_var.get() == '1'
+        self.run_scene_timeout=0
+        if hasattr(self,'skip_slow_var') and self.skip_slow_var.get() == '1':
+            try:self.run_scene_timeout=max(15,min(3600,float(self.scene_timeout_var.get())))
+            except ValueError:
+                messagebox.showerror('Limite da cena','Informe o limite em segundos.',parent=self.root);return
+        retry_incomplete=getattr(self,'_retry_incomplete_next',False)
+        self._retry_incomplete_next=False
+        if retry_incomplete:self.run_skip_non_speech=False
 
         if not self.force_overwrite:
             self.run_stems = list(self.stems)
+        from batch_checkpoint import recover_records, plan_batch, remaining_session, save_session
+        selection = getattr(self, '_selected_next_batch', None)
+        resume = getattr(self, '_resume_next_batch', False)
+        self._selected_next_batch = None
+        self._resume_next_batch = False
+        try:
+            records = recover_records(ROOT, self.stems, OUTPUT_DIR)
+            previous = remaining_session(ROOT)
+            if selection is None and not self.force_overwrite and (previous or (resume and previous is not None)):
+                available = set(self.stems)
+                selection = [stem for stem in previous if stem in available]
+                resume = True
+            from speech_completeness import needs_review
+            for stem in list(records):
+                if records[stem] == 'success' and needs_review(OUTPUT_DIR / f'{stem}.wav'):
+                    records[stem] = 'revisar'
+            self.run_preparation_stems=list(selection if selection is not None else self.run_stems)
+            self.run_retry_stems = {stem for stem,status in records.items() if resume and status in ('error','revisar')}
+            self.run_stems = plan_batch(selection if selection is not None else self.run_stems,
+                                        records, OUTPUT_DIR, resume=resume,
+                                        ignore_errors=not retry_incomplete and hasattr(self, 'ignore_previous_errors_var') and self.ignore_previous_errors_var.get() == '1')
+        except OSError as error:
+            messagebox.showerror('Controle do lote', str(error), parent=self.root)
+            return
+        self.preparation_only=not self.run_stems and bool(self.run_translation_settings and self.run_translation_settings.get('prepare_before_dubbing',True) and self.run_preparation_stems)
+        if not self.run_stems and not self.preparation_only:
+            self.emit_log('SEM PENDÊNCIAS DE DUBLAGEM: não há cenas nesta seleção após os filtros.','info')
+            messagebox.showinfo('Fila concluída', 'Não há áudios pendentes para esta seleção e estes filtros.', parent=self.root)
+            return
+        if self.preparation_only:self.emit_log('Não há síntese pendente; verificando os TXTs antes de encerrar.','info')
+        try:
+            save_session(ROOT, self.run_stems)
+            self._run_positions = {stem:index for index,stem in enumerate(self.run_stems)}
+        except OSError as error:
+            messagebox.showerror('Controle do lote', str(error), parent=self.root)
+            return
         self.running = True
         self.paused = False
         self.stop_after_current = False
@@ -2497,23 +2775,38 @@ class BatchApp:
         if instruction:
             command.extend(["--instruct", instruction])
         command.extend(["--output", str(output_file)])
-        return command
+        from voice_reference import protect_reference_command
+        command=protect_reference_command(command,command[command.index('--model')+1])
+        from speech_completeness import verified_command
+        return verified_command(command, command[command.index('--model') + 1], ROOT, batch_budget=True)
 
     def omnivoice_environment(self) -> dict[str, str]:
         environment = os.environ.copy()
-        # UTF-8 so F5-TTS (and any model) can print Cyrillic/Unicode without
-        # crashing on Windows cp1252 consoles, and so text=True decoding works.
-        environment["PYTHONIOENCODING"] = "utf-8"
-        environment["PYTHONUTF8"] = "1"
         ffmpeg_dir = find_ffmpeg_directory()
         if ffmpeg_dir:
             environment["PATH"] = str(ffmpeg_dir) + os.pathsep + environment.get("PATH", "")
             environment["FFMPEG_BINARY"] = str(ffmpeg_dir / ("ffmpeg.exe" if sys.platform.startswith("win") else "ffmpeg"))
         return environment
 
+    @warm_batch
+    @speech_preflight_batch
     def worker(self):
-        active_stems = list(self.run_stems or self.stems)
+        active_stems = [] if getattr(self,"preparation_only",False) else list(self.run_stems or self.stems)
         total = len(active_stems)
+        self.prepared_batch_texts={};self.prepared_batch_errors={}
+        config=getattr(self,'run_translation_settings',None)
+        if config and config.get('prepare_before_dubbing',True):
+            from batch_text_preparation import prepare_missing_texts
+            try:
+                self.prepared_batch_texts,self.prepared_batch_errors=prepare_missing_texts(
+                    getattr(self,"run_preparation_stems",active_stems),self.audio_by_stem,self.text_by_stem,TEXT_DIR,ROOT,config,
+                    lambda text:self.emit_log(text,'info'),lambda:self.cancel_requested,
+                    lambda:self.pause_event.wait(),
+                    lambda stem,stage,fraction:self.message_queue.put(('stage',stem,stage,fraction)),
+                    on_theme=lambda profile:self.message_queue.put(('preparation_theme',profile)))
+            except Exception as exc:
+                self.emit_log('Preparação dos textos interrompida: '+str(exc),'error')
+                self.message_queue.put(('finished','Preparação interrompida; nenhuma síntese iniciada. Textos já preparados foram preservados.'));return
         for number, stem in enumerate(active_stems, start=1):
             self.pause_event.wait()
             if self.cancel_requested:
@@ -2521,6 +2814,8 @@ class BatchApp:
             if self.stop_after_current and number > 1:
                 break
 
+            if stem in self.prepared_batch_errors:
+                self.message_queue.put(('error',stem,'Texto não preparado: '+self.prepared_batch_errors[stem]));continue
             ref_audio = self.audio_by_stem[stem]
             text_file = self.text_by_stem.get(stem) or (TEXT_DIR / f"{stem}.txt")
             self.scene_translation_language = None
@@ -2529,15 +2824,34 @@ class BatchApp:
             self.message_queue.put(("started", stem, number, total))
             self.emit_log(f"[{number}/{total}] {stem}: clonando referência e preparando dublagem.", "info")
 
-            if output_file.exists() and not OVERWRITE and not self.force_overwrite:
+            if output_file.exists() and not OVERWRITE and not self.force_overwrite and stem not in getattr(self, 'run_retry_stems', set()):
                 self.emit_log(f"[{number}/{total}] PULADO: já existe {output_file.name}.", "skip")
                 self.message_queue.put(("skipped", stem))
                 continue
 
+            if getattr(self, 'run_skip_non_speech', False):
+                self.emit_log(f'DETECÇÃO DE FALA: {stem}', 'info')
+                try:
+                    speech = self._speech_detector.detect(ref_audio, lambda:self.cancel_requested)
+                except Exception as detection_error:
+                    if self.cancel_requested: break
+                    self._speech_detector.close()
+                    self.run_skip_non_speech = False
+                    self.emit_log('AVISO: detector indisponível; filtro suspenso nesta execução, nenhum áudio será excluído por isso: '+str(detection_error), 'error')
+                else:
+                    if not speech:
+                        self.emit_log(f'SEM FALA? {stem}: possível efeito sonoro; pulado, original preservado. Desative o filtro e selecione este áudio para tentar novamente.', 'skip')
+                        self.message_queue.put(('no_speech',stem))
+                        continue
+
             try:
                 text = text_file.read_text(encoding="utf-8-sig").strip() if text_file.is_file() else ""
                 config=getattr(self,"run_translation_settings",None)
+                if stem in self.prepared_batch_texts:
+                    text,self.scene_translation_language=self.prepared_batch_texts[stem]
+                    if text_file.is_file():self.text_by_stem[stem]=text_file
                 if not text and config:
+                    if config.get('prepare_before_dubbing',True):raise RuntimeError('Texto continua ausente após a preparação; cena preservada sem iniciar síntese.')
                     from audio_translation import generate_text
                     text,self.scene_translation_language=generate_text(ref_audio,text_file,ROOT,stem,config,
                         lambda value:self.emit_log(value,"info"),lambda:self.cancel_requested,
@@ -2571,25 +2885,21 @@ class BatchApp:
                 self.emit_log(f"[{number}/{total}] voz de {character_from_stem(stem)}: {profile_name}", "info")
             self.emit_log(f"[{number}/{total}] dublando: {text_file.name} -> {output_file.name}", "info")
             try:
-                self.current_process = subprocess.Popen(
-                    command,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    bufsize=1,
-                    env=self.omnivoice_environment(),
-                    **hidden_process_kwargs(),
-                )
+                self.current_process = self._warm_inference.start(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, env=self.omnivoice_environment(), **hidden_process_kwargs())
                 observer=GenerationProgress(lambda c,d,p: (self.message_queue.put(("stage",stem,"clone",c/100)), self.message_queue.put(("stage",stem,"dub",d/100)) if d else None))
                 if self.current_process.stdout:
-                    for raw_line in self.current_process.stdout:
+                    for raw_line in scene_lines(self.current_process,getattr(self,'run_scene_timeout',0),lambda:self.cancel_requested):
                         line = raw_line.strip()
                         if line:
                             self.emit_log(line, "normal")
                             observer.feed(line)
                 return_code = self.current_process.wait()
+            except SceneTimeout as exc:
+                self._warm_inference.close()
+                temporary_output_file.unlink(missing_ok=True)
+                self.emit_log(str(exc)+' '+stem,'skip')
+                self.message_queue.put(('timed_out',stem))
+                continue
             except Exception as exc:
                 self.current_process = None
                 self.message_queue.put(("error", stem, f"[{number}/{total}] FALHA ao iniciar OmniVoice: {exc}"))
@@ -2610,14 +2920,49 @@ class BatchApp:
                     backup_path = None
                     if getattr(self, 'run_alignment_settings', None):
                         self.emit_log(f'Alinhando ritmo e duração: {stem}', 'info')
-                        self.align_generated_audio(temporary_output_file, self.audio_by_stem[stem])
+                        try:
+                            self.align_generated_audio(temporary_output_file, self.audio_by_stem[stem])
+                        except RuntimeError as alignment_error:
+                            if self.cancel_requested or 'cancelado' in str(alignment_error).lower():
+                                raise
+                            if 'validação de duração' not in str(alignment_error):
+                                raise
+                            from speech_completeness import mark_pending_review
+                            mark_pending_review(temporary_output_file, ROOT, alignment_error)
+                            self.emit_log(f'REVISAR: alinhamento não validado; preservando síntese sem alinhamento: {stem}', 'error')
+                    if getattr(self, 'run_preserve_original_voice', False):
+                        ffmpeg = executable_path('ffmpeg', ROOT)
+                        if not ffmpeg:
+                            raise RuntimeError('FFmpeg não está disponível para preservar a voz original.')
+                        from voice_character import preserve_original_voice
+                        self.emit_log(f'Analisando o caráter da voz original: {stem}', 'info')
+                        try:
+                            detected = preserve_original_voice(temporary_output_file, self.audio_by_stem[stem], ffmpeg)
+                            self.emit_log(f'Voz original preservada: {stem} — {detected}.', 'info')
+                        except Exception as effect_error:
+                            # A dublagem continua utilizável mesmo se um WAV raro
+                            # não puder ser analisado ou filtrado.
+                            self.emit_log(f'AVISO: não foi possível preservar o perfil de {stem}: {effect_error}', 'error')
                     if self.cancel_requested:
                         temporary_output_file.unlink(missing_ok=True)
                         break
+                    if getattr(self,'run_trim_edges',False) or getattr(self,'run_max_volume',False):
+                        from audio_player import apply_dubbed_finishing
+                        try:
+                            detail=apply_dubbed_finishing(temporary_output_file,ROOT,trim=self.run_trim_edges,max_volume=self.run_max_volume,backup=False)
+                            self.emit_log(f'ACABAMENTO {stem}: corte {detail["removed_seconds"]:.3f}s; volume {detail["gain_db"]:+.2f} dB.', 'info')
+                        except Exception as finish_error:
+                            self.emit_log(f'AVISO: acabamento não aplicado em {stem}; dublagem preservada: {finish_error}', 'error')
+                            from speech_completeness import mark_pending_review
+                            mark_pending_review(temporary_output_file,ROOT,'Acabamento não aplicado: '+str(finish_error))
                     backup_path = _archive_dubbed_before_replace(stem, output_file)
                     os.replace(temporary_output_file, output_file)
+                    from speech_completeness import publish_review_report
+                    publish_review_report(temporary_output_file, output_file)
                     self.message_queue.put(("success", stem))
-                    self.emit_log(f"[{number}/{total}] OK: {output_file.name}", "ok")
+                    from speech_completeness import needs_review
+                    review = needs_review(output_file)
+                    self.emit_log(f"[{number}/{total}] {'REVISAR' if review else 'OK'}: {output_file.name}", "error" if review else "ok")
                     if backup_path is not None:
                         self.emit_log(f"[{number}/{total}] Versão anterior preservada em revisoes: {backup_path.name}", "info")
                 except Exception as exc:
@@ -2648,7 +2993,7 @@ class BatchApp:
         elif self.stop_after_current:
             reason = "Fila parada após a cena atual."
         else:
-            reason = "Fila finalizada."
+            reason = 'Preparação dos textos concluída; nenhuma síntese estava pendente.' if getattr(self,'preparation_only',False) else 'Fila finalizada.'
         self.message_queue.put(("finished", reason))
         self.run_stems = list(self.stems)
         self.force_overwrite = False

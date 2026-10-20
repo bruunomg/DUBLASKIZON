@@ -11,6 +11,16 @@ import personalized_dubbing_tab as custom
 
 
 class GenerationControls(unittest.TestCase):
+    def test_personalized_watchdog_terminates_stalled_engine(self):
+        process = Mock()
+        process.poll.return_value = None
+        app = SimpleNamespace(regen_cancel_requested=False)
+        with patch('review_tab.subprocess.Popen', return_value=process), patch('review_tab.time.monotonic', side_effect=[0, 91]):
+            with self.assertRaisesRegex(RuntimeError, 'motor sem novas mensagens'):
+                ReviewApp._run_cancellable_generation(app, ['engine'], personalized_watchdog=True)
+        process.terminate.assert_called_once()
+        process.wait.assert_called_once_with(timeout=5)
+
     def test_missing_translation_respects_displayed_text_and_activation(self):
         flag = SimpleNamespace(get=lambda:'1')
         app = SimpleNamespace(translate_missing_var=flag, player_text_override=('scene','Texto existente'))

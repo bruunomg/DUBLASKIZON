@@ -25,5 +25,11 @@ with tempfile.TemporaryDirectory() as folder:
     assert [path.name for path in filter_app.files] == ["evento#456.dat", "fala (123).wem"]
     assert filter_app.preview_tree.get_children()
     assert app.clone_scroll is not app.active_scroll
+app.select_tab(app.transcription_scroll)
+root.update_idletasks()
+assert app.current_tab_key() == 'transcription'
+assert app.transcription_app is not None
+app.fit_tab_buttons();root.update_idletasks()
+assert int(app.transcription_tab_button.grid_info()['column']) == int(app.text_to_speech_tab_button.grid_info()['column'])+1
 root.destroy()
 print("refresh_filter_tab_ok")

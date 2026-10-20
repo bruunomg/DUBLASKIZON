@@ -1,4 +1,4 @@
-"""Player integrado ao Tk no Windows; FFplay embutido e busca visual via FFmpeg."""
+"""Player integrado ao Tk no Windows e reprodução externa segura no Linux."""
 from __future__ import annotations
 import base64
 import ctypes
@@ -94,7 +94,7 @@ class VideoPreview:
         self.events=queue.Queue();self.frame_requests=queue.Queue(maxsize=1);self.decoder=None;self.decoder_lock=threading.Lock()
         self.ffmpeg=executable_path('ffmpeg',owner.project_root);self.ffprobe=executable_path('ffprobe',owner.project_root)
         self.ffplay=executable_path('ffplay',owner.project_root)
-        self.native=WindowsVideoHost()
+        self.native=WindowsVideoHost() if os.name=='nt' else None
         self.window=tk.Toplevel(owner.root);self.window.title('VISUALIZAR VÍDEO');self.window.geometry('1060x740');self.window.minsize(640,420)
         self.window.protocol('WM_DELETE_WINDOW',self.close)
         self.title=tk.Label(self.window,font=('Segoe UI',11,'bold'),anchor='w',padx=16,pady=12)
@@ -173,15 +173,17 @@ class VideoPreview:
         if not self.ffplay:self.status.set('Use PREPARAR FERRAMENTAS para instalar FFplay.');return
         self.stop();self.current=self.clamp(seconds);self.paused=False
         try:
-            startup=subprocess.STARTUPINFO();startup.dwFlags|=subprocess.STARTF_USESHOWWINDOW;startup.wShowWindow=0
             command=[str(self.ffplay),'-hide_banner','-loglevel','info','-stats','-autoexit','-noborder',
                 '-ss',str(self.current),'-window_title',f'Dublaskizon integrado {id(self)}',
                 '-x',str(max(2,self.surface.winfo_width())),'-y',str(max(2,self.surface.winfo_height())),str(self.path)]
-            self.process=subprocess.Popen(command,stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,
-                startupinfo=startup,creationflags=subprocess.CREATE_NO_WINDOW,bufsize=0)
+            options={'stdin':subprocess.DEVNULL,'stdout':subprocess.DEVNULL,'stderr':subprocess.PIPE,'bufsize':0}
+            if os.name=='nt':
+                startup=subprocess.STARTUPINFO();startup.dwFlags|=subprocess.STARTF_USESHOWWINDOW;startup.wShowWindow=0
+                options.update(startupinfo=startup,creationflags=subprocess.CREATE_NO_WINDOW)
+            self.process=subprocess.Popen(command,**options)
             self.attach_deadline=time.monotonic()+12
             threading.Thread(target=self.read_player,args=(self.process,self.serial),daemon=True).start()
-            self.status.set('Abrindo vídeo integrado...')
+            self.status.set('Abrindo vídeo integrado...' if self.native else 'Reproduzindo no FFplay — a linha de tempo continua disponível aqui.')
         except Exception as exc:self.stop();self.status.set(str(exc))
     def read_player(self,process,generation):
         buffer='';last=''
@@ -200,6 +202,11 @@ class VideoPreview:
     def pause(self):
         if self.process is not None and not self.paused and self.hwnd and self.native.pause(self.hwnd):
             self.paused=True;self.status.set('Pausado')
+        elif self.process is not None and not self.paused and self.native is None:
+            # FFplay não oferece controle de pausa por stdin no Linux. Encerrar
+            # preserva o relógio lido do processo; PLAY retoma desse ponto.
+            current=self.current;self.stop();self.current=current;self.paused=True
+            self.status.set('Pausado — PLAY retoma deste ponto.')
     def toggle(self):
         if self.paused:self.play()
         else:self.pause()
@@ -280,7 +287,7 @@ class VideoPreview:
                     self.status.set('Reprodução encerrada.' if item[2]==0 else 'Erro: '+item[3]);self.request_frame(self.current)
                 elif kind=='error' and item[1]==self.media_serial:self.status.set(item[2])
         except queue.Empty:pass
-        if self.process is not None and self.hwnd is None:
+        if self.native is not None and self.process is not None and self.hwnd is None:
             hwnd=self.native.find(self.process.pid)
             if hwnd:
                 try:

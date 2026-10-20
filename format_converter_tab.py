@@ -133,11 +133,8 @@ def hidden_process_kwargs() -> dict:
 
 
 def portable_tool_dir() -> Path:
-    module_dir = Path(__file__).resolve().parent
-    app_dir = Path(os.environ.get("DUBLASKIZON_APP_DIR", module_dir)).expanduser().resolve()
-    target = app_dir / TOOLS_DIR_NAME
-    target.mkdir(parents=True, exist_ok=True)
-    return target
+    from shared_audio_tools import prepare_storage
+    return prepare_storage()
 
 
 class FormatConverterApp:
@@ -360,23 +357,34 @@ class FormatConverterApp:
 
     def handle_drop(self, raw: str):
         found: list[Path] = []
+        relative_paths: dict[str, Path] = {}
         for path in parse_drop_paths(raw, self.root):
             if path.is_dir():
-                found.extend(list_audio_files(path))
+                root = path.expanduser().resolve()
+                loaded = list_audio_files(root)
+                found.extend(loaded)
+                for audio in loaded:
+                    relative_paths[str(audio)] = Path(root.name) / audio.relative_to(root)
             elif is_audio_file(path):
-                found.append(path)
-        self.set_files(self.files + found, "Arquivos arrastados")
+                audio = path.expanduser().resolve()
+                found.append(audio)
+                relative_paths[str(audio)] = Path(audio.parent.name) / audio.name
+        self.set_files(self.files + found, "Arquivos arrastados", relative_paths=relative_paths)
 
     def choose_input_folder(self):
         selected = filedialog.askdirectory(parent=self.root, title="Escolher pasta de áudios ou vídeos para converter")
         if selected:
-            folder = Path(selected)
-            self.set_files(list_audio_files(folder), str(folder))
+            folder = Path(selected).expanduser().resolve()
+            files = list_audio_files(folder)
+            relative_paths = {str(path): Path(folder.name) / path.relative_to(folder) for path in files}
+            self.set_files(files, str(folder), relative_paths=relative_paths)
 
     def add_files(self):
         selected = filedialog.askopenfilenames(parent=self.root, title="Selecionar áudios ou vídeos para converter", filetypes=[("Áudios e vídeos", " ".join("*" + ext for ext in sorted(AUDIO_EXTENSIONS | VIDEO_EXTENSIONS))), ("Todos os arquivos", "*.*")])
         if selected:
-            self.set_files(self.files + [Path(path) for path in selected], "Arquivos selecionados")
+            files = [Path(path).expanduser().resolve() for path in selected]
+            relative_paths = {str(path): Path(path.parent.name) / path.name for path in files}
+            self.set_files(self.files + files, "Arquivos selecionados", relative_paths=relative_paths)
 
     def choose_output_folder(self):
         selected = filedialog.askdirectory(parent=self.root, title="Pasta dos áudios convertidos")
@@ -408,21 +416,36 @@ class FormatConverterApp:
                 continue
         return path.name
 
-    def set_files(self, files: list[Path], label: str, source_labels: dict[str, str] | None = None):
+    def set_files(self, files: list[Path], label: str, source_labels: dict[str, str] | None = None,
+                  relative_paths: dict[str, Path | str] | None = None):
         unique: list[Path] = []
         seen: set[str] = set()
         supplied_sources = source_labels or {}
         normalized_sources = {os.path.normcase(str(Path(key).expanduser().resolve())): value for key, value in supplied_sources.items()}
+        previous_sources = getattr(self, "file_source_by_path", {})
+        previous_relatives = getattr(self, "file_relative_by_path", {})
+        supplied_relatives = relative_paths or {}
+        normalized_relatives = {
+            os.path.normcase(str(Path(key).expanduser().resolve())): Path(value)
+            for key, value in supplied_relatives.items()
+        }
         next_sources: dict[str, str] = {}
+        next_relatives: dict[str, Path] = {}
         for raw in files:
             path = Path(raw).expanduser().resolve()
             key = os.path.normcase(str(path))
             if is_audio_file(path) and key not in seen:
                 seen.add(key)
                 unique.append(path)
-                next_sources[key] = normalized_sources.get(key, "")
+                next_sources[key] = normalized_sources.get(key, previous_sources.get(key, ""))
+                relative = normalized_relatives.get(key, previous_relatives.get(key))
+                if relative is not None:
+                    parts = [part for part in Path(relative).parts if part not in ("", ".", "..")]
+                    if parts:
+                        next_relatives[key] = Path(*parts)
         self.files = sorted(unique, key=lambda path: (path.name.casefold(), str(path).casefold()))
         self.file_source_by_path = next_sources
+        self.file_relative_by_path = next_relatives
         self.input_dir_var.set(label)
         self.panel_title_var.set(f"ÁUDIOS / VÍDEOS PARA CONVERTER ({len(self.files)})")
         self.count_var.set(f"Áudios: {len(self.files)}")
@@ -573,8 +596,16 @@ class FormatConverterApp:
         files = original_files + dubbed_files
         source_labels = {str(path): "ORIGINAL" for path in original_files}
         source_labels.update({str(path): "DUBLADO" for path in dubbed_files})
+        relative_paths = {
+            str(path): Path("WAV ORIGINAIS") / path.relative_to(self.project_root / "WAV ORIGINAIS")
+            for path in original_files
+        }
+        relative_paths.update({
+            str(path): Path("dublado") / path.relative_to(self.project_root / "dublado")
+            for path in dubbed_files
+        })
         label = f"Carregado da aba {source_label}: {len(original_files)} originais + {len(dubbed_files)} dublados"
-        self.set_files(files, label, source_labels=source_labels)
+        self.set_files(files, label, source_labels=source_labels, relative_paths=relative_paths)
         self.status_var.set(f"Carregado da aba {source_label}: confira os arquivos antes de converter.")
         self.append_log(f"Carregamento da aba {source_label}: {len(files)} arquivo(s) carregado(s).")
 
@@ -588,7 +619,8 @@ class FormatConverterApp:
         folder = self.project_root / "dublados personalizados"
         files = [path for path in list_audio_files(folder) if not path.name.startswith(".")]
         label = f"Carregado da aba DUBLAGEM PERSONALIZADA: {len(files)} áudio(s)"
-        self.set_files(files, label, source_labels={str(path): "DUBLADO" for path in files})
+        relative_paths = {str(path): Path(folder.name) / path.relative_to(folder) for path in files}
+        self.set_files(files, label, source_labels={str(path): "DUBLADO" for path in files}, relative_paths=relative_paths)
         message = (label + ". Confira os arquivos antes de converter." if files else
                    "Nenhum áudio em dublados personalizados. Gere os áudios na aba DUBLAGEM PERSONALIZADA e carregue novamente.")
         self.status_var.set(message)
@@ -743,14 +775,18 @@ class FormatConverterApp:
     def _output_relative_path(self, source: Path) -> Path:
         """Preserva a subpasta de arquivos importados das pastas do projeto."""
         source = Path(source).expanduser().resolve()
+        key = os.path.normcase(str(source))
+        mapped = getattr(self, "file_relative_by_path", {}).get(key)
+        if mapped is not None:
+            return Path(mapped)
         project_root = Path(getattr(self, "project_root", Path.cwd())).expanduser().resolve()
-        for folder_name in ("WAV ORIGINAIS", "dublado"):
+        for folder_name in ("WAV ORIGINAIS", "dublado", "dublados personalizados"):
             folder = project_root / folder_name
             try:
-                return source.relative_to(folder)
+                return Path(folder_name) / source.relative_to(folder)
             except ValueError:
                 continue
-        return Path(source.name)
+        return Path(source.parent.name) / source.name
 
     def output_target(self, source: Path, output_root: Path, format_name: str) -> Path:
         extension = FORMAT_CHOICES[format_name]["extension"]
@@ -760,12 +796,8 @@ class FormatConverterApp:
             same_as_source = target.resolve() == source.resolve()
         except OSError:
             same_as_source = False
-        if same_as_source or target.exists():
-            target = target.with_name(f"{target.stem}_convertido{extension}")
-        counter = 2
-        while target.exists() and target.resolve() != source.resolve():
-            target = target.with_name(f"{target.stem.split('_convertido')[0]}_convertido_{counter}{extension}")
-            counter += 1
+        if same_as_source:
+            raise ValueError("A pasta de saída faria a conversão substituir o áudio original. Escolha AUDIO FORMATOS CONVERTIDOS ou outra pasta.")
         return target
 
     def start_conversion(self):
@@ -869,6 +901,8 @@ class FormatConverterApp:
             if os.name != "nt":
                 self.queue.put(("dependencies_done", "No Windows, use este botão para preparar FFmpeg/FFplay; neste sistema o PATH deve fornecê-los."))
                 return
+            from shared_audio_tools import prepare_storage
+            prepare_storage(self.project_root)
             if executable_path("ffmpeg", self.project_root) and executable_path("ffplay", self.project_root):
                 self.queue.put(("dependencies_done", "FFmpeg e FFplay já estão disponíveis; download ignorado."))
                 return

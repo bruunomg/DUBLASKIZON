@@ -13,7 +13,7 @@ import batch_tab
 
 
 class Tests(unittest.TestCase):
-    def test_dialog_disables_unused_model_when_engine_changes(self):
+    def test_dialog_shows_single_model_and_remembers_each_engine(self):
         import tkinter as tk
         from tkinter import ttk
         from contextlib import ExitStack
@@ -42,13 +42,15 @@ class Tests(unittest.TestCase):
             def yview(self,*args):pass
             def wait_window(inner):
                 engine=next(w for w in widgets if w.value=='faster-whisper')
-                faster=next(w for w in widgets if w.kw.get('textvariable') and w.kw['textvariable'].get()=='small')
-                whisper=next(w for w in widgets if w.kw.get('textvariable') and w.kw['textvariable'].get()=='medium')
-                self.assertEqual(faster.kw['state'],'readonly');self.assertEqual(whisper.kw['state'],'disabled')
-                engine.set('openai-whisper')
-                self.assertEqual(faster.kw['state'],'disabled');self.assertEqual(whisper.kw['state'],'readonly')
+                model=next(w for w in widgets if w.kw.get('textvariable') and w.kw.get('values')==tuple(translation.MODEL_LABELS.values()))
+                self.assertEqual(model.kw['state'],'readonly');self.assertEqual(model.kw['textvariable'].get(),'Whisper small')
+                model.kw['textvariable'].set('Whisper large-v3')
+                engine.set('openai-whisper');self.assertEqual(model.kw['textvariable'].get(),'Whisper medium')
+                engine.set('faster-whisper');self.assertEqual(model.kw['textvariable'].get(),'Whisper large-v3')
+                self.assertFalse(any(w.kw.get('text')=='WHISPER LARGE-V3 — SELECIONAR PERFIL' for w in widgets))
         with ExitStack() as stack:
-            for module,names in ((tk,('Toplevel','StringVar','Text')),(ttk,('Style','Frame','Label','Combobox','Button','Progressbar','LabelFrame','Scrollbar'))):
+            stack.enter_context(patch.object(translation,'load_last_settings',return_value=translation.settings()))
+            for module,names in ((tk,('Toplevel','StringVar','BooleanVar','Text')),(ttk,('Style','Frame','Label','Combobox','Button','Progressbar','LabelFrame','Scrollbar','Checkbutton'))):
                 for name in names:stack.enter_context(patch.object(module,name,Widget))
             translation.choose_settings(None)
 
@@ -139,14 +141,15 @@ class Tests(unittest.TestCase):
             app=cls.__new__(cls)
         app.audio_by_stem={'one':1,'two':2};app.text_by_stem={'one':1}
         app.auto_translation_var=SimpleNamespace(get=lambda:'0')
-        self.assertEqual(app.available_translation_stems(),['one'])
+        # Navigation remains available even before the Portuguese TXT exists.
+        self.assertEqual(app.available_translation_stems(),['one','two'])
         app.auto_translation_var=SimpleNamespace(get=lambda:'1')
         self.assertEqual(app.available_translation_stems(),['one','two'])
 
-    def worker(self, engine, backend, text='Hello there', same_language=False, gpu_failure=None):
+    def worker(self, engine, backend, text='Hello there', same_language=False, gpu_failure=None, translation_device='auto'):
         with tempfile.TemporaryDirectory() as tmp:
             request=Path(tmp)/'request.json';result=Path(tmp)/'result.json'
-            config=translation.settings(dict(engine=engine,translator=backend,language='Português (Brasil)'))
+            config=translation.settings(dict(engine=engine,translator=backend,language='Português (Brasil)',translation_device=translation_device))
             if gpu_failure:config['device']='cuda'
             request.write_text(json.dumps({'audio':'scene.wav','settings':config}),encoding='utf-8')
             language='pt' if same_language else 'en'
@@ -172,7 +175,7 @@ class Tests(unittest.TestCase):
                 calls.append(url)
                 if url.endswith('/tags'):data={'models':[{'name':config['repository']}]}
                 else:
-                    body=json.loads(request.data);self.assertEqual(body['model'],config['repository']);self.assertEqual(body['keep_alive'],0)
+                    body=json.loads(request.data);self.assertEqual(body['model'],config['repository']);self.assertEqual(body['keep_alive'],0);self.assertEqual(body['options']['num_gpu'],0 if translation_device=='cpu' else -1)
                     data={'response':'Olá','done_reason':'stop'}
                 return io.BytesIO(json.dumps(data).encode())
             modules={'faster_whisper':faster,'whisper':whisper,'argostranslate':argos,'argostranslate.package':package,'argostranslate.translate':translate}
@@ -185,9 +188,12 @@ class Tests(unittest.TestCase):
             if gpu_failure:self.assertEqual(devices,[('cuda','float16'),('cpu','int8')])
             if backend!='argos' and not same_language:self.assertEqual(len(calls),2)
 
+    def test_cpu_only_local_translation_and_automatic_gpu(self):
+        for device in ('cpu','auto'):self.worker('faster-whisper','qwen-game-local',translation_device=device)
+
     def test_two_recognizers_and_three_translators(self):
         for engine in ('faster-whisper','openai-whisper'):
-            for backend in translation.TRANSLATORS:
+            for backend in translation.LOCAL_TRANSLATORS:
                 with self.subTest(engine=engine,backend=backend):self.worker(engine,backend)
 
     def test_same_language_bypasses_translator(self):
@@ -240,6 +246,12 @@ class Tests(unittest.TestCase):
     def test_worker_source_is_valid(self):
         ast.parse(translation.WORKER)
         ast.parse(translation.PREPARE_WORKER)
+
+    def test_faster_whisper_worker_handles_pyav_19_and_installer_pins_compatible_av(self):
+        self.assertIn("kwargs.pop('metadata_errors',None)",translation.WORKER)
+        source=Path(translation.__file__).read_text(encoding='utf-8')
+        self.assertIn("av<19\\n",source)
+        self.assertIn("corrigindo PyAV 19",source)
 
     def test_redub_transcribes_original_and_keeps_chosen_voice(self):
         import review_tab

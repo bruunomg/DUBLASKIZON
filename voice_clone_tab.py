@@ -926,7 +926,8 @@ class VoiceClonePreprocessorApp:
             self.tool_alert_after_id = None
 
     def tool_storage_dir(self) -> Path:
-        return self.project_root / TOOLS_DIR_NAME
+        from shared_audio_tools import prepare_storage
+        return prepare_storage(self.project_root)
 
     def safe_extract_zip(self, archive_path: Path, destination: Path):
         destination.mkdir(parents=True, exist_ok=True)

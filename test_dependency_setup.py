@@ -40,6 +40,33 @@ class BootstrapTests(unittest.TestCase):
         (setup.runtime_root() / "active.json").write_text('{"python":"../../outside.exe"}')
         self.assertIsNone(setup.managed_python())
 
+    def test_silero_install_does_not_replace_torch(self):
+        path = self.active()
+        with patch.object(self.job, 'run', side_effect=[RuntimeError('missing silero'), None, None]) as run:
+            self.job.install_silero_vad(path)
+        install = run.call_args_list[1].args[0]
+        self.assertIn('--no-deps', install)
+        self.assertIn('silero-vad==6.2.3', install)
+        self.assertNotIn('--upgrade', install)
+
+
+    def test_compatible_omnivoice_install_reuses_existing_environment(self):
+        path=self.active()
+        (setup.runtime_root()/'active.json').write_text(json.dumps({'python':path.relative_to(setup.runtime_root()).as_posix(),'variant':'cpu'}),encoding='utf-8')
+        with patch.object(self.job,'run') as run,patch.object(self.job,'ensure_base_python') as base,patch.object(self.job,'download_python') as download:
+            self.job._install_locked('cpu',False,False)
+            base.assert_not_called();download.assert_not_called()
+            self.assertEqual(run.call_count,3)
+            self.assertTrue(all('install' not in call.args[0] for call in run.call_args_list))
+            self.assertEqual(setup.managed_python(),path.resolve())
+
+    def test_reuse_installs_only_missing_optional_dependency(self):
+        path=self.active()
+        (setup.runtime_root()/'active.json').write_text(json.dumps({'python':path.relative_to(setup.runtime_root()).as_posix(),'variant':'cpu'}),encoding='utf-8')
+        with patch.object(self.job,'run',side_effect=[None,None,None,RuntimeError('missing librosa')]),patch.object(self.job,'install_audio_analysis') as analysis,patch.object(self.job,'ensure_base_python') as base:
+            self.job._install_locked('cpu',True,False)
+            analysis.assert_called_once_with(path.resolve());base.assert_not_called()
+
     def test_existing_official_python_skips_maintenance_installer(self):
         installed=self.root/'Python313'/'python.exe'
         installed.parent.mkdir();installed.write_bytes(b'python')
@@ -88,6 +115,13 @@ class BootstrapTests(unittest.TestCase):
     def test_actual_timeout(self):
         with self.assertRaises(TimeoutError):
             self.job.run([sys.executable, "-c", "import time;time.sleep(60)"], timeout=.2)
+
+    def test_stalled_process_is_restarted_then_reported(self):
+        with self.assertRaises(setup.StalledDownload):
+            self.job.run([sys.executable, "-c", "import time;time.sleep(60)"], timeout=10, stall_timeout=.35, stall_retries=1)
+        report=self.job.log.read_text(encoding='utf-8')
+        self.assertIn('TRAVAMENTO DETECTADO',report)
+        self.assertGreaterEqual(report.count('> '),2)
 
     def test_official_environment_ignores_pip_mirrors(self):
         with patch.dict(os.environ, {"PIP_EXTRA_INDEX_URL": "https://example.invalid", "HF_ENDPOINT": "https://example.invalid", "PYTHONPATH": "bad"}):
@@ -145,6 +179,32 @@ class BootstrapTests(unittest.TestCase):
         self.assertTrue(any("omnivoice==0.2.1" in c for c in commands))
         self.assertTrue(any("check" in c for c in commands))
         self.assertTrue(any("--help" in c for c in commands))
+
+    def test_amd_omnivoice_uses_python312_and_official_rocm(self):
+        base=self.root/'python312.exe';base.write_bytes(b'fake');commands=[]
+        def run(args,**kwargs):
+            commands.append([str(a) for a in args])
+            if 'venv' in args:
+                exe=Path(args[-1])/'Scripts'/'python.exe';exe.parent.mkdir(parents=True);exe.write_bytes(b'new')
+        with patch.object(self.job,'ensure_amd_python',return_value=base),patch.object(self.job,'run',side_effect=run),patch.object(setup.shutil,'disk_usage',return_value=type('Disk',(),{'free':30*1024**3})()):
+            self.job._install_locked('rocm721')
+        flat=[' '.join(c) for c in commands]
+        self.assertTrue(any('repo.radeon.com/rocm/windows/rocm-rel-7.2.1' in c for c in flat))
+        self.assertTrue(any('omnivoice==0.2.1' in c for c in flat))
+        self.assertEqual(json.loads((setup.runtime_root()/'active.json').read_text())['variant'],'rocm721')
+
+    def test_rx7600_uses_official_rocm10_gfx1102_packages(self):
+        base=self.root/'python312.exe';base.write_bytes(b'fake');commands=[]
+        def run(args,**kwargs):
+            commands.append([str(a) for a in args])
+            if 'venv' in args:
+                exe=Path(args[-1])/'Scripts'/'python.exe';exe.parent.mkdir(parents=True);exe.write_bytes(b'new')
+        with patch.object(self.job,'ensure_amd_python',return_value=base),patch.object(self.job,'run',side_effect=run),patch.object(setup.shutil,'disk_usage',return_value=type('Disk',(),{'free':30*1024**3})()):
+            self.job._install_locked('rocm100-gfx1102')
+        flat=[' '.join(c) for c in commands]
+        self.assertTrue(any('stable.repo.amd.com/rocm/whl-next/' in c and 'device-gfx1102' in c for c in flat))
+        self.assertTrue(any('torch[device-gfx1102]==2.13.0+rocm10.0.0' in c for c in flat))
+        self.assertEqual(json.loads((setup.runtime_root()/'active.json').read_text())['variant'],'rocm100-gfx1102')
 
     def test_cache_and_inference_routing(self):
         self.active()
@@ -221,6 +281,9 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(setup.detect_processing()['variant'],'cpu')
 
     def test_batch_prefers_managed_but_respects_override(self):
+        self.assertEqual(setup.amd_gpu_supported('AMD Radeon RX 7900 XTX'),'RX 7900 XTX')
+        self.assertIsNone(setup.amd_gpu_supported('AMD Radeon RX 580'))
+        self.assertEqual(len(setup.AMD_PYTHON_SHA256),64)
         import batch_tab
         self.active()
         with patch.dict(os.environ, {"OMNIVOICE_INFER": ""}):
@@ -256,12 +319,16 @@ class BootstrapTests(unittest.TestCase):
             def after(self, ms, callback): self.callbacks.append(callback)
             def winfo_exists(self): return self.exists
             def winfo_screenheight(self): return 1080
+            def winfo_screenwidth(self): return 1920
             def destroy(self): self.exists = False
             def lift(self): pass
             def insert(self, *a): pass
             def index(self, *a): return "1.0"
             def delete(self, *a): pass
             def see(self, *a): pass
+            def create_window(self,*a,**kw):return 1
+            def winfo_class(self):return "Frame"
+            def winfo_children(self):return []
             def yview(self, *a): pass
             def start(self, *a): pass
             def stop(self): pass
@@ -273,7 +340,7 @@ class BootstrapTests(unittest.TestCase):
             def __init__(self, target, **kw): self.target = target
             def start(self): self.target()
         with ExitStack() as stack:
-            for module, names in ((tk, ("Toplevel", "Label", "Text", "StringVar", "BooleanVar")),
+            for module, names in ((tk, ("Toplevel", "Canvas", "Label", "Text", "StringVar", "BooleanVar", "Button")),
                                   (ttk, ("Frame", "LabelFrame", "Label", "Button", "Checkbutton", "Combobox", "Progressbar", "Scrollbar"))):
                 for name in names: stack.enter_context(patch.object(module, name, Widget))
             stack.enter_context(patch.object(setup.threading, "Thread", ImmediateThread))
@@ -293,6 +360,9 @@ class BootstrapTests(unittest.TestCase):
             self.assertEqual(buttons["CANCELAR"].kw["state"], "disabled")
             buttons["1. INSTALAR / REPARAR"].kw["command"]()
             self.assertEqual(buttons["VERIFICAR"].kw["state"], "normal")
+            self.assertFalse(any('FISH' in (name or '').upper() for name in buttons))
+            choices=[w.kw['values'] for w in widgets if 'values' in w.kw]
+            self.assertFalse(any('fishaudio' in str(values).lower() for values in choices))
             buttons["CONTINUAR"].kw["command"]()
             self.assertIsNone(app.dependency_window)
 

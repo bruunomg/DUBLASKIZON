@@ -1,0 +1,51 @@
+{
+  "elapsed_seconds": 26.87,
+  "original_sha256": "2855ba4302d3851210a219a39719222ff1c6c821aae2b4d076e4c4d7650fcac0",
+  "original_preserved": true,
+  "installation": "C:\\Users\\bruun\\Documents\\Codex\\2026-09-16\\coloque-um-bot-o-na-aba\\tmp\\audacity-v8819-isolated\\Audacity",
+  "outputs": {
+    "instrumental": {
+      "path": "C:\\Users\\bruun\\Documents\\Codex\\2026-09-16\\coloque-um-bot-o-na-aba\\tmp\\audacity-v8819-isolated\\project\\revisoes\\audacity_openvino\\68f28882e488c1e08edba254\\instrumental.wav",
+      "duration": 4.45,
+      "frames": 196245,
+      "sample_rate": 44100,
+      "sha256": "3077d960d4a8042c9a117d29b2d3cd644381e3ba9f898c412454dfae0243dc8a",
+      "channels": 1,
+      "sample_width": 2,
+      "rms": 15.805738876638122,
+      "peak": 271.0
+    },
+    "vocals": {
+      "path": "C:\\Users\\bruun\\Documents\\Codex\\2026-09-16\\coloque-um-bot-o-na-aba\\tmp\\audacity-v8819-isolated\\project\\revisoes\\audacity_openvino\\68f28882e488c1e08edba254\\vocals.wav",
+      "duration": 4.45,
+      "frames": 196245,
+      "sample_rate": 44100,
+      "sha256": "0704bf49538cf973e4477b548faed7216e7f8954a6ef5f636017595b19d7ef33",
+      "channels": 1,
+      "sample_width": 2,
+      "rms": 2661.266984321287,
+      "peak": 19194.0
+    },
+    "suppression": {
+      "path": "C:\\Users\\bruun\\Documents\\Codex\\2026-09-16\\coloque-um-bot-o-na-aba\\tmp\\audacity-v8819-isolated\\project\\revisoes\\audacity_openvino\\68f28882e488c1e08edba254\\suppression.wav",
+      "duration": 4.45,
+      "frames": 196245,
+      "sample_rate": 44100,
+      "sha256": "4e14d92289879a574cabca34a8ba2d1a6703d212f44f97a3b737448a775c386b",
+      "channels": 1,
+      "sample_width": 2,
+      "rms": 2650.8715485830426,
+      "peak": 18954.0
+    }
+  },
+  "log": [
+    "12% Iniciando Audacity isolado…",
+    "18% Importando cópia do áudio original…",
+    "25% AUDACITY Music Separation: separando voz e instrumental…",
+    "65% Voz e instrumental separados.",
+    "70% AUDACITY Noise Suppression: tratando somente a voz separada…",
+    "100% Tratamento concluído. Original preservado."
+  ],
+  "method": "Official Audacity portable ZIP, OpenVINO installer payload extracted without registry changes, models downloaded from pinned Intel URLs and SHA256 verified; fresh portable automation profile.",
+  "test_installed_system_modified": false
+}

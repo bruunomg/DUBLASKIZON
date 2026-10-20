@@ -103,8 +103,8 @@ DEFAULT_CONFIG = {
     "language": "pt",
     "instruct": "portuguese accent",
     "audacity_exe": "",
-    "auto_open_after_generate": True,
-    "ask_r_pronunciation": True,
+    "auto_open_after_generate": False,
+    "ask_r_pronunciation": False,
     "other_translation_dir": "",
     "other_translation_root_dir": "",
 }
@@ -139,7 +139,8 @@ def find_audacity_exe(configured: str) -> Path | None:
         if candidate.is_file():
             return candidate
 
-    candidates = []
+    from audacity_setup import installations
+    candidates = [root/'Audacity.exe' for root in installations()]
     for env_name in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
         value = os.environ.get(env_name)
         if value:
@@ -433,12 +434,15 @@ class ReviewApp:
         self.other_audio_listen_button = None
         self.other_audio_confirm_button = None
         self.other_audio_cancel_button = None
-        self.stems = sorted(set(self.audio_by_stem) & set(self.text_by_stem), key=str.casefold)
+        self.stems = sorted(self.audio_by_stem, key=str.casefold)
         self.default_stems = list(self.stems)
         self.scene_sort_mode = "default"
         self.current_index = 0
         self.busy = False
-        self.request_r_var = StringVar(value="1" if bool(self.config.get("ask_r_pronunciation", True)) else "0")
+        self.config['auto_open_after_generate']=False
+        self.config['ask_r_pronunciation']=False
+        self.request_r_var = StringVar(value='0')
+        self.preserve_original_voice_var = StringVar(value='0')
         self.request_character_var = StringVar(value="0")
         self.request_translation_var = StringVar(value="0")
         self.align_original_var = StringVar(value='0')
@@ -460,6 +464,7 @@ class ReviewApp:
         self.status_var = StringVar(value="Pronto")
         self.audio_player.set_review_preferences({
             "align_original_var": self.align_original_var,
+            "preserve_original_voice_var": self.preserve_original_voice_var,
             "translate_missing_var": self.translate_missing_var,
             "auto_open_var": self.auto_open_var if hasattr(self, "auto_open_var") else None,
             "request_character_var": self.request_character_var,
@@ -494,6 +499,7 @@ class ReviewApp:
         self.audio_player.set_review_preferences({
             "auto_open_var": self.auto_open_var,
             "align_original_var": self.align_original_var,
+            "preserve_original_voice_var": self.preserve_original_voice_var,
             "translate_missing_var": self.translate_missing_var,
             "auto_open_command": self.toggle_auto_open,
             "request_character_var": self.request_character_var,
@@ -529,6 +535,8 @@ class ReviewApp:
         Button(project_actions, text="USAR PASTA DO EXE", command=self.project_actions.get("use_exe_folder", lambda: None), bg="#475569", activebackground="#334155", fg="white", activeforeground="white", relief="flat", font=("Segoe UI", 8, "bold"), padx=8, pady=5, cursor="hand2").pack(side="left", padx=(4, 0))
         Button(project_actions, text="TUTORIAL PDF", command=self.project_actions.get("tutorial", lambda: None), bg="#D97706", activebackground="#B45309", fg="white", activeforeground="white", relief="flat", font=("Segoe UI", 8, "bold"), padx=8, pady=5, cursor="hand2").pack(side="left", padx=(4, 0))
 
+        from speech_completeness import mount_controls
+        mount_controls(self.root, ROOT)
         main = ttk.Frame(self.root)
         main.pack(fill="both", expand=True, padx=12, pady=(0, 8))
         self.main_pane = ttk.PanedWindow(main, orient="horizontal")
@@ -556,7 +564,7 @@ class ReviewApp:
         self.scene_sort_combo = ttk.Combobox(
             scene_list_header,
             textvariable=self.scene_sort_var,
-            values=("Padrão", "Aprovadas primeiro", "Rejeitadas primeiro", "Aprovadas e rejeitadas primeiro"),
+            values=("Padrão", "Avaliar primeiro", "Aprovadas primeiro", "Rejeitadas primeiro", "Aprovadas e rejeitadas primeiro"),
             state="readonly",
             width=25,
         )
@@ -574,12 +582,27 @@ class ReviewApp:
         self.scene_list.bind("<<ListboxSelect>>", self.on_scene_selected)
         self.scene_list.bind("<Double-Button-1>", self.play_selected_scene)
         self.scene_list.bind("<Button-3>", self.show_scene_context_menu)
+        self.review_totals_var=StringVar(value='Padrão (total): 0 | Sem avaliação: 0\nAvaliar: 0 | Aprovadas: 0 | Rejeitadas: 0')
+        ttk.Label(left,textvariable=self.review_totals_var,wraplength=360,font=('Segoe UI',8,'bold')).pack(fill='x',pady=(4,0))
         scene_audio_controls = ttk.Frame(left)
         scene_audio_controls.pack(fill="x", pady=(6, 0))
         self.play_scene_button = Button(scene_audio_controls, text="▶ OUVIR CENA", command=self.play_selected_scene, bg="#0F766E", activebackground="#115E59", fg="white", relief="flat", padx=8, pady=4, cursor="hand2")
         self.play_scene_button.pack(side="left", fill="x", expand=True, padx=(0, 3))
         self.play_all_button = Button(scene_audio_controls, text="▶ OUVIR TODOS", command=self.play_all_scenes, bg="#7C3AED", activebackground="#6D28D9", fg="white", relief="flat", padx=8, pady=4, cursor="hand2")
         self.play_all_button.pack(side="left", fill="x", expand=True, padx=(3, 0))
+        rejected_bar=ttk.Frame(left);rejected_bar.pack(fill='x',pady=(4,0))
+        gear_box=Frame(rejected_bar,width=46,height=38)
+        gear_box.pack(side='right',padx=(4,0));gear_box.pack_propagate(False)
+        self.rejected_settings_button=Button(gear_box,text='⚙',font=('Segoe UI Symbol',14),command=self.configure_rejected_batch,relief='flat',padx=5,pady=3,cursor='hand2')
+        self.rejected_settings_button.pack(fill='both',expand=True)
+        apply_button_style(self.rejected_settings_button,getattr(self,'theme',{}),'secondary')
+        ttk.Button(rejected_bar,text="REDUBLAR TODOS REJEITADOS [REFAZER]",command=self.redub_all_rejected).pack(side='left',fill='x',expand=True)
+
+        finish_panel=ttk.Frame(left);finish_panel.pack(fill='x',pady=(5,0))
+        ttk.Button(finish_panel,text='CORTAR SILÊNCIO INÍCIO/FIM — TODOS',command=lambda:self.finish_all_audio(trim=True)).pack(fill='x',pady=2)
+        ttk.Button(finish_panel,text='VOLUME MÁXIMO SEGURO — TODOS',command=lambda:self.finish_all_audio(max_volume=True)).pack(fill='x',pady=2)
+        self.finishing_progress=ttk.Progressbar(finish_panel,mode='determinate');self.finishing_progress.pack(fill='x',pady=2)
+        ttk.Button(finish_panel,text='PARAR AJUSTES',command=lambda:getattr(self,'finishing_cancel',threading.Event()).set()).pack(fill='x')
 
         ttk.Label(right, textvariable=self.scene_var, font=("Segoe UI", 14, "bold")).pack(anchor="w")
         ttk.Label(right, textvariable=self.meta_var).pack(anchor="w", pady=(4, 0))
@@ -692,7 +715,7 @@ class ReviewApp:
 
         actions = ttk.LabelFrame(right, text="Revisão", padding=10)
         actions.pack(fill="x", pady=(0, 8))
-        self.auto_open_var = StringVar(value="1" if bool(self.config.get("auto_open_after_generate", True)) else "0")
+        self.auto_open_var = StringVar(value='0')
         self.auto_open_check = ttk.Checkbutton(actions, text="Abrir Audacity após redublar", variable=self.auto_open_var, onvalue="1", offvalue="0", command=self.toggle_auto_open)
         self.auto_open_check.grid(row=0, column=3, pady=(0, 4), padx=6, sticky="w")
         self.request_r_check = ttk.Checkbutton(actions, text="Pedido de alterar pronúncia do R", variable=self.request_r_var, onvalue="1", offvalue="0", command=self.toggle_r_request)
@@ -1196,8 +1219,8 @@ class ReviewApp:
             return
         self._copy_context_value(str(path.parent), f"Local da pasta {label} copiado: {path.parent}")
 
-    def show_scene_context_menu(self, event):
-        stem = self._scene_stem_from_context_event(event)
+    def show_scene_context_menu(self, event, stem=None):
+        stem = stem or self._scene_stem_from_context_event(event)
         if not stem:
             return "break"
         theme = getattr(self, "theme", {})
@@ -1288,7 +1311,9 @@ class ReviewApp:
         """Retorna a lista na ordem solicitada, sem perder o conjunto original."""
         base = list(getattr(self, "default_stems", self.stems))
         mode = getattr(self, "scene_sort_mode", "default")
-        if mode == "approved_first":
+        if mode == "evaluate_first":
+            rank = {"avaliar": 0, "pendente": 1, "rejeitada": 2, "aprovada": 3}
+        elif mode == "approved_first":
             rank = {"aprovada": 0, "pendente": 1, "rejeitada": 2}
         elif mode == "rejected_first":
             rank = {"rejeitada": 0, "pendente": 1, "aprovada": 2}
@@ -1301,6 +1326,7 @@ class ReviewApp:
     def _on_scene_sort_selected(self, _event=None) -> None:
         selected_label = self.scene_sort_var.get()
         self.scene_sort_mode = {
+            "Avaliar primeiro": "evaluate_first",
             "Aprovadas primeiro": "approved_first",
             "Rejeitadas primeiro": "rejected_first",
             "Aprovadas e rejeitadas primeiro": "decided_first",
@@ -1323,7 +1349,8 @@ class ReviewApp:
         previous = self.current_stem()
         view = self.scene_list.yview()
         mode = getattr(self, 'scene_sort_mode', 'default')
-        ranks = {'approved_first': {'aprovada':0, 'pendente':1, 'rejeitada':2},
+        ranks = {'evaluate_first': {'avaliar':0, 'pendente':1, 'rejeitada':2, 'aprovada':3},
+                 'approved_first': {'aprovada':0, 'pendente':1, 'rejeitada':2},
                  'rejected_first': {'rejeitada':0, 'pendente':1, 'aprovada':2},
                  'decided_first': {'aprovada':0, 'rejeitada':1, 'pendente':2}}
         def key(value):
@@ -1334,20 +1361,35 @@ class ReviewApp:
         if stem not in self.default_stems:
             self.default_stems.append(stem)
         status = self.state.get(self.review_state_key(stem), {}).get('status', 'pendente')
-        marker = {'aprovada':'[OK]', 'rejeitada':'[REFAZER]'}.get(status, '[ ]')
+        marker = {'aprovada':'[OK]', 'rejeitada':'[REFAZER]', 'avaliar':'[AVALIAR]'}.get(status, '[ ]')
         dark = getattr(self, 'theme', {}).get('root') != '#F5F6FA'
-        color = {'aprovada':'#60A5FA' if dark else '#0057B8', 'rejeitada':'#F87171' if dark else '#C00000'}.get(status, '#F8FAFC' if dark else '#333333')
+        color = {'aprovada':'#60A5FA' if dark else '#0057B8', 'rejeitada':'#F87171' if dark else '#C00000', 'avaliar':'#FBBF24' if dark else '#9A6700'}.get(status, '#F8FAFC' if dark else '#333333')
         row = (f'{marker} {self.scene_display_name(stem)}', color)
         self.scene_list.insert(index, row[0])
         self.scene_list.itemconfig(index, foreground=color)
         if getattr(self, '_scene_rows', None) is not None:
             self._scene_rows.insert(index, row)
         self.scene_count_var.set(f'{self.audio_source_var.get().upper()} ({len(self.stems)} áudios)')
+        totals=getattr(self,'_review_totals_counts',None)
+        if totals is not None:
+            totals=dict(totals);totals[status if status in totals else 'pendente']+=1
+        ReviewApp.update_review_totals(self,totals)
         if previous is not None:
             self.current_index = self.stems.index(previous)
             self.scene_list.yview_moveto(view[0])
         elif not getattr(self, 'busy', False):
             self.select_scene(index)
+
+    def update_review_totals(self, counts=None):
+        if counts is None:
+            counts={key:0 for key in ('pendente','avaliar','aprovada','rejeitada')}
+            for stem in self.stems:
+                status=self.state.get(self.review_state_key(stem),{}).get('status','pendente')
+                counts[status if status in counts else 'pendente']+=1
+        self._review_totals_counts=dict(counts)
+        variable=getattr(self,'review_totals_var',None)
+        if variable is not None:
+            variable.set(f"Padrão (total): {sum(counts.values())} | Sem avaliação: {counts['pendente']}\nAvaliar: {counts['avaliar']} | Aprovadas: {counts['aprovada']} | Rejeitadas: {counts['rejeitada']}")
 
     def refresh_scene_list(self, preserve_stem: str | None = None) -> None:
         if preserve_stem is None and getattr(self, "stems", None) and 0 <= getattr(self, "current_index", -1) < len(self.stems):
@@ -1355,12 +1397,15 @@ class ReviewApp:
         self.stems = self._ordered_scene_stems()
         self.scene_count_var.set(f"{self.audio_source_var.get().upper()} ({len(self.stems)} áudios)")
         rows=[]
+        totals={key:0 for key in ('pendente','avaliar','aprovada','rejeitada')}
         dark = getattr(self, "theme", {}).get("root") != "#F5F6FA"
         for index, stem in enumerate(self.stems):
             status = self.state.get(self.review_state_key(stem), {}).get("status", "pendente")
-            marker = {"aprovada": "[OK]", "rejeitada": "[REFAZER]"}.get(status, "[ ]")
-            color = {"aprovada": "#60A5FA" if dark else "#0057B8", "rejeitada": "#F87171" if dark else "#C00000"}.get(status, "#F8FAFC" if dark else "#333333")
+            totals[status if status in totals else 'pendente']+=1
+            marker = {"aprovada": "[OK]", "rejeitada": "[REFAZER]", "avaliar":"[AVALIAR]"}.get(status, "[ ]")
+            color = {"aprovada": "#60A5FA" if dark else "#0057B8", "rejeitada": "#F87171" if dark else "#C00000", "avaliar":"#FBBF24" if dark else "#9A6700"}.get(status, "#F8FAFC" if dark else "#333333")
             rows.append((f"{marker} {self.scene_display_name(stem)}",color))
+        ReviewApp.update_review_totals(self,totals)
         previous=getattr(self,'_scene_rows',None)
         if rows!=previous:
             if previous is not None and len(previous)==len(rows) and [r[0].split('] ',1)[-1] for r in rows]==[r[0].split('] ',1)[-1] for r in previous]:
@@ -1369,8 +1414,18 @@ class ReviewApp:
                         self.scene_list.delete(index);self.scene_list.insert(index,row[0]);self.scene_list.itemconfig(index,foreground=row[1])
             else:
                 self.scene_list.delete(0,END)
-                if rows:self.scene_list.insert(END,*(row[0] for row in rows))
-                for index,row in enumerate(rows):self.scene_list.itemconfig(index,foreground=row[1])
+                if rows:
+                    for start in range(0, len(rows), 1000):
+                        self.scene_list.insert(END, *(row[0] for row in rows[start:start + 1000]))
+                # A grande maioria está pendente e já usa a cor global da lista.
+                # Configurar individualmente 17 mil linhas era o maior bloqueio
+                # da interface; só os estados destacados precisam de itemconfig.
+                normal_color = "#F8FAFC" if dark else "#333333"
+                if hasattr(self.scene_list, "configure"):
+                    self.scene_list.configure(fg=normal_color)
+                for index, row in enumerate(rows):
+                    if row[1] != normal_color:
+                        self.scene_list.itemconfig(index, foreground=row[1])
             self._scene_rows=rows
         if self.stems:
             if preserve_stem in self.stems:
@@ -1388,16 +1443,21 @@ class ReviewApp:
     def on_scene_selected(self, _event=None) -> None:
         selection = self.scene_list.curselection()
         if selection:
-            self.select_scene(selection[0])
+            active = self.scene_list.index('active')
+            self.select_scene(active if active in selection else selection[0], preserve_selection=True)
 
-    def select_scene(self, index: int) -> None:
+    def select_scene(self, index: int, preserve_selection: bool = False) -> None:
         if not self.stems:
             return
         self.current_index = max(0, min(index, len(self.stems) - 1))
-        self.scene_list.selection_clear(0, END)
-        self.scene_list.selection_set(self.current_index)
+        if not preserve_selection:
+            self.scene_list.selection_clear(0, END)
+            self.scene_list.selection_set(self.current_index)
         self.scene_list.see(self.current_index)
         self.update_details()
+        player = getattr(self, 'audio_player', None)
+        if player is not None and hasattr(player, 'follow_scene_selection'):
+            player.follow_scene_selection(self.stems[self.current_index], [self.current_output_dir() / f'{key}.wav' for key in self.stems], self.stems)
 
     def current_stem(self) -> str | None:
         if not self.stems:
@@ -1423,7 +1483,7 @@ class ReviewApp:
                     key = path.relative_to(CUSTOM_OUTPUT_DIR).with_suffix("").as_posix()
                 except ValueError:
                     continue
-                if key in self.audio_by_stem and key in self.text_by_stem:
+                if key in self.audio_by_stem:
                     found.append(key)
         return sorted(set(found), key=str.casefold)
 
@@ -1442,7 +1502,7 @@ class ReviewApp:
         else:
             self.audio_source_mode = "normal"
             self.audio_source_var.set("Dublados")
-            self.default_stems = sorted(set(self.audio_by_stem) & set(self.text_by_stem), key=str.casefold)
+            self.default_stems = sorted(self.audio_by_stem, key=str.casefold)
         if hasattr(self.audio_player, "set_dubbed_folder_name"):
             self.audio_player.set_dubbed_folder_name("dublados personalizados" if self.audio_source_mode == "custom" else "dublado")
         self.stems = list(self.default_stems)
@@ -2076,12 +2136,16 @@ class ReviewApp:
         if not stem:
             return
         try:
-            message = open_audio_pair(
-                self.audio_by_stem[stem],
-                self.current_output(stem),
-                stem,
-                self.config,
-            )
+            from scene_audio_choices import sources, choose
+            selected = choose(self.root, sources(ROOT, self.audio_by_stem[stem], self.current_output(stem)), 'Abrir faixas no Audacity')
+            if selected is None: return
+            audacity = find_audacity_exe(str(self.config.get('audacity_exe', '')))
+            if not audacity: raise ValueError('Configure o caminho do Audacity antes de abrir as faixas.')
+            lof = _revision_scene_dir(stem) / '.audacity_faixas.lof'
+            lof.parent.mkdir(parents=True, exist_ok=True)
+            lof.write_text('# Faixas selecionadas\n' + ''.join(f'file "{path.resolve()}"\n' for _, path in selected), encoding='utf-8')
+            subprocess.Popen([str(audacity), str(lof)])
+            message = f'Aberto no Audacity: {len(selected)} faixa(s) — {stem}'
             self.status_var.set(message)
             self._log_central(f"Audacity aberto para a cena {stem}: {message}", "ok")
         except Exception as exc:
@@ -2161,7 +2225,7 @@ class ReviewApp:
         if (requested is not None and requested.get()=="1") or self.needs_missing_translation(stem):
             from audio_translation import choose_settings, translation_python
             provider=getattr(self,"translation_settings_provider",None)
-            translation_config=choose_settings(self.audio_player.window or self.root,provider() if callable(provider) else {})
+            translation_config=(dict(self._rejected_translation) if getattr(self,'_rejected_active',None)==stem and getattr(self,'_rejected_translation',None) else choose_settings(self.audio_player.window or self.root,provider() if callable(provider) else {}))
             if translation_config is None:return
             try:translation_python()
             except Exception as exc:
@@ -2202,12 +2266,15 @@ class ReviewApp:
         current = self.current_output(stem)
         destination_note = "A versão atual será preservada em revisoes antes da substituição." if current.exists() else "A nova versão será criada em dublado; não há dublado anterior para arquivar."
         r_label = i18n.tr(self._r_mode_label(r_mode))
-        if not messagebox.askyesno(
-            "Refazer cena",
-            f"Regenerar {stem} usando a referência:\n{reference_audio.name}\n\ne o texto:\n{source_label}\n\n{i18n.tr('A pronúncia do R desta vez será: ')}{r_label}\n\n{destination_note}",
-            parent=self.root,
-        ):
-            return
+        if getattr(self,"_rejected_active",None) != stem:
+            prompt=f"Regenerar {stem} usando a referência:\n{reference_audio.name}\n\ne o texto:\n{source_label}\n\n{i18n.tr('A pronúncia do R desta vez será: ')}{r_label}\n\n{destination_note}"
+            player=getattr(self,'active_scene_player',None) or self.audio_player
+            treated=getattr(player,'audacity_ui',None)
+            if treated is not None and player.window is not None and player._scene_text_key()==stem:
+                confirmed,reference_audio=treated.choose_reference(reference_audio,'Refazer cena',prompt)
+            else:
+                confirmed=messagebox.askyesno('Refazer cena',prompt,parent=self.root)
+            if not confirmed:return
 
         try:
             if translation_config is not None:
@@ -2217,7 +2284,11 @@ class ReviewApp:
             elif use_other:
                 text = self.selected_other_translation_text.strip()
             else:
-                text = self.text_by_stem[stem].read_text(encoding="utf-8-sig").strip()
+                text_file=self.text_by_stem.get(stem) or (TEXT_DIR / f'{stem}.txt')
+                if not text_file.is_file():
+                    messagebox.showwarning('TXT ausente', 'Adicione ou salve o texto da cena, escolha outra tradução ou ative Transcrever e traduzir quando faltar TXT.', parent=self.root)
+                    return
+                text = text_file.read_text(encoding="utf-8-sig").strip()
         except Exception as exc:
             messagebox.showerror("TXT", f"Não foi possível ler o texto:\n{exc}")
             return
@@ -2229,6 +2300,8 @@ class ReviewApp:
         target = current
         self.busy = True
         self.regen_cancel_requested = False
+        natural=getattr(self,"preserve_original_voice_var",None)
+        self.regen_preserve_original_voice=natural is not None and natural.get() == "1"
         self.regen_stage_events = queue.SimpleQueue()
         self.regen_started_at = time.monotonic()
         self.regen_stem = stem
@@ -2251,7 +2324,136 @@ class ReviewApp:
         thread = threading.Thread(target=self._run_generation, args=(stem, text, target, current, reference_audio, r_mode), daemon=True)
         thread.start()
 
+    def finish_all_audio(self,trim=False,max_volume=False):
+        if self.busy or not getattr(self,'audio_finishing_allowed',lambda:True)():
+            self.status_var.set('Aguarde a dublagem ou ajuste atual terminar.');return
+        if getattr(self.audio_player,'audio_edit_dirty',False) or getattr(self.audio_player,'audio_transform_busy',False):
+            messagebox.showinfo('Ajustar áudios','Salve ou descarte a edição em Ouvir cena antes de aplicar em todos.',parent=self.root);return
+        paths=list(dict.fromkeys(self.current_output(stem) for stem in getattr(self,'default_stems',self.stems) if self.current_output(stem).is_file()))
+        if not paths:messagebox.showinfo('Ajustar áudios','Nenhum áudio dublado disponível nesta lista.',parent=self.root);return
+        label='cortar somente o silêncio do início e fim' if trim else 'aumentar o volume até o limite seguro de -1 dBFS'
+        if not messagebox.askyesno('Aplicar em todos',f'Aplicar {label} em {len(paths)} áudios dublados? As versões anteriores serão preservadas em revisoes. Os originais não serão alterados.',parent=self.root):return
+        self.audio_player.stop(announce=False);self.busy=True;self.bulk_finishing_busy=True;self.finishing_cancel=threading.Event()
+        self.root.bind('<Destroy>',lambda event:self.finishing_cancel.set() if event.widget is self.root else None,add='+')
+        self.finishing_progress.configure(maximum=len(paths),value=0);events=queue.Queue()
+        def worker():
+            from audio_player import apply_dubbed_finishing
+            changed=errors=processed=0
+            try:
+                for index,path in enumerate(paths,1):
+                    if self.finishing_cancel.is_set():break
+                    try:
+                        detail=apply_dubbed_finishing(path,ROOT,trim=trim,max_volume=max_volume)
+                        changed+=int(detail['changed']);message=f'{index}/{len(paths)} {path.name}: corte {detail["removed_seconds"]:.3f}s; volume {detail["gain_db"]:+.2f} dB.'
+                    except Exception as exc:errors+=1;message=f'{index}/{len(paths)} ERRO {path.name}: {exc}'
+                    processed=index;events.put(('progress',index,message))
+            finally:events.put(('done',processed,changed,errors))
+        def poll():
+            if not self.root.winfo_exists():self.finishing_cancel.set();return
+            for _ in range(50):
+                try:event=events.get_nowait()
+                except queue.Empty:break
+                if event[0]=='progress':self.finishing_progress.configure(value=event[1]);self.status_var.set(event[2]);self._log_central(event[2])
+                else:
+                    self.busy=False;self.bulk_finishing_busy=False;self.status_var.set(f'Ajustes: {event[1]}/{len(paths)} processados; {event[2]} alterados; {event[3]} erros. Versões anteriores em revisoes.')
+                    self._log_central(self.status_var.get());self.refresh_scene_list()
+                    # Invalidate cached waveform/edit data; reopen to hear the saved file.
+                    if self.audio_player.window is not None:self.audio_player.close_window()
+                    return
+            self.root.after(100,poll)
+        threading.Thread(target=worker,daemon=True).start();self.root.after(100,poll)
+
+    def configure_rejected_batch(self):
+        if self.busy or getattr(self,'_rejected_queue',None):return
+        import tkinter as tk
+        theme=getattr(self,'theme',{}) or {}
+        surface=theme.get('surface','#202B3B');foreground=theme.get('text','#F8FAFC')
+        field=theme.get('input',surface);field_text=theme.get('input_text',foreground)
+        window=Toplevel(self.root);window.title('Configurar redublagem dos rejeitados');window.geometry('650x460')
+        window.configure(bg=surface);window.transient(self.root)
+        window.option_add('*TCombobox*Listbox.background',field)
+        window.option_add('*TCombobox*Listbox.foreground',field_text)
+        window.option_add('*TCombobox*Listbox.selectBackground',theme.get('select','#2563EB'))
+        style=ttk.Style(window)
+        style.configure('RejectedSettings.TCombobox',fieldbackground=field,background=surface,foreground=field_text)
+        style.map('RejectedSettings.TCombobox',fieldbackground=[('readonly',field)],foreground=[('readonly',field_text)])
+        labels=[('auto_open_var','Abrir Audacity após redublar'),('request_r_var','Alterar pronúncia do R'),('align_original_var','Alinhar ritmo e duração ao original'),('preserve_original_voice_var','Manter voz natural do áudio original'),('request_character_var','Alterar personagem da dublagem'),('request_translation_var','Transcrever e traduzir original'),('translate_missing_var','Transcrever e traduzir quando faltar TXT')]
+        current=getattr(self,'rejected_options',{})
+        variables={}
+        for key,label in labels:
+            variable=StringVar(window,value=current.get(key,getattr(self,key).get()))
+            variables[key]=variable
+            tk.Checkbutton(window,text=label,variable=variable,onvalue='1',offvalue='0',bg=surface,fg=foreground,activebackground=surface,activeforeground=foreground,selectcolor=field,anchor='w',font=('Segoe UI',10)).pack(anchor='w',padx=14,pady=5)
+        tk.Label(window,text='Pronúncia do R para o lote:',bg=surface,fg=foreground,font=('Segoe UI',10)).pack(anchor='w',padx=14)
+        combo=ttk.Combobox(window,state='readonly',style='RejectedSettings.TCombobox',values=[label for label,mode in R_PRONUNCIATION_CHOICES]);combo.pack(fill='x',padx=14)
+        combo.current(next((i for i,(_,mode) in enumerate(R_PRONUNCIATION_CHOICES) if mode==current.get('r_mode')),0))
+        tk.Label(window,bg=surface,fg=foreground,text='Personagem e transcrição/tradução são escolhidos uma vez ao iniciar o lote.',wraplength=610).pack(anchor='w',padx=14,pady=10)
+        def save():
+            self.rejected_options={key:var.get() for key,var in variables.items()}
+            self.rejected_options['r_mode']=R_PRONUNCIATION_CHOICES[combo.current()][1]
+            window.destroy()
+        save_button=Button(window,text='SALVAR CONFIGURAÇÃO DO LOTE',command=save,relief='flat',font=('Segoe UI',10,'bold'),pady=8)
+        apply_button_style(save_button,theme,'primary')
+        save_button.pack(fill='x',padx=14,pady=12)
+        window.update_idletasks()
+        window.minsize(590,window.winfo_reqheight()+10)
+
+    def _restore_rejected_options(self):
+        for key,value in getattr(self,'_rejected_previous',{}).items():getattr(self,key).set(value)
+        if hasattr(self,'_rejected_old_auto'):self.config['auto_open_after_generate']=self._rejected_old_auto
+        self._rejected_previous={};self._rejected_run_options=None
+
+    def redub_all_rejected(self):
+        if self.busy or getattr(self,'_rejected_queue',None):
+            self.status_var.set('Aguarde a redublagem atual terminar.');return
+        stems=[stem for stem in self.stems if self.state.get(self.review_state_key(stem),{}).get('status') == 'rejeitada']
+        if not stems:
+            messagebox.showinfo('Rejeitados','Não há cenas marcadas [REFAZER] nesta lista.',parent=self.root);return
+        if not messagebox.askyesno('Redublar rejeitados',f'Redublar {len(stems)} cenas rejeitadas? Versões anteriores serão preservadas. Cenas concluídas ficarão [AVALIAR].',parent=self.root):return
+        options=dict(getattr(self,'rejected_options',{}))
+        names=('auto_open_var','request_r_var','align_original_var','preserve_original_voice_var','request_character_var','request_translation_var','translate_missing_var')
+        for key in names:options.setdefault(key,getattr(self,key).get())
+        self._rejected_reference=None
+        if options['request_character_var']=='1':
+            from personalized_dubbing_tab import choose_personalized_voice
+            picker=getattr(self,'voice_model_picker',None) or (lambda owner:choose_personalized_voice(owner,self.theme,ROOT))
+            self._rejected_reference=picker(self.root)
+            if self._rejected_reference is None:return
+        self._rejected_translation=None
+        if options['request_translation_var']=='1' or options['translate_missing_var']=='1':
+            from audio_translation import choose_settings
+            provider=getattr(self,'translation_settings_provider',None)
+            self._rejected_translation=choose_settings(self.root,provider() if callable(provider) else {})
+            if self._rejected_translation is None:return
+        self._rejected_previous={key:getattr(self,key).get() for key in names}
+        self._rejected_old_auto=self.config.get('auto_open_after_generate',False)
+        self._rejected_run_options=options
+        self._rejected_queue=list(stems)
+        self._next_rejected()
+
+    def _next_rejected(self):
+        if self.busy:
+            self.root.after(250,self._next_rejected);return
+        pending=getattr(self,'_rejected_queue',[])
+        if not pending:
+            self._rejected_active=None
+            self._restore_rejected_options();return
+        stem=pending.pop(0)
+        if stem not in self.stems:
+            self.root.after(0,self._next_rejected);return
+        self.select_scene(self.stems.index(stem))
+        self._rejected_active=stem
+        options=getattr(self,'_rejected_run_options',None) or {}
+        for key,value in options.items():
+            if key!='r_mode':getattr(self,key).set(value)
+        self.config['auto_open_after_generate']=options.get('auto_open_var','0')=='1'
+        self.alternate_reference_audio=getattr(self,'_rejected_reference',None)
+        if options.get('request_r_var')=='1':self.regen_r_override=options.get('r_mode','unchanged')
+        self.regenerate_scene()
+        self.root.after(250,self._next_rejected)
+
     def control_generation(self, after_scene=False):
+        self._rejected_queue=[]
         if self.busy:
             if after_scene:
                 self.status_var.set('A cena atual será concluída; a redublagem individual termina após esta cena.')
@@ -2264,18 +2466,48 @@ class ReviewApp:
             callback(getattr(self, 'audio_source_mode', 'normal'), after_scene)
 
     def _run_cancellable_generation(self, command, **kwargs):
-        process = subprocess.Popen(command, **kwargs)
-        while process.poll() is None:
-            if getattr(self, 'regen_cancel_requested', False):
-                process.terminate()
-                try:
-                    process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-                    process.wait()
-                raise RuntimeError('Redublagem cancelada; áudio anterior preservado.')
+        personalized = kwargs.pop('personalized_watchdog', False)
+        from warm_inference import review_memory_cache
+        while review_memory_cache.preloading:
+            if getattr(self,'regen_cancel_requested',False):raise RuntimeError('Redublagem cancelada durante a preparação do motor.')
             time.sleep(.1)
-        return subprocess.CompletedProcess(command, process.returncode)
+        local_pool=None
+        try:
+            from warm_inference import WarmInference,LoggedScene
+            if WarmInference.eligible(command) and (not review_memory_cache.enabled or not review_memory_cache.memory_ok()):
+                review_memory_cache.evict_idle('Liberado para geração isolada')
+                local_pool=WarmInference()
+                scene=local_pool.start(command,**kwargs)
+                process=LoggedScene(scene,kwargs['stdout'],lambda code:None)
+            else:process = review_memory_cache.start(command, **kwargs)
+            started = last_activity = time.monotonic()
+            output_stream = kwargs.get('stdout')
+            last_size = 0
+            while process.poll() is None:
+                now = time.monotonic()
+                if personalized and output_stream is not None:
+                    try:
+                        size = os.fstat(output_stream.fileno()).st_size
+                        if size != last_size:
+                            last_size = size
+                            last_activity = now
+                    except (OSError, ValueError, AttributeError):
+                        pass
+                stalled = personalized and (now-last_activity > 90 or now-started > 180)
+                if getattr(self, 'regen_cancel_requested', False) or stalled:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+                    if stalled:
+                        raise RuntimeError('Redublagem personalizada interrompida: motor sem novas mensagens por 90 segundos ou limite da correção manual de 3 minutos atingido. Áudio anterior preservado. Envie a última mensagem do processo para identificar a causa; esse limite não confirma defeito no áudio.')
+                    raise RuntimeError('Redublagem cancelada; áudio anterior preservado.')
+                time.sleep(.1)
+            return subprocess.CompletedProcess(command, process.returncode)
+        finally:
+            if local_pool is not None:local_pool.close()
 
     def _run_generation(self, stem: str, text: str, target: Path, current: Path, reference_audio: Path, r_mode: str = "unchanged") -> None:
         backup_path = None
@@ -2285,7 +2517,8 @@ class ReviewApp:
             selected_model=getattr(self,'regen_voice_model',self.config['model'])
             # Preserve legacy discovery hooks for OmniVoice installations.
             from f5_backend import MODEL as F5_MODEL, validate
-            infer_prefix = find_voice_command(selected_model) if selected_model == F5_MODEL else find_omnivoice_command()
+            from directml_backend import MODEL as DML_MODEL, validate as validate_dml
+            infer_prefix = find_voice_command(selected_model)
             if not infer_prefix:
                 self.root.after(0, lambda: self._generation_failed(stem, "Não encontrei o OmniVoice. Instale o pacote ou defina OMNIVOICE_INFER."))
                 return
@@ -2303,7 +2536,10 @@ class ReviewApp:
                     on_result=lambda value,path:self._generated_text_ready(stem,value,path))
             from audio_translation import synthesis_settings
             voice_model, instruction=synthesis_settings(language,str(selected_model),str(self.config['instruct']))
+            from qwen_backend import MODEL as QWEN_MODEL, validate as validate_qwen
+            if voice_model == QWEN_MODEL:validate_qwen(language)
             if voice_model == F5_MODEL:validate(language)
+            elif voice_model == DML_MODEL:validate_dml(language)
             if language not in ('pt','Portuguese'):r_mode='unchanged'
             command = [
                 *infer_prefix,
@@ -2320,40 +2556,53 @@ class ReviewApp:
                 "--output",
                 str(temporary_target),
             ]
+            from voice_reference import protect_reference_command
+            command = protect_reference_command(command, voice_model)
+            from speech_completeness import verified_command
+            personalized = target.is_relative_to(CUSTOM_OUTPUT_DIR)
+            command = verified_command(command, voice_model, ROOT, personalized_pauses=personalized)
             result = run_observed(command, lambda c,d,p: self.regen_stage_events.put((c,d,p)),
-                                  runner=self._run_cancellable_generation, text=True, stderr=subprocess.STDOUT, **hidden_process_kwargs())
+                                  runner=self._run_cancellable_generation, personalized_watchdog=personalized,
+                                  text=True, stderr=subprocess.STDOUT, **hidden_process_kwargs())
+            if (int(result.returncode)&0xFFFFFFFF)==0xC0000005 and 'omnivoice' in voice_model.lower() and len(command)>=4 and command[2]=='-c' and not getattr(self,'regen_cancel_requested',False):
+                from generation_progress import emit_process_line
+                emit_process_line('GERAÇÃO — '+str(stem),'RECUPERAÇÃO: falha nativa; uma nova tentativa com reconhecimento na CPU.')
+                command=list(command);command[3]='# DUBLASKIZON_ASR_CPU_RECOVERY\n'+command[3]
+                temporary_target.unlink(missing_ok=True)
+                result=run_observed(command,lambda c,d,p:self.regen_stage_events.put((c,d,p)),runner=self._run_cancellable_generation,personalized_watchdog=personalized,text=True,stderr=subprocess.STDOUT,**hidden_process_kwargs())
             if result.returncode != 0 or not temporary_target.exists():
                 details = (result.stdout or "").strip()
                 suffix = f"\n\n{details[-2000:]}" if details else ""
-                backend_name='F5-TTS Russian' if voice_model == F5_MODEL else 'OmniVoice'
+                backend_name=('F5-TTS Russian' if voice_model == F5_MODEL else
+                              'F5-TTS PT-BR DirectML' if voice_model == DML_MODEL else 'OmniVoice')
                 raise RuntimeError(f"{backend_name} terminou com código {result.returncode}.{suffix}")
+            if personalized:
+                self.regen_stage_events.put((100,99,'Síntese concluída; finalizando alinhamento e salvamento'))
             if getattr(self, 'regen_alignment_settings', None):
                 from batch_tab import BatchApp
                 from types import SimpleNamespace
                 helper = SimpleNamespace(run_alignment_settings=self.regen_alignment_settings,
                                          cancel_requested=getattr(self, 'regen_cancel_requested', False), current_process=None)
                 BatchApp.align_generated_audio(helper, temporary_target, self.audio_by_stem[stem])
-            elif target.is_relative_to(CUSTOM_OUTPUT_DIR):
-                if hasattr(self,"regen_stage_events"):self.regen_stage_events.put((100,99,"Aplicando ritmo / pausas do original"))
-                try:
-                    try:
-                        from .personalized_dubbing_tab import match_original_expression
-                    except ImportError:
-                        from personalized_dubbing_tab import match_original_expression
-                    expressive_target = temporary_target.with_name(temporary_target.stem + ".__expressao.wav")
-                    match_original_expression(temporary_target, self.audio_by_stem[stem], expressive_target)
-                    temporary_target.unlink(missing_ok=True)
-                    temporary_target = expressive_target
-                except Exception as exc:
-                    self.root.after(0, lambda err=str(exc): self.append_regen_log(f"Aviso: não foi possível reaplicar ritmo/pausas do original: {err}"))
             if getattr(self, 'regen_cancel_requested', False):
                 raise RuntimeError('Redublagem cancelada; áudio anterior preservado.')
+            if getattr(self,'regen_preserve_original_voice',False):
+                from voice_character import preserve_original_voice
+                from batch_tab import executable_path
+                ffmpeg=executable_path('ffmpeg',ROOT)
+                if not ffmpeg:raise RuntimeError('FFmpeg ausente para preservar o caráter da voz original.')
+                preserve_original_voice(temporary_target,self.audio_by_stem[stem],ffmpeg)
             if current.exists():
+                from audio_versions import archive
+                archive(current, ROOT)
+                if personalized:
+                    self.regen_stage_events.put((100,99,'Finalização: preservando versão anterior'))
                 revision_dir = _revision_scene_dir(stem)
                 revision_dir.mkdir(parents=True, exist_ok=True)
                 backup_path = revision_dir / f"{_scene_basename(stem)}_v{next_version(stem):02d}.wav"
                 shutil.copy2(current, backup_path)
             if target.is_relative_to(CUSTOM_OUTPUT_DIR):
+                self.regen_stage_events.put((100,99,'Finalização: salvando áudio personalizado'))
                 try:
                     from .personalized_dubbing_tab import _safe_replace_file
                 except ImportError:
@@ -2367,6 +2616,8 @@ class ReviewApp:
                     reference=_Path(reference_audio).resolve()
                     record["voice_model"]=reference.relative_to(ROOT).as_posix() if reference.is_relative_to(ROOT) else str(reference)
                     record["generated_at"]=time.strftime("%Y-%m-%d %H:%M:%S")
+                    record["timing_mode"]="aligned_to_original" if getattr(self, 'regen_alignment_settings', None) else "natural"
+                    record["expression_transfer"]="optional_alignment" if getattr(self, 'regen_alignment_settings', None) else "none"
                     temporary_manifest=manifest_path.with_suffix(".tmp.json")
                     temporary_manifest.write_text(json.dumps(data,ensure_ascii=False,indent=2),encoding="utf-8")
                     os.replace(temporary_manifest,manifest_path)
@@ -2374,6 +2625,10 @@ class ReviewApp:
                     self.root.after(0,lambda err=str(exc):self.append_regen_log("Áudio salvo; não foi possível registrar o modelo escolhido: "+err))
             else:
                 os.replace(temporary_target, target)
+            from speech_completeness import publish_review_report
+            publish_review_report(temporary_target, target)
+            if personalized:
+                self.regen_stage_events.put((100,100,'Áudio salvo; atualizando janela Ouvir Cena'))
             self.root.after(0, lambda: self._generation_done(stem, target, backup_path))
         except Exception as exc:
             try:
@@ -2418,14 +2673,21 @@ class ReviewApp:
 
     def _generation_done(self, stem: str, target: Path, backup_path: Path | None = None) -> None:
         self.busy = False
+        if target.is_relative_to(CUSTOM_OUTPUT_DIR):
+            # Release manual controls before history/player refresh can fail.
+            self.finish_regen_clock(True)
+            self.set_action_state()
         self.append_regen_log(f"CONCLUÍDO: novo áudio salvo em {self.current_output_dir().name}/{target.relative_to(self.current_output_dir()) if target.is_relative_to(self.current_output_dir()) else target.name}")
         if backup_path is not None:
             self.append_regen_log(f"VERSÃO ANTERIOR PRESERVADA: {backup_path.relative_to(REVISIONS_DIR) if backup_path.is_relative_to(REVISIONS_DIR) else backup_path.name}")
+        from speech_completeness import needs_review
+        if needs_review(target):
+            self.append_regen_log('REVISAR: áudio salvo, mas o reconhecimento não confirmou todas as palavras. Ouça antes de aprovar.')
         self.finish_regen_clock(True)
         record_text = f"Novo dublado salvo em {target.name}; arquivo atual substituído."
         if backup_path is not None:
             record_text += f" Versão anterior preservada em {backup_path.name}."
-        self.update_record(stem, "pendente", record_text)
+        self.update_record(stem, "avaliar" if getattr(self,"_rejected_active",None) == stem else "pendente", record_text)
         self.status_var.set(f"Novo áudio salvo em {self.current_output_dir().name}: {target.name}")
         try:
             self.audio_player.refresh_current_scene(stem)
@@ -2449,13 +2711,21 @@ class ReviewApp:
 
     def _generation_failed(self, stem: str, error: str) -> None:
         self.busy = False
+        if getattr(self, 'audio_source_mode', 'normal') == 'custom':
+            self.finish_regen_clock(False)
+            self.set_action_state()
         generated=getattr(self, 'regen_translation_result', None)
         if generated:self._show_generated_translation(stem,*generated)
         self.append_regen_log(f"ERRO: {error}")
         self.finish_regen_clock(False)
         self.set_action_state()
-        self.status_var.set(f"Falha ao regenerar {stem}")
-        messagebox.showerror("Regeneração", f"Não foi possível regenerar a cena.\n\n{error}", parent=self.root)
+        from speech_completeness import friendly_error
+        if 'DUBLASKIZON_NEEDS_REVIEW:' in error:
+            self.status_var.set(f"Conferir a fala de {stem}; áudio anterior preservado")
+            messagebox.showwarning("Conferência da fala", friendly_error(error), parent=self.root)
+        else:
+            self.status_var.set(f"Falha ao regenerar {stem}")
+            messagebox.showerror("Regeneração", f"Não foi possível regenerar a cena.\n\n{error}", parent=self.root)
 
 
 def main() -> int:

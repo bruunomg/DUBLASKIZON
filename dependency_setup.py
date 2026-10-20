@@ -19,14 +19,65 @@ from pathlib import Path
 PYTHON_VERSION = "3.13.15"
 PYTHON_URL = f"https://www.python.org/ftp/python/{PYTHON_VERSION}/python-{PYTHON_VERSION}-amd64.exe"
 PYTHON_SHA256 = "edec09c4853aeae9ac36efb8c9f95b6b8e2fee65eee56d9767a8b7c69c574403"
+AMD_PYTHON_VERSION = "3.12.10"
+AMD_PYTHON_URL = f"https://www.python.org/ftp/python/{AMD_PYTHON_VERSION}/python-{AMD_PYTHON_VERSION}-amd64.exe"
+AMD_PYTHON_SHA256 = "67b5635e80ea51072b87941312d00ec8927c4db9ba18938f7ad2d27b328b95fb"
+AMD_SUPPORTED_GPUS = ("RX 9070 XT", "RX 9070", "AI PRO R9700", "RX 9060 XT",
+                      "RX 7900 XTX", "PRO W7900 DUAL SLOT", "PRO W7900", "RX 7700", "RX 7600",
+                      "RYZEN AI MAX+ 395", "RYZEN AI MAX 390", "RYZEN AI MAX 385",
+                      "RYZEN AI 9 HX 375", "RYZEN AI 9 HX 370", "RYZEN AI 9 365",
+                      "RYZEN AI 9 HX 475", "RYZEN AI 9 HX 470", "RYZEN AI 9 465")
+DIRECTML_RX500 = ("RX 590", "RX 580", "RX 570", "RX 560")
 MODELS = ("edwixx/omnivoice-brpt-v15", "k2-fsa/OmniVoice")
 CODEC = "eustlb/higgs-audio-v2-tokenizer"
 WHISPER = "openai/whisper-large-v3-turbo"
+MANAGED_MODEL_REPOS = (
+    *MODELS, CODEC, WHISPER,
+    "hotstone228/F5-TTS-Russian",
+    "firstpixel/F5-TTS-pt-br",
+    "charactr/vocos-mel-24khz",
+)
 
 
 def byte_size(value):
     value=max(0,int(value))
     return f"{value/1_000_000_000:.2f} GB" if value>=1_000_000_000 else f"{value/1_000_000:.1f} MB"
+
+
+def removed_size(value):
+    value=max(0,int(value))
+    return f"{value/1_000_000_000:.2f} GB ({byte_size(value)})"
+
+
+def _windows_display_names():
+    """Read adapter names without PowerShell, WMI or third-party modules."""
+    if os.name != 'nt':return []
+    try:
+        import ctypes
+        class DISPLAY_DEVICE(ctypes.Structure):
+            _fields_=[('cb',ctypes.c_ulong),('DeviceName',ctypes.c_wchar*32),('DeviceString',ctypes.c_wchar*128),
+                      ('StateFlags',ctypes.c_ulong),('DeviceID',ctypes.c_wchar*128),('DeviceKey',ctypes.c_wchar*128)]
+        result=[];index=0
+        while True:
+            item=DISPLAY_DEVICE();item.cb=ctypes.sizeof(item)
+            if not ctypes.windll.user32.EnumDisplayDevicesW(None,index,ctypes.byref(item),0):break
+            if item.DeviceString:result.append(item.DeviceString.strip())
+            index+=1
+        return list(dict.fromkeys(result))
+    except (AttributeError,OSError,ValueError):return []
+
+
+def amd_gpu_supported(name):
+    normalized=' '.join(str(name).upper().replace('AMD RADEON','').split())
+    return next((model for model in AMD_SUPPORTED_GPUS if model in normalized),None)
+
+
+def rx7600_system_issue():
+    if os.name!='nt':return 'O perfil RX 7600 requer Windows 11 25H2.'
+    version=sys.getwindowsversion()
+    if version.major<10 or version.build<26200:
+        return f'ROCm 10.0 requer Windows 11 25H2 (build 26200 ou mais recente); este Windows é build {version.build}.'
+    return ''
 
 
 def detect_processing():
@@ -45,7 +96,22 @@ def detect_processing():
             if result.returncode==0 and result.stdout.strip():
                 return {'variant':'cu128','cpu':cpu,'gpu':result.stdout.strip().replace('\n','; ')+' (memória em MiB)'}
         except (OSError,subprocess.SubprocessError):pass
-    return {'variant':'cpu','cpu':cpu,'gpu':'NVIDIA com driver utilizável não detectada; usar CPU (AMD ou Intel).'}
+    displays=_windows_display_names()
+    legacy=next((name for name in displays if any(model in name.upper() for model in DIRECTML_RX500)),None)
+    if legacy and sys.getwindowsversion().major>=10:
+        return {'variant':'directml','cpu':cpu,'gpu':legacy+' (DirectML / DirectX 12; teste real obrigatório)'}
+    rx7600=next((name for name in displays if 'RX 7600' in name.upper()),None)
+    if rx7600:
+        issue=rx7600_system_issue()
+        if issue:return {'variant':'cpu','cpu':cpu,'gpu':rx7600+' — '+issue+' Usar CPU até atualizar.'}
+        return {'variant':'rocm100-gfx1102','cpu':cpu,'gpu':rx7600+' (ROCm 10.0 / gfx1102 compatível; requer Adrenalin 26.8.1)'}
+    amd=next(((name,amd_gpu_supported(name)) for name in [*displays,cpu] if amd_gpu_supported(name)),None)
+    if amd and sys.getwindowsversion().major >= 10 and sys.getwindowsversion().build >= 22000:
+        return {'variant':'rocm721','cpu':cpu,'gpu':amd[0]+' (ROCm 7.2.1 compatível: '+amd[1]+')'}
+    amd_name=next((name for name in displays if 'AMD' in name.upper() or 'RADEON' in name.upper()),None)
+    detail=(amd_name+' — fora da lista oficial do ROCm Windows; usar CPU.' if amd_name else
+            'NVIDIA/AMD ROCm utilizável não detectada; usar CPU (AMD ou Intel).')
+    return {'variant':'cpu','cpu':cpu,'gpu':detail}
 
 
 class TransferParser:
@@ -121,6 +187,82 @@ def runtime_root():
     return Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "Dublaskizon" / "runtime"
 
 
+def huggingface_cache_roots() -> list[Path]:
+    """Cache roots used by the official Hugging Face download calls."""
+    roots = [Path(os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface"))) / "hub"]
+    for key in ("HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE"):
+        if os.environ.get(key):
+            roots.insert(0, Path(os.environ[key]))
+    return list(dict.fromkeys(path.expanduser() for path in roots))
+
+
+def managed_download_targets(app_dir=None, project_root=None) -> list[Path]:
+    """Return only locations created or populated by the Requirements workflow."""
+    targets = [runtime_root()]
+    for base in (app_dir, project_root):
+        if base:
+            targets.append(Path(base).expanduser() / "ferramentas_audio")
+    for cache_root in huggingface_cache_roots():
+        targets.extend(cache_root / ("models--" + repo.replace("/", "--")) for repo in MANAGED_MODEL_REPOS)
+    result, seen = [], set()
+    for target in targets:
+        normalized = os.path.normcase(os.path.abspath(str(target)))
+        if normalized not in seen:
+            seen.add(normalized); result.append(Path(target))
+    return result
+
+
+def path_size(path: Path) -> int:
+    """Size without following directory symlinks/junctions."""
+    path = Path(path)
+    try:
+        if path.is_symlink() or (hasattr(path, "is_junction") and path.is_junction()):
+            return path.lstat().st_size
+        if path.is_file():
+            return path.stat().st_size
+        if not path.is_dir():
+            return 0
+    except OSError:
+        return 0
+    total = 0
+    for folder, dirs, files in os.walk(path, followlinks=False):
+        current = Path(folder); safe_dirs = []
+        for name in dirs:
+            child = current / name
+            try:
+                if child.is_symlink() or (hasattr(child, "is_junction") and child.is_junction()):
+                    total += child.lstat().st_size
+                else:
+                    safe_dirs.append(name)
+            except OSError:
+                continue
+        dirs[:] = safe_dirs
+        for name in files:
+            try: total += (current / name).stat().st_size
+            except OSError: pass
+    return total
+
+
+def remove_managed_downloads(targets: list[Path]) -> tuple[int, list[str]]:
+    """Remove exact precomputed managed targets and report actual freed bytes."""
+    removed, failures = 0, []
+    for target in targets:
+        target = Path(target); before = path_size(target)
+        if not before and not target.exists() and not target.is_symlink():
+            continue
+        try:
+            if hasattr(target, "is_junction") and target.is_junction():
+                target.rmdir()
+            elif target.is_symlink() or target.is_file():
+                target.unlink()
+            else:
+                shutil.rmtree(target)
+        except OSError as exc:
+            failures.append(f"{target}: {exc}")
+        removed += max(0, before - path_size(target))
+    return removed, failures
+
+
 def managed_python():
     try:
         root = runtime_root().resolve()
@@ -143,6 +285,20 @@ def installed_python313():
         for hive in (winreg.HKEY_CURRENT_USER,winreg.HKEY_LOCAL_MACHINE):
             try:
                 with winreg.OpenKey(hive,r"Software\Python\PythonCore\3.13\InstallPath",0,winreg.KEY_READ|winreg.KEY_WOW64_64KEY) as key:
+                    candidates.append(Path(winreg.QueryValue(key,None))/"python.exe")
+            except OSError:pass
+    return list(dict.fromkeys(path for path in candidates if path.is_file()))
+
+
+def installed_python312():
+    candidates=[runtime_root()/f"python-{AMD_PYTHON_VERSION}"/"python.exe",
+                Path(os.environ.get("LOCALAPPDATA",str(Path.home())))/"Programs"/"Python"/"Python312"/"python.exe",
+                Path(os.environ.get("ProgramFiles","C:/Program Files"))/"Python312"/"python.exe"]
+    if os.name=='nt':
+        import winreg
+        for hive in (winreg.HKEY_CURRENT_USER,winreg.HKEY_LOCAL_MACHINE):
+            try:
+                with winreg.OpenKey(hive,r"Software\Python\PythonCore\3.12\InstallPath",0,winreg.KEY_READ|winreg.KEY_WOW64_64KEY) as key:
                     candidates.append(Path(winreg.QueryValue(key,None))/"python.exe")
             except OSError:pass
     return list(dict.fromkeys(path for path in candidates if path.is_file()))
@@ -214,6 +370,26 @@ class Cancelled(Exception):
     pass
 
 
+class StalledDownload(RuntimeError):
+    pass
+
+
+def process_cpu_seconds(process):
+    """Best-effort CPU activity check without adding psutil to the EXE."""
+    if os.name != 'nt':
+        return None
+    try:
+        import ctypes
+        created=ctypes.c_ulonglong();exited=ctypes.c_ulonglong();kernel=ctypes.c_ulonglong();user=ctypes.c_ulonglong()
+        handle=ctypes.windll.kernel32.OpenProcess(0x0400,False,process.pid)
+        if not handle:return None
+        try:
+            if not ctypes.windll.kernel32.GetProcessTimes(handle,ctypes.byref(created),ctypes.byref(exited),ctypes.byref(kernel),ctypes.byref(user)):return None
+            return (kernel.value+user.value)/10_000_000
+        finally:ctypes.windll.kernel32.CloseHandle(handle)
+    except Exception:return None
+
+
 class SetupJob:
     def __init__(self, emit, cancel=None, progress=None, ffmpeg_dir=None, transfer=None):
         self.emit = emit
@@ -236,15 +412,46 @@ class SetupJob:
         if self.cancel.is_set():
             raise Cancelled("Operação cancelada. A instalação anterior continua selecionada.")
 
-    def run(self, args, timeout=1800, ok_codes=(0,)):
+    def run(self, args, timeout=1800, ok_codes=(0,), stall_timeout=240, stall_retries=2):
+        for attempt in range(stall_retries + 1):
+            try:
+                return self._run_once(args, timeout, ok_codes, stall_timeout)
+            except StalledDownload:
+                if attempt >= stall_retries: raise
+                self.write(f"[TRAVAMENTO DETECTADO] Sem avanço útil por {stall_timeout:.0f}s. Reiniciando e retomando arquivos já baixados (tentativa {attempt + 2}/{stall_retries + 1})…")
+                self.transfer({'kind':'activity','name':f'Travamento detectado; retomando tentativa {attempt + 2}/{stall_retries + 1}'})
+                self.cancel.wait(min(5, attempt + 2))
+
+    def _run_once(self, args, timeout, ok_codes, stall_timeout):
         self.checkpoint()
-        parser=TransferParser(self.transfer)
+        activity={'time':time.monotonic(),'bytes':0,'slow':None,'downloads':{}}
+        def receive_transfer(event):
+            current=int(event.get('current',0) or 0)
+            total=int(event.get('total',0) or 0);name=str(event.get('name','Arquivo'))
+            if current > activity['bytes']:
+                activity['bytes']=current;activity['time']=time.monotonic()
+            if total >= 50_000_000 and current > 0:
+                now=time.monotonic();window=activity['downloads'].setdefault(name,[now,current,current])
+                if current < window[2]:window[:]=[now,current,current]
+                window[2]=current
+                if now-window[0] >= stall_timeout:
+                    advanced=current-window[1]
+                    if advanced < 1_000_000:
+                        activity['slow']=(name,advanced,now-window[0])
+                    else:window[:]=[now,current,current]
+            self.transfer(event)
+        parser=TransferParser(receive_transfer)
         self.transfer({'kind':'activity','name':'Executando / instalando; aguardando dados de download'})
         environment = official_environment()
         if self.ffmpeg_dir and self.ffmpeg_dir.is_dir():
             environment['PATH'] = str(self.ffmpeg_dir) + os.pathsep + environment.get('PATH', '')
             environment['FFMPEG_BINARY'] = str(self.ffmpeg_dir / ('ffmpeg.exe' if os.name=='nt' else 'ffmpeg'))
-        self.write("> " + subprocess.list2cmdline([str(a) for a in args[:5]]))
+        display_args=[str(a) for a in args[:5]]
+        if '-c' in display_args:
+            code_index=display_args.index('-c')+1
+            if code_index<len(display_args) and len(display_args[code_index])>160:
+                display_args[code_index]='<script Python interno>'
+        self.write("> " + subprocess.list2cmdline(display_args))
         with tempfile.TemporaryDirectory(prefix="dublaskizon-setup-") as temporary:
             path = Path(temporary) / "process.log"
             # Independent handles: seeking the reader must not move the child's write offset.
@@ -260,6 +467,8 @@ class SetupJob:
                         ctypes.windll.kernel32.SetDllDirectoryW(getattr(sys, "_MEIPASS", None))
             output = path.open("rb")
             start, offset = time.monotonic(), 0
+            watchdog_emit=start
+            last_cpu=process_cpu_seconds(proc);cpu_checked=start
             try:
                 while True:
                     self.checkpoint()
@@ -269,8 +478,24 @@ class SetupJob:
                     raw = output.read()
                     offset += len(raw)
                     if raw:
-                        parser.feed(raw.decode('utf-8',errors='replace'))
-                        self.write(raw.decode("utf-8", errors="replace"))
+                        decoded=raw.decode('utf-8',errors='replace')
+                        parser.feed(decoded)
+                        if any(line.strip() and not line.strip().startswith(('DUBLASKIZON_TRANSFER ','Progress ')) for line in decoded.replace('\r','\n').split('\n')):
+                            activity['time']=time.monotonic()
+                        self.write(decoded)
+                    now=time.monotonic()
+                    if now-cpu_checked>=10:
+                        cpu=process_cpu_seconds(proc)
+                        if cpu is not None and last_cpu is not None and cpu-last_cpu>=0.05:activity['time']=now
+                        last_cpu=cpu;cpu_checked=now
+                    if stall_timeout and now-activity['time']>stall_timeout:
+                        raise StalledDownload(f"Download/processamento travado: nenhum dado, mensagem ou uso de CPU detectado por {stall_timeout:.0f} segundos.")
+                    if activity['slow']:
+                        name,advanced,seconds=activity['slow']
+                        raise StalledDownload(f"Download praticamente parado em {name}: apenas {byte_size(advanced)} em {seconds:.0f} segundos.")
+                    if now-watchdog_emit>=5:
+                        self.transfer({'kind':'watchdog','idle':max(0,now-activity['time']),'limit':stall_timeout})
+                        watchdog_emit=now
                     code = proc.poll()
                     if code is not None:
                         output.seek(offset)
@@ -298,9 +523,11 @@ class SetupJob:
                 finally:
                     output.close()
 
-    def download_python(self):
-        target = runtime_root() / f"python-{PYTHON_VERSION}-amd64.exe"
-        if target.is_file() and hashlib.sha256(target.read_bytes()).hexdigest() == PYTHON_SHA256:
+    def download_python(self, amd=False):
+        version,url,expected=((AMD_PYTHON_VERSION,AMD_PYTHON_URL,AMD_PYTHON_SHA256) if amd else
+                              (PYTHON_VERSION,PYTHON_URL,PYTHON_SHA256))
+        target = runtime_root() / f"python-{version}-amd64.exe"
+        if target.is_file() and hashlib.sha256(target.read_bytes()).hexdigest() == expected:
             self.transfer({'kind':'cache','name':'Instalador Python já baixado e verificado'})
             return target
         part = target.with_suffix(".part")
@@ -309,7 +536,7 @@ class SetupJob:
             try:
                 self.write(f"Baixando Python oficial (tentativa {attempt + 1}/3)...")
                 digest, size, last = hashlib.sha256(), 0, -1
-                with urllib.request.urlopen(PYTHON_URL, timeout=30) as response, part.open("wb") as output:
+                with urllib.request.urlopen(url, timeout=30) as response, part.open("wb") as output:
                     if not response.url.startswith("https://www.python.org/"):
                         raise RuntimeError("Redirecionamento inesperado no download do Python.")
                     total = int(response.headers.get("Content-Length", "0"))
@@ -325,7 +552,7 @@ class SetupJob:
                             self.write(f"Python: {size / 1048576:.1f} MB" + (f" / {total / 1048576:.1f} MB" if total else ""))
                             self.progress(min(10.0,percent / 10))
                             last = percent
-                if digest.hexdigest() != PYTHON_SHA256:
+                if digest.hexdigest() != expected:
                     raise RuntimeError("SHA-256 diferente do publicado em python.org. Instalador rejeitado.")
                 part.replace(target)
                 return target
@@ -336,11 +563,11 @@ class SetupJob:
                     raise
                 self.cancel.wait(2)
 
-    def install(self, variant):
+    def install(self, variant, include_audio_analysis=True, include_text_to_speech=True):
         if os.name != "nt" or platform.machine().lower() not in ("amd64", "x86_64"):
             raise RuntimeError("Este instalador automático requer Windows x64.")
-        if variant not in ("cpu", "cu128"):
-            raise ValueError("Selecione CPU ou NVIDIA CUDA 12.8.")
+        if variant not in ("cpu", "cu128", "rocm721", "rocm100-gfx1102"):
+            raise ValueError("Selecione CPU, NVIDIA CUDA ou um modo AMD ROCm disponível.")
         root = runtime_root()
         root.mkdir(parents=True, exist_ok=True)
         # OS lock is released even if the application crashes.
@@ -354,7 +581,7 @@ class SetupJob:
             except OSError as exc:
                 raise RuntimeError("Outra instalação do Dublaskizon está em andamento.") from exc
             try:
-                self._install_locked(variant)
+                self._install_locked(variant, include_audio_analysis, include_text_to_speech)
             finally:
                 lock.seek(0)
                 msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
@@ -386,11 +613,59 @@ class SetupJob:
             raise RuntimeError("O instalador terminou, mas nenhum Python 3.13 de 64 bits utilizável foi encontrado. Consulte "+str(root/"python-install.log")+". Nenhum ambiente foi ativado; não é necessário remover o Python anterior.")
         return python
 
-    def _install_locked(self, variant):
+    def ensure_amd_python(self):
+        root=runtime_root();check="import sys,struct,venv,ensurepip;assert sys.version_info[:2]==(3,12);assert struct.calcsize('P')==8;print(sys.executable);print(sys.version)"
+        def find():
+            for candidate in installed_python312():
+                self.checkpoint()
+                try:self.run([candidate,'-c',check],timeout=30)
+                except (OSError,RuntimeError,TimeoutError):continue
+                self.write(f"Python 3.12 base validado para AMD ROCm: {candidate}");return candidate
+        python=find()
+        if python:return python
+        base=root/f"python-{AMD_PYTHON_VERSION}";installer=self.download_python(amd=True)
+        self.write('Instalando Python 3.12 oficial e isolado, exigido pelo PyTorch AMD ROCm para Windows...')
+        self.run([installer,'/quiet','InstallAllUsers=0',f'TargetDir={base}','PrependPath=0','Include_launcher=0',
+                  'Include_test=0','Include_pip=1','AssociateFiles=0','Shortcuts=0','/log',root/'python-amd-install.log'],ok_codes=(0,3010))
+        python=find()
+        if not python:raise RuntimeError('O Python 3.12 x64 exigido pelo AMD ROCm não pôde ser executado. Consulte '+str(root/'python-amd-install.log'))
+        return python
+
+    def _install_locked(self, variant, include_audio_analysis=True, include_text_to_speech=True):
         root = runtime_root()
-        if shutil.disk_usage(root).free < 12 * 1024**3:
-            raise RuntimeError("Reserve ao menos 12 GB livres para Python/PyTorch e temporários; modelos precisam de espaço adicional.")
-        python=self.ensure_base_python()
+        existing=managed_python()
+        try:active=json.loads((root/'active.json').read_text(encoding='utf-8'))
+        except (OSError,ValueError):active={}
+        if existing and active.get('variant')==variant:
+            torch_version='2.13.0' if variant=='rocm100-gfx1102' else '2.9.1' if variant=='rocm721' else '2.8.0'
+            check=("import torch,torchaudio,omnivoice;from importlib.metadata import version;"
+                   "assert version('omnivoice')=='0.2.1';"
+                   f"assert torch.__version__.split('+')[0]=='{torch_version}';"
+                   + ("assert torch.version.hip and torch.cuda.is_available();" if variant.startswith('rocm') else
+                      "assert torch.version.cuda=='12.8' and torch.cuda.is_available();" if variant=='cu128' else
+                      "assert torch.version.cuda is None and not torch.version.hip;")
+                   + "print('OmniVoice: ambiente existente compatível')")
+            self.write('Verificando ambiente OmniVoice já instalado; nenhum download iniciado…')
+            try:
+                self.run([existing,'-c',check],timeout=180)
+                self.run([existing,'-m','pip','check'],timeout=180)
+            except (OSError,RuntimeError,TimeoutError) as exc:
+                self.checkpoint()
+                self.write('Ambiente precisa de reparo ou atualização: '+str(exc))
+            else:
+                self.install_silero_vad(existing)
+                if include_audio_analysis:
+                    try:self.run([existing,'-c','import librosa,numpy,soundfile;print("Análise MFCC já instalada")'],timeout=120)
+                    except (OSError,RuntimeError,TimeoutError):self.checkpoint();self.install_audio_analysis(existing)
+                if include_text_to_speech:
+                    try:self.test_text_to_speech(existing)
+                    except (OSError,RuntimeError,TimeoutError):self.checkpoint();self.install_text_to_speech(existing)
+                self.write('[OK] Ambiente existente reutilizado; só dependências ausentes precisam ser instaladas.')
+                return
+        required=20 if variant.startswith('rocm') else 12
+        if shutil.disk_usage(root).free < required * 1024**3:
+            raise RuntimeError(f"Reserve ao menos {required} GB livres para Python/PyTorch e temporários; modelos precisam de espaço adicional.")
+        python=self.ensure_amd_python() if variant.startswith('rocm') else self.ensure_base_python()
         # A failed update never modifies the previously active virtual environment.
         envdir = root / ("env-" + str(time.time_ns()))
         self.run([python, "-m", "venv", envdir])
@@ -398,16 +673,46 @@ class SetupJob:
         pip = [executable, "-m", "pip", "install", "--retries", "3", "--timeout", "60"]
         self.run([*pip, "--index-url", "https://pypi.org/simple", "--upgrade", "pip"])
         pip.extend(['--progress-bar','raw'])
-        self.run([*pip, "--index-url", f"https://download.pytorch.org/whl/{variant}",
-                  "torch==2.8.0", "torchaudio==2.8.0"], timeout=7200)
+        if variant=='rocm100-gfx1102':
+            index='https://stable.repo.amd.com/rocm/whl-next/'
+            preflight=("import urllib.request;index='https://stable.repo.amd.com/rocm/whl-next/';"
+                       "checks={'rocm':'10.0.0','torch':'2.13.0%2Brocm10.0.0','torchvision':'0.28.0%2Brocm10.0.0','torchaudio':'2.11.0.2%2Brocm10.0.0'};"
+                       "[(lambda data,name,version: (_ for _ in ()).throw(RuntimeError('Pacote AMD ausente: '+name+' '+version)) if version not in data else print('[OK] AMD',name,version))"
+                       "(urllib.request.urlopen(index+name+'/',timeout=30).read().decode(),name,version) for name,version in checks.items()]")
+            self.write('Conferindo no índice oficial AMD se todos os pacotes RX 7600 ainda estão publicados...')
+            self.run([python,'-c',preflight],timeout=180)
+            self.write('Instalando ROCm 10.0 e PyTorch oficiais para Radeon RX 7600 (gfx1102)...')
+            self.run([*pip,'--index-url',index,'rocm[libraries,device-gfx1102]==10.0.0'],timeout=7200)
+            self.run([*pip,'--index-url',index,'torch[device-gfx1102]==2.13.0+rocm10.0.0',
+                      'torchvision[device-gfx1102]==0.28.0+rocm10.0.0','torchaudio==2.11.0.2+rocm10.0.0'],timeout=7200)
+        elif variant=='rocm721':
+            from f5_backend import AMD_BASE,AMD_SDK,AMD_TORCH
+            self.write('Instalando SDK ROCm e PyTorch AMD oficiais para o OmniVoice em português...')
+            self.run([*pip,'--no-cache-dir',*[AMD_BASE+name for name in AMD_SDK]],timeout=7200)
+            self.run([*pip,'--no-cache-dir',*[AMD_BASE+name for name in AMD_TORCH]],timeout=7200)
+        else:
+            self.run([*pip, "--index-url", f"https://download.pytorch.org/whl/{variant}",
+                      "torch==2.8.0", "torchaudio==2.8.0"], timeout=7200)
         constraints = envdir / "constraints.txt"
-        constraints.write_text("torch==2.8.0\ntorchaudio==2.8.0\n", encoding="utf-8")
+        constraints.write_text(("torch==2.13.0+rocm10.0.0\ntorchaudio==2.11.0.2+rocm10.0.0\n" if variant=='rocm100-gfx1102' else
+                                "torch==2.9.1+rocm7.2.1\ntorchaudio==2.9.1+rocm7.2.1\n" if variant=='rocm721' else
+                                "torch==2.8.0\ntorchaudio==2.8.0\n"), encoding="utf-8")
         self.run([*pip, "--index-url", "https://pypi.org/simple", "-c", constraints,
                   "omnivoice==0.2.1", "audioop-lts", "huggingface_hub>=1.32,<2"], timeout=7200)
+        self.install_silero_vad(executable)
+        if include_audio_analysis:
+            self.write("Instalando análise MFCC para SEPARAR ÁUDIO IGUAL POR FREQUÊNCIA IDÊNTICA…")
+            self.run([*pip, "--index-url", "https://pypi.org/simple", "librosa>=0.11,<2", "soundfile>=0.13"], timeout=1800)
+        if include_text_to_speech:
+            self.install_text_to_speech(executable)
         self.run([executable, "-m", "pip", "check"])
         self.run([executable, "-m", "omnivoice.cli.infer", "--help"], timeout=180)
         self.run([executable, "-c", "import torch,torchaudio;print('Torch:',torch.__version__,'CUDA:',torch.cuda.is_available());"
-                  + ("assert torch.cuda.is_available(), 'Driver/GPU NVIDIA indisponível. Atualize o driver oficial ou selecione CPU.';"
+                  + ("assert torch.cuda.is_available(), 'GPU AMD ROCm indisponível. Confira Windows 11 e o driver AMD atualizado.';"
+                     "assert torch.version.hip;name=torch.cuda.get_device_name(0);assert '7600' in name, 'A GPU ativa não é a RX 7600: '+name;print('AMD:',name,'HIP:',torch.version.hip);print(torch.zeros(1,device='cuda')+1)" if variant=='rocm100-gfx1102' else
+                     "assert torch.cuda.is_available(), 'GPU AMD ROCm indisponível. Confira Windows 11, driver AMD 26.2.2 e a matriz oficial.';"
+                     "assert torch.version.hip;print('AMD:',torch.cuda.get_device_name(0),'HIP:',torch.version.hip);print(torch.zeros(1,device='cuda')+1)" if variant=='rocm721' else
+                     "assert torch.cuda.is_available(), 'Driver/GPU NVIDIA indisponível. Atualize o driver oficial ou selecione CPU.';"
                      "print(torch.zeros(1,device='cuda')+1)" if variant == "cu128" else "print(torch.zeros(1)+1)")], timeout=180)
         self.checkpoint()
         pending = root / "active.pending.json"
@@ -430,6 +735,48 @@ class SetupJob:
         self.run([python, "-u", "-c", MODEL_DOWNLOAD_WORKER, json.dumps(repos), '1' if sizes_only else '0'], timeout=900 if sizes_only else 14400)
         self.write("[OK] Consulta concluída; nenhum modelo foi baixado." if sizes_only else "[OK] Downloads concluídos. Use TESTAR MODELO para verificar carregamento, memória e compatibilidade.")
 
+    def install_silero_vad(self, python=None):
+        """Use bundled JIT weights on CPU without changing installed Torch packages."""
+        python = Path(python or managed_python() or '')
+        check = 'from silero_vad import load_silero_vad;load_silero_vad();print("Silero VAD pronto: CPU / modelo local")'
+        try:
+            self.run([python, '-c', check], timeout=120)
+            return
+        except (OSError, RuntimeError, TimeoutError):
+            self.checkpoint()
+        self.write('Preparando Silero VAD para alinhar fala e pausas; sem reinstalar PyTorch…')
+        self.run([python, '-m', 'pip', 'install', '--index-url', 'https://pypi.org/simple',
+                  '--no-deps', '--retries', '3', '--timeout', '60', 'silero-vad==6.2.3'], timeout=600)
+        self.run([python, '-c', check], timeout=120)
+
+    def install_audio_analysis(self, python=None):
+        """Instala o analisador MFCC no ambiente isolado escolhido, sem tocar no Python global."""
+        python = Path(python or managed_python() or '')
+        if not python.is_file():
+            raise RuntimeError("Instale primeiro o ambiente isolado antes da análise MFCC.")
+        self.write("Preparando análise MFCC para separar áudio por frequência idêntica…")
+        self.run([python, "-m", "pip", "install", "--index-url", "https://pypi.org/simple",
+                  "--progress-bar", "raw", "librosa>=0.11,<2", "soundfile>=0.13"], timeout=1800)
+        self.run([python, "-c", "import librosa,numpy,soundfile;print('MFCC OK:',librosa.__version__)"], timeout=120)
+        self.write("[OK] Análise MFCC instalada no ambiente gerenciado.")
+
+    def install_text_to_speech(self, python=None):
+        """Instala o pacote de apoio pedido para a aba TEXTO PARA FALA."""
+        python = Path(python or managed_python() or '')
+        if not python.is_file():
+            raise RuntimeError("Instale primeiro o ambiente isolado antes do Texto para Fala.")
+        self.write("Preparando TEXTO PARA FALA: datasets<4, soundfile e librosa…")
+        self.run([python, "-m", "pip", "install", "--index-url", "https://pypi.org/simple",
+                  "--progress-bar", "raw", "datasets<4", "soundfile>=0.13", "librosa>=0.11,<2", "sounddevice>=0.5,<0.6"], timeout=3600)
+        self.test_text_to_speech(python)
+        self.write("[OK] Dependências de TEXTO PARA FALA instaladas no ambiente gerenciado.")
+
+    def test_text_to_speech(self, python=None):
+        python = Path(python or managed_python() or '')
+        if not python.is_file():
+            raise RuntimeError("Ambiente isolado não instalado.")
+        self.run([python, "-c", "import datasets,librosa,soundfile,sounddevice;print('TEXTO PARA FALA OK:',datasets.__version__,librosa.__version__,soundfile.__version__)"], timeout=180)
+
     def test_model(self, model, whisper):
         from f5_backend import MODEL, test
         if model == MODEL:return test(self)
@@ -446,6 +793,19 @@ class SetupJob:
                 "print('MODELO CARREGADO:',device,'; geração de fala ainda não testada')")
         source = model if cached_snapshot(model) else str(legacy_model_path(model) or model)
         self.run([python, "-u", "-c", code, source, "1" if whisper else "0"], timeout=900)
+        try:data=json.loads((runtime_root()/'active.json').read_text(encoding='utf-8'))
+        except (OSError,ValueError,TypeError):data={}
+        if data.get('variant')=='rocm100-gfx1102':
+            output=runtime_root()/'rx7600-teste-portugues.wav'
+            if output.exists():output.unlink()
+            self.write('Executando síntese portuguesa curta na RX 7600 para validar operadores, memória e gravação WAV...')
+            command=inference_command()
+            self.run([*command,'--model',source,'--text','Teste de voz em português.','--language','Portuguese',
+                      '--instruct','Brazilian Portuguese voice','--duration','0.8','--num_step','2',
+                      '--denoise','false','--postprocess_output','false','--output',output],timeout=900)
+            if not output.is_file() or output.stat().st_size<1000:
+                raise RuntimeError('A RX 7600 carregou o modelo, mas não produziu um WAV válido. Use CPU e envie o relatório.')
+            self.write('[OK] RX 7600 validada com geração real em português: '+str(output))
 
     def diagnose(self, command, ffmpeg_dir, backend='OmniVoice'):
         self.write(f"Sistema: {platform.platform()} / {platform.machine()}\nAmbiente gerenciado: {managed_python() or 'não instalado'}")
@@ -459,6 +819,12 @@ class SetupJob:
         python = managed_python()
         if backend == 'F5-TTS':
             from f5_backend import runtime
+            python = runtime()[0]
+        elif backend == 'F5-TTS PT-BR DirectML':
+            from directml_backend import runtime
+            python = runtime()[0]
+        elif backend == 'Qwen3-TTS':
+            from qwen_backend import runtime
             python = runtime()[0]
         if python:
             checks.append(("PyTorch / GPU", [python, "-c", "import torch,torchaudio;print('PyTorch',torch.__version__,'CUDA disponível:',torch.cuda.is_available());print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"]))
@@ -489,6 +855,68 @@ class SetupJob:
         self.write(f"Diagnóstico concluído; {failures} comando(s) falharam. Cache existente não garante integridade. TESTAR MODELO verifica o carregamento.")
 
 
+def show_linux_assistant(app):
+    """Diagnóstico Linux sem expor os instaladores de Python/CUDA/ROCm do Windows."""
+    import shutil
+    import tkinter as tk
+    from tkinter import ttk
+    import webbrowser
+
+    window = tk.Toplevel(app.root)
+    app.dependency_window = window
+    window.title("Verificação inicial — requisitos Linux")
+    window.geometry("850x580")
+    window.minsize(700, 480)
+    theme = app.current_theme()
+    window.configure(bg=theme.get("root", "#172033"))
+    ttk.Label(window, text="DUBLASKIZON NO LINUX", font=("Segoe UI", 17, "bold")).pack(anchor="w", padx=18, pady=(16, 5))
+    ttk.Label(window, text=("Esta edição usa as dependências instaladas pela distribuição. "
+        "Os instaladores de Python, CUDA e ROCm para Windows ficam desativados aqui."),
+        wraplength=800, justify="left").pack(anchor="w", padx=18, pady=(0, 10))
+    output = tk.Text(window, height=16, wrap="word", state="disabled", font=("Consolas", 10),
+                     bg=theme.get("input", "#202838"), fg=theme.get("input_text", "#FFFFFF"))
+    output.pack(fill="both", expand=True, padx=18, pady=8)
+    status = tk.StringVar(value="Clique em VERIFICAR LINUX.")
+    ttk.Label(window, textvariable=status).pack(anchor="w", padx=18)
+
+    def write(lines):
+        output.configure(state="normal"); output.delete("1.0", "end")
+        output.insert("end", "\n".join(lines)); output.configure(state="disabled")
+    def verify():
+        import platform
+        tools = ("python3", "ffmpeg", "ffprobe", "ffplay", "sox", "xdg-open")
+        rows = [f"Sistema: {platform.platform()}", f"Arquitetura: {platform.machine()}", ""]
+        missing = []
+        for name in tools:
+            path = shutil.which(name)
+            rows.append(f"[{'OK' if path else 'FALTA'}] {name}: {path or 'não encontrado'}")
+            if not path: missing.append(name)
+        rows += ["", "Síntese de voz: configure OMNIVOICE_INFER ou instale o ambiente compatível com sua GPU/CPU."]
+        if missing:
+            rows.append("Instale os itens ausentes pelo gerenciador oficial da sua distribuição.")
+            status.set("Há dependências ausentes: " + ", ".join(missing))
+        else:
+            status.set("Dependências básicas do aplicativo encontradas.")
+        write(rows)
+    def open_guide():
+        guide = Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "LEIA-ME-LINUX.md"
+        if guide.exists(): subprocess.Popen(["xdg-open", str(guide)])
+        else: webbrowser.open("https://docs.python.org/3/using/unix.html")
+    def close():
+        app.save_dependency_assistant_preference(not dont_show.get())
+        app.dependency_window = None
+        window.destroy()
+    controls = ttk.Frame(window); controls.pack(fill="x", padx=18, pady=10)
+    ttk.Button(controls, text="VERIFICAR LINUX", command=verify).pack(side="left", padx=3)
+    ttk.Button(controls, text="ABRIR INSTRUÇÕES LINUX", command=open_guide).pack(side="left", padx=3)
+    ttk.Button(controls, text="ROCm OFICIAL", command=lambda:webbrowser.open("https://rocm.docs.amd.com/projects/install-on-linux/en/latest/")).pack(side="left", padx=3)
+    dont_show = tk.BooleanVar(value=not app.should_show_dependency_assistant())
+    ttk.Checkbutton(controls, text="Não mostrar novamente", variable=dont_show).pack(side="left", padx=12)
+    ttk.Button(controls, text="CONTINUAR", command=close).pack(side="right", padx=3)
+    window.protocol("WM_DELETE_WINDOW", close)
+    verify()
+
+
 def show_assistant(app):
     import tkinter as tk
     from tkinter import ttk, messagebox
@@ -501,11 +929,15 @@ def show_assistant(app):
             return
         except tk.TclError:
             pass
+    if os.name != "nt":
+        return show_linux_assistant(app)
     window = tk.Toplevel(app.root)
     app.dependency_window = window
     window.title("Verificação inicial — requisitos do Dublaskizon")
-    window.geometry(f"1050x{min(900,max(700,window.winfo_screenheight()-100))}")
-    window.minsize(880, 700)
+    available_width = max(600, window.winfo_screenwidth()-60)
+    available_height = max(400, window.winfo_screenheight()-100)
+    window.geometry(f"{min(1100,available_width)}x{min(960,available_height)}+20+30")
+    window.minsize(min(880, available_width), min(600, available_height))
     window.transient(app.root)
     try:
         window.iconbitmap(str(Path(getattr(sys, "_MEIPASS", Path(__file__).parent)) / "Dublaskizon.ico"))
@@ -515,20 +947,49 @@ def show_assistant(app):
     window.configure(bg=theme["root"])
     for key, value in (("text", "#FFFFFF"), ("input", "#202838"), ("input_text", "#FFFFFF")):
         theme.setdefault(key, value)
-    tk.Label(window, text="PREPARAR O DUBLASKIZON", font=("Segoe UI", 17, "bold"),
+    bottom_actions = ttk.Frame(window)
+    bottom_actions.pack(side='bottom', fill='x')
+    body_host=ttk.Frame(window);body_host.pack(fill='both',expand=True)
+    body_canvas=tk.Canvas(body_host,bg=theme['root'],highlightthickness=0)
+    body_scroll=ttk.Scrollbar(body_host,orient='vertical',command=body_canvas.yview)
+    body_canvas.configure(yscrollcommand=body_scroll.set)
+    body_scroll.pack(side='right',fill='y');body_canvas.pack(side='left',fill='both',expand=True)
+    body=ttk.Frame(body_canvas);body_item=body_canvas.create_window(0,0,window=body,anchor='nw')
+    app.dependency_body_canvas=body_canvas
+    def fit_body(event=None):
+        body_canvas.itemconfigure(body_item,width=max(1,body_canvas.winfo_width()))
+        body_canvas.configure(scrollregion=body_canvas.bbox('all'))
+        box=body_canvas.bbox('all')
+        if box and box[3]<=body_canvas.winfo_height():body_canvas.yview_moveto(0)
+    body.bind('<Configure>',fit_body);body_canvas.bind('<Configure>',fit_body)
+    def wheel_body(event):
+        box=body_canvas.bbox('all')
+        if box and box[3]>body_canvas.winfo_height():body_canvas.yview_scroll(-1 if event.delta>0 else 1,'units')
+        return 'break'
+    def bind_body(widget):
+        if widget.winfo_class() not in ('Text','TCombobox','Combobox'):
+            widget.bind('<MouseWheel>',wheel_body)
+        for child in widget.winfo_children():bind_body(child)
+
+    tk.Label(body, text="PREPARAR O DUBLASKIZON", font=("Segoe UI", 17, "bold"),
              bg=theme["root"], fg=theme["text"]).pack(anchor="w", padx=18, pady=(14, 4))
-    ttk.Label(window, text="1. Instale o ambiente  →  2. Baixe os modelos  →  3. Teste o carregamento", font=("Segoe UI", 11)).pack(anchor="w", padx=18)
-    info = ttk.LabelFrame(window, text="O que é necessário", padding=10)
+    ttk.Label(body, text="1. Instale o ambiente  →  2. Baixe os modelos  →  3. Prepare Audacity  →  4. Teste o carregamento", font=("Segoe UI", 11)).pack(anchor="w", padx=18)
+    info = ttk.LabelFrame(body, text="O que é necessário", padding=10)
     info.pack(fill="x", padx=18, pady=10)
     explanation = ttk.Label(info, justify="left", wraplength=900, text="• Python + OmniVoice + PyTorch: geram as vozes; o cache sozinho não substitui esses programas.\n"
               "• Modelo de voz + tokenizer de áudio: necessários para síntese. Whisper: transcrição automática da referência.\n"
+              "• Análise MFCC: compara as frequências na ferramenta de separação de áudios.\n"
+              "• Texto para Fala: instala datasets<4, soundfile e librosa; use OmniVoice/F5 ou o Qwen opcional.\n"
               "• FFmpeg / FFprobe / FFplay: conversão e reprodução. VoiceStudio é opcional.\n"
               "• O modo ‘omnivoice-subprocess’ da imagem pertence ao VoiceStudio; não é outro modelo para baixar.")
     explanation.pack(anchor="w", fill="x")
     info.bind("<Configure>", lambda event: explanation.configure(wraplength=max(300, event.width - 24)))
-    settings = ttk.Frame(window)
+    settings = ttk.Frame(body)
     settings.pack(fill="x", padx=18)
-    variants = ("Automático — NVIDIA disponível; senão CPU", "NVIDIA — CUDA 12.8 / driver compatível", "CPU — AMD Ryzen / Intel (mais lento)")
+    variants = ("Automático — NVIDIA, AMD ROCm ou DirectML; senão CPU", "NVIDIA — CUDA 12.8 / driver compatível",
+                "AMD Radeon — ROCm 7.2.1 oficial (Windows 11)", "AMD RX 7600 — ROCm 10.0 oficial (Windows 11)",
+                "AMD RX 500 / GPU DirectX 12 — DirectML experimental",
+                "CPU — AMD Ryzen / Intel (mais lento)")
     variant = tk.StringVar(value=variants[0])
     ttk.Label(settings, text="Processamento:").grid(row=0, column=0, sticky="w")
     hardware = ttk.Combobox(settings, values=variants, textvariable=variant, state="readonly", width=47)
@@ -537,26 +998,46 @@ def show_assistant(app):
     model = tk.StringVar(value=MODELS[1] if i18n.CURRENT_LANGUAGE == 'ru' else MODELS[0])
     ttk.Label(settings, text="Modelo de voz:").grid(row=1, column=0, sticky="w")
     from f5_backend import MODEL as F5_MODEL
-    choice = ttk.Combobox(settings, values=(*MODELS, F5_MODEL), textvariable=model, state="readonly", width=47)
+    from directml_backend import MODEL as DML_MODEL
+    from qwen_backend import MODEL as QWEN_MODEL
+    choice = ttk.Combobox(settings, values=(*MODELS, F5_MODEL, DML_MODEL, QWEN_MODEL), textvariable=model, state="readonly", width=47)
     choice.grid(row=1, column=1, sticky="ew", padx=8, pady=3)
-    ttk.Label(settings,text='OmniVoice: multilíngue. F5-TTS Russian: russo / inglês, referência obrigatória, CC-BY-NC-SA-4.0.',wraplength=900).grid(row=3,column=0,columnspan=2,sticky='w')
+    ttk.Label(settings,text='Português prioritário: OmniVoice ou F5-TTS PT-BR DirectML. O perfil DirectML tenta acelerar GPUs DirectX 12 sem ROCm, como RX 560/570/580/590, exige teste real e troca para CPU se a síntese falhar.',wraplength=900).grid(row=8,column=0,columnspan=2,sticky='w')
     settings.columnconfigure(1, weight=1)
     whisper = tk.BooleanVar(value=True)
     whisper_check = ttk.Checkbutton(settings, text="Incluir Whisper (recomendado para clonar sem transcrição)", variable=whisper)
     whisper_check.grid(row=2, column=0, columnspan=2, sticky="w", pady=4)
+    audio_analysis = tk.BooleanVar(value=True)
+    audio_analysis_check = ttk.Checkbutton(settings, text="Incluir análise MFCC (necessária para separar áudio por frequência idêntica)", variable=audio_analysis)
+    audio_analysis_check.grid(row=3, column=0, columnspan=2, sticky="w", pady=(0, 4))
+    text_to_speech = tk.BooleanVar(value=True)
+    text_to_speech_check = ttk.Checkbutton(settings, text="Incluir Texto para Fala (datasets<4 + soundfile + librosa)", variable=text_to_speech)
+    text_to_speech_check.grid(row=4, column=0, columnspan=2, sticky="w", pady=(0, 4))
+    native_emotions = tk.BooleanVar(value=True)
+    ttk.Checkbutton(settings,text="Incluir reações nativas automáticas (Seed-VC isolado; download adicional de alguns GB)",variable=native_emotions).grid(row=5,column=0,columnspan=2,sticky='w',pady=(0,4))
+    include_audacity=tk.BooleanVar(window,value=True)
+    include_openvino=tk.BooleanVar(window,value=True)
+    audacity_check=ttk.Checkbutton(settings,text='Baixar / preparar Audacity (versão compatível; instalação atual preservada)',variable=include_audacity)
+    audacity_check.grid(row=6,column=0,columnspan=2,sticky='w',pady=3)
+    openvino_check=ttk.Checkbutton(settings,text='Baixar / instalar OpenVINO no Audacity: Music Separation + Noise Suppression e modelos',variable=include_openvino)
+    openvino_check.grid(row=7,column=0,columnspan=2,sticky='w',pady=3)
+    app.dependency_audacity_options=(include_audacity,include_openvino)
     def model_changed(_event=None):
-        if model.get() == F5_MODEL:
+        if model.get() in (F5_MODEL,DML_MODEL,QWEN_MODEL):
             whisper.set(True)
             whisper_check.configure(state='disabled')
         else:
             whisper_check.configure(state='normal')
     choice.bind('<<ComboboxSelected>>', model_changed)
+    for selector in (hardware,choice):
+        for sequence in ('<MouseWheel>','<Button-4>','<Button-5>'):
+            selector.bind(sequence,lambda event:'break')
     detected=tk.StringVar(value='Identificando CPU e GPU deste computador…')
-    ttk.Label(window,textvariable=detected,wraplength=960).pack(anchor='w',padx=18)
-    ttk.Label(window,text='Windows x64: CPU AMD/Intel e GPU NVIDIA. GPU AMD/ROCm não é instalada por este assistente; requer combinação oficial compatível e validação do OmniVoice.',wraplength=960).pack(anchor='w',padx=18)
-    size_hint=tk.StringVar(value='Estimativa das dependências: CPU 1–3 GB; NVIDIA 4–7 GB. Reserve pelo menos 12 GB livres, mais os modelos. Cache pode reduzir os downloads. Consulte os tamanhos dos modelos abaixo.')
-    ttk.Label(window,textvariable=size_hint,wraplength=960).pack(anchor='w',padx=18,pady=4)
-    controls = ttk.Frame(window)
+    ttk.Label(body,textvariable=detected,wraplength=960).pack(anchor='w',padx=18)
+    ttk.Label(body,text='AMD ROCm no Windows: somente Windows 11 e hardware listado oficialmente. RX 7600 usa ROCm 10.0/gfx1102; acelera OmniVoice BR-PT em português.',wraplength=960).pack(anchor='w',padx=18)
+    size_hint=tk.StringVar(value='Estimativa: CPU 1–3 GB; NVIDIA 4–7 GB; AMD ROCm pode ultrapassar 10 GB. Reserve 20 GB para AMD, mais os modelos.')
+    ttk.Label(body,textvariable=size_hint,wraplength=960).pack(anchor='w',padx=18,pady=4)
+    controls = ttk.Frame(bottom_actions)
     controls.pack(fill="x", padx=18, pady=8)
     events, stop = queue.Queue(), threading.Event()
     state = {"busy": False, "log": None, "closed": False, 'hardware':None, 'last_transfer':'Nenhum download informado'}
@@ -566,14 +1047,14 @@ def show_assistant(app):
     threading.Thread(target=probe,daemon=True).start()
     actions = []
     status = tk.StringVar(value="Pronto para verificar. Nenhuma instalação foi iniciada.")
-    ttk.Label(window, textvariable=status).pack(anchor="w", padx=18)
-    progress = ttk.Progressbar(window, mode="determinate", maximum=100, value=0)
+    ttk.Label(body, textvariable=status).pack(anchor="w", padx=18)
+    progress = ttk.Progressbar(body, mode="determinate", maximum=100, value=0)
     progress.pack(fill="x", padx=18, pady=(4, 8))
     transfer_text=tk.StringVar(value='Download: aguardando')
-    ttk.Label(window,textvariable=transfer_text,wraplength=960).pack(anchor='w',padx=18)
-    transfer_bar=ttk.Progressbar(window,mode='determinate',maximum=100,value=0)
+    ttk.Label(body,textvariable=transfer_text,wraplength=960).pack(anchor='w',padx=18)
+    transfer_bar=ttk.Progressbar(body,mode='determinate',maximum=100,value=0)
     transfer_bar.pack(fill='x',padx=18,pady=(3,8))
-    logframe = ttk.Frame(window)
+    logframe = ttk.Frame(body)
     logframe.pack(fill="both", expand=True, padx=18)
     output = tk.Text(logframe, height=12, wrap="word", state="disabled", font=("Consolas", 9),
                      bg=theme["input"], fg=theme["input_text"])
@@ -590,20 +1071,41 @@ def show_assistant(app):
         output.see("end")
         output.configure(state="disabled")
 
-    def start(kind):
+    def start(kind,confirmed=False):
         if state["busy"]:
             return
         selected, include = model.get(), whisper.get()
+        include_mfcc_selected = audio_analysis.get()
+        include_tts_selected = text_to_speech.get()
+        include_native_selected = native_emotions.get()
+        audacity_selected,openvino_selected=include_audacity.get(),include_openvino.get()
+        is_qwen = selected == QWEN_MODEL
         is_f5 = selected == F5_MODEL
-        if is_f5:include=True
+        is_dml = selected == DML_MODEL
+        if is_f5 or is_dml or is_qwen:include=True
         if variant.get()==variants[0] and state['hardware'] is None:
             status.set('Aguarde a identificação do processador e da placa de vídeo.');return
-        mode = (state['hardware']['variant'] if variant.get()==variants[0] else 'cu128' if variant.get()==variants[1] else 'cpu')
-        if kind == "install" and not messagebox.askyesno("Instalar ambiente isolado", ("Baixar Python de python.org, PyTorch oficial e " + ("F5-TTS" if is_f5 else "OmniVoice") + " do PyPI?\n\n")
+        mode = (state['hardware']['variant'] if variant.get()==variants[0] else
+                'cu128' if variant.get()==variants[1] else 'rocm721' if variant.get()==variants[2] else
+                'rocm100-gfx1102' if variant.get()==variants[3] else 'directml' if variant.get()==variants[4] else 'cpu')
+        if is_qwen and mode not in ('cpu','cu128'):
+            mode='cpu';write('Qwen usa CPU neste perfil AMD. Não modifica os ambientes ROCm / DirectML.')
+        if is_dml and mode!='directml':
+            status.set('F5-TTS PT-BR DirectML requer o processamento AMD RX 500 / GPU DirectX 12 — DirectML.');return
+        if mode=='directml' and not is_dml:
+            status.set('O perfil DirectML usa o modelo F5-TTS PT-BR DirectML. Selecione esse modelo.');return
+        if mode=='rocm100-gfx1102' and 'RX 7600' not in state['hardware'].get('gpu','').upper():
+            status.set('RX 7600 não detectada. Este perfil baixa kernels gfx1102 específicos e não será instalado em outra placa.');return
+        if mode=='rocm100-gfx1102' and rx7600_system_issue():
+            status.set(rx7600_system_issue());return
+        if mode=='rocm100-gfx1102' and is_f5:
+            status.set('Na RX 7600, o modo ROCm 10.0 está validado pelo instalador para OmniVoice BR-PT. Use CPU para F5-TTS Russian.');return
+        backend_label='Qwen3-TTS' if is_qwen else 'F5-TTS PT-BR + Microsoft DirectML' if is_dml else ('F5-TTS' if is_f5 else 'OmniVoice')
+        if kind == "install" and not confirmed and not messagebox.askyesno("Instalar ambiente isolado", ("Baixar Python de python.org, PyTorch e " + backend_label + " do PyPI?\n\n")
                 + f"Destino: {runtime_root()}\nModo: {mode}\nDownloads de vários GB. Seu Python atual será preservado.\n"
-                "O ambiente novo só será ativado após os testes. Esta ação não baixa os modelos.", parent=window):
+                "O ambiente novo só será ativado após os testes.\nAudacity / OpenVINO selecionados serão preparados das fontes oficiais, incluindo os modelos dos efeitos. O Windows pode pedir autorização para o instalador da Intel.", parent=window):
             return
-        if kind == "models" and not messagebox.askyesno("Baixar modelos", f"Baixar {selected}, " + ("Vocos e " if is_f5 else "tokenizer e ") + ("Whisper" if include else "sem Whisper") + " diretamente dos repositórios no Hugging Face?\n\nPode ocupar vários GB; o cache padrão será reutilizado.", parent=window):
+        if kind == "models" and not messagebox.askyesno("Baixar modelos", f"Baixar {selected}, " + (("Vocos e " if is_f5 or is_dml else "tokenizer e ") + ("Whisper" if include else "sem Whisper")) + " diretamente dos repositórios no Hugging Face?\n\nPode ocupar vários GB; o cache padrão será reutilizado.", parent=window):
             return
         command = None
         if kind == 'check':
@@ -617,6 +1119,8 @@ def show_assistant(app):
         hardware.configure(state="disabled")
         choice.configure(state="disabled")
         whisper_check.configure(state="disabled")
+        audio_analysis_check.configure(state="disabled")
+        text_to_speech_check.configure(state="disabled")
         cancel_button.configure(state="normal")
         progress.configure(mode="determinate",value=0)
         transfer_bar.configure(value=0);state['last_transfer']='Nenhum download informado';transfer_text.set('Consultando / preparando; ainda sem transferência informada')
@@ -625,8 +1129,61 @@ def show_assistant(app):
             try:
                 job = SetupJob(lambda text: events.put(("text", text)), stop, lambda value: events.put(("progress", value)), ffmpeg_dir=ffmpeg,transfer=lambda event:events.put(('transfer',event)))
                 events.put(("log", job.log))
-                {"check": lambda: job.diagnose(command, ffmpeg, 'F5-TTS') if is_f5 else job.diagnose(command, ffmpeg), "install": lambda: __import__("f5_backend").install(job, mode) if is_f5 else job.install(mode),
-                 "models": lambda: job.download_models(selected, include), 'sizes':lambda:job.download_models(selected,include,sizes_only=True), "test": lambda: job.test_model(selected, include)}[kind]()
+                def install_selected():
+                    __import__('audacity_setup').prepare(job,audacity_selected,openvino_selected)
+                    include_mfcc = include_mfcc_selected
+                    include_tts = include_tts_selected
+                    if is_qwen:
+                        __import__('qwen_backend').install(job,mode)
+                        python=__import__('qwen_backend').runtime()[0]
+                        if include_mfcc:job.install_audio_analysis(python)
+                        if include_tts:job.install_text_to_speech(python)
+                    elif is_dml:
+                        __import__('directml_backend').install(job,mode)
+                        if include_mfcc:
+                            job.install_audio_analysis(__import__('directml_backend').runtime()[0])
+                        if include_tts:
+                            job.install_text_to_speech(__import__('directml_backend').runtime()[0])
+                    elif is_f5:
+                        __import__('f5_backend').install(job,mode)
+                        if include_mfcc:
+                            job.install_audio_analysis(__import__('f5_backend').runtime()[0])
+                        if include_tts:
+                            job.install_text_to_speech(__import__('f5_backend').runtime()[0])
+                    else:
+                        job.install(mode, include_audio_analysis=include_mfcc, include_text_to_speech=include_tts)
+                    if include_native_selected:__import__('native_emotions').install(job)
+                def test_selected():
+                    if is_qwen:
+                        __import__('qwen_backend').test(job,getattr(app,'project_root',None))
+                        python=__import__('qwen_backend').runtime()[0]
+                    elif is_dml:
+                        __import__('directml_backend').test(job,getattr(app,'project_root',None))
+                        python=__import__('directml_backend').runtime()[0]
+                    elif is_f5:
+                        __import__('f5_backend').test(job)
+                        python=__import__('f5_backend').runtime()[0]
+                    else:
+                        job.test_model(selected,include);python=managed_python()
+                    if include_tts_selected:job.test_text_to_speech(python)
+                    if include_native_selected:__import__('native_emotions').test(job)
+                def download_selected():
+                    __import__('audacity_setup').prepare(job,audacity_selected,openvino_selected)
+                    if is_qwen:__import__('qwen_backend').download(job)
+                    elif is_dml:__import__('directml_backend').download(job)
+                    elif is_f5:__import__('f5_backend').download(job)
+                    else:job.download_models(selected,include)
+                    if include_native_selected:__import__('native_emotions').download(job)
+                operations={
+                    'check':lambda:job.diagnose(command,ffmpeg,'Qwen3-TTS') if is_qwen else (job.diagnose(command,ffmpeg,'F5-TTS PT-BR DirectML' if is_dml else 'F5-TTS') if is_dml or is_f5 else job.diagnose(command,ffmpeg)),
+                    'install':install_selected,
+                    'prepare_model':lambda:(install_selected(),download_selected()),
+                    'models':download_selected,
+                    'sizes':lambda:__import__('qwen_backend').download(job,True) if is_qwen else __import__('directml_backend').download(job,True) if is_dml else __import__('f5_backend').download(job,True) if is_f5 else job.download_models(selected,include,sizes_only=True),
+                    'test':test_selected}
+                operations[kind]()
+                if kind in ('check','test') and (audacity_selected or openvino_selected):
+                    __import__('audacity_setup').diagnose(job,openvino_selected)
                 events.put(("done", (True,"Etapa concluída. Confira os resultados e eventuais itens ausentes no relatório.")))
             except Exception as exc:
                 events.put(("text", f"[INTERROMPIDO] {exc}"))
@@ -634,13 +1191,33 @@ def show_assistant(app):
         threading.Thread(target=worker, daemon=True).start()
 
     for index, (label, kind) in enumerate((("VERIFICAR", "check"), ("1. INSTALAR / REPARAR", "install"),
-                                         ("2. BAIXAR MODELOS", "models"), ("3. TESTAR MODELO", "test"))):
-        button = ttk.Button(controls, text=label, command=lambda k=kind: start(k))
-        button.grid(row=0, column=index, padx=3, sticky="ew")
-        controls.columnconfigure(index, weight=1)
+                                         ("2. BAIXAR MODELOS", "models"), ("4. TESTAR MODELO", "test"))):
+        button = (tk.Button(controls,text=label,command=lambda k=kind:start(k),bg='#00FFFF',activebackground='#67FFFF',fg='#102A43',activeforeground='#102A43',relief='flat',font=('Segoe UI',9,'bold'),pady=6)
+                  if kind in ('install','models','test') else ttk.Button(controls,text=label,command=lambda k=kind:start(k)))
+        column=4 if kind=="test" else index
+        button.grid(row=0,column=column,padx=3,sticky="ew")
+        controls.columnconfigure(column,weight=1)
         actions.append(button)
     cancel_button = ttk.Button(controls, text="CANCELAR", command=stop.set, state="disabled")
-    cancel_button.grid(row=1, column=3, sticky="ew", padx=3, pady=5)
+    cancel_button.grid(row=1,column=3,columnspan=2,sticky="ew", padx=3, pady=5)
+    def prepare_audacity():
+        if state['busy']:return
+        aud,ov=include_audacity.get(),include_openvino.get()
+        if not aud and not ov:
+            messagebox.showinfo('Audacity / OpenVINO','Marque Audacity e/ou OpenVINO nas opções acima.',parent=window);return
+        if not messagebox.askyesno('Preparar Audacity / OpenVINO','Baixar e preparar os componentes selecionados das fontes oficiais?\n\nO OpenVINO inclui os modelos de separação e supressão. O Windows pode pedir autorização para o instalador da Intel. Salve e feche o Audacity antes de continuar.',parent=window):return
+        state['busy']=True;stop.clear();set_controls_enabled(False);cancel_button.configure(state='normal')
+        status.set('Preparando Audacity / OpenVINO…');progress.configure(value=0)
+        def work():
+            try:
+                job=SetupJob(lambda text:events.put(('text',text)),stop,transfer=lambda event:events.put(('transfer',event)))
+                events.put(('log',job.log));__import__('audacity_setup').prepare(job,aud,ov)
+                events.put(('done',(True,'Audacity / OpenVINO: preparação concluída e arquivos verificados.')))
+            except Exception as exc:
+                events.put(('text',str(exc)));events.put(('done',(False,'Preparação interrompida: '+str(exc))))
+        threading.Thread(target=work,daemon=True).start()
+    audacity_button=tk.Button(controls,text='3. PREPARAR AUDACITY',command=prepare_audacity,bg='#00FFFF',activebackground='#67FFFF',fg='#102A43',relief='flat',font=('Segoe UI',9,'bold'),pady=6)
+    audacity_button.grid(row=0,column=3,sticky='ew',padx=3,pady=0);controls.columnconfigure(3,weight=1);actions.append(audacity_button)
     def prepare_tools():
         app.prepare_shared_audio_tools()
         write("Preparação de FFmpeg / FFprobe / FFplay / SoX iniciada pela ferramenta existente.\n"
@@ -658,21 +1235,74 @@ def show_assistant(app):
     tools_button.grid(row=1, column=0, columnspan=2, sticky="ew", padx=3, pady=5)
     actions.append(tools_button)
     size_button=ttk.Button(controls,text='CONSULTAR TAMANHO DOS MODELOS (sem baixar)',command=lambda:start('sizes'))
-    size_button.grid(row=2,column=0,columnspan=4,sticky='ew',padx=3,pady=3);actions.append(size_button)
+    size_button.grid(row=2,column=0,columnspan=5,sticky='ew',padx=3,pady=3);actions.append(size_button)
+    def set_controls_enabled(enabled):
+        for button in actions:
+            button.configure(state="normal" if enabled else "disabled")
+        hardware.configure(state="readonly" if enabled else "disabled")
+        choice.configure(state="readonly" if enabled else "disabled")
+        whisper_check.configure(state="normal" if enabled else "disabled")
+        audio_analysis_check.configure(state="normal" if enabled else "disabled")
+        text_to_speech_check.configure(state="normal" if enabled else "disabled")
+        audacity_check.configure(state="normal" if enabled else "disabled")
+        openvino_check.configure(state="normal" if enabled else "disabled")
+        if enabled:model_changed()
+
+    def uninstall_all():
+        if state["busy"]: return
+        processing = any(
+            getattr(candidate, 'running', False) or getattr(candidate, 'busy', False)
+            or getattr(getattr(getattr(candidate,'audio_player',None),'audacity_ui',None),'busy',False)
+            or getattr(getattr(getattr(candidate,'audio_player',None),'scene_parts_ui',None),'busy',False)
+            or getattr(getattr(candidate,'audio_player',None),'audio_transform_busy',False)
+            for candidate in (
+                getattr(app, "batch_app", None), getattr(app, "personalized_app", None),
+                getattr(app, "review_app", None), getattr(app, "converter_app", None),
+                getattr(app, "format_app", None), getattr(app, "video_app", None),
+                getattr(app, "swap_app", None), getattr(app, "voice_clone_app", None),
+                getattr(app, "text_to_speech_app", None),getattr(app,"transcription_app",None),
+            ) if candidate is not None
+        )
+        if processing:
+            messagebox.showwarning("Desinstalar ferramentas", "Pare a dublagem, conversão ou revisão em andamento antes de desinstalar as ferramentas.", parent=window)
+            return
+        state["busy"] = True; stop.clear(); set_controls_enabled(False)
+        cancel_button.configure(state="disabled")
+        status.set("Calculando o espaço ocupado somente pelos downloads gerenciados pelo Dublaskizon…")
+        progress.configure(mode="indeterminate"); progress.start(12)
+        app_dir = Path(os.environ.get("DUBLASKIZON_APP_DIR", Path(__file__).resolve().parent)).expanduser().resolve()
+        project = getattr(app, "project_root", None)
+        def inventory():
+            try:
+                from component_uninstall import catalog
+                events.put(('uninstall_ready',catalog(app_dir,project)))
+            except Exception as exc:events.put(('done',(False,'Não foi possível listar os componentes: '+str(exc))))
+        threading.Thread(target=inventory, daemon=True).start()
+
+    uninstall_button = tk.Button(
+        controls, text=i18n.tr("DESINSTALAR TUDO / POR PARTES"), command=uninstall_all,
+        bg="#C00000", activebackground="#8B0000", fg="white", activeforeground="white",
+        relief="flat", font=("Segoe UI", 9, "bold"), padx=8, pady=6, cursor="hand2",
+    )
+    uninstall_button.grid(row=3,column=0,columnspan=5,sticky='ew',padx=3,pady=(6,3));actions.append(uninstall_button)
     def open_log():
         if state["log"] and Path(state["log"]).exists():
             os.startfile(str(state["log"]))
     ttk.Button(controls, text="ABRIR RELATÓRIO", command=open_log).grid(row=1, column=2, sticky="ew", padx=3)
-    links = ttk.Frame(window)
+    links = ttk.Frame(bottom_actions)
     links.pack(fill="x", padx=18, pady=7)
-    for label, url in (("Python oficial", "https://www.python.org/downloads/release/python-31315/"),
+    for link_index,(label, url) in enumerate((("Python oficial", "https://www.python.org/downloads/release/python-31315/"),
                        ("OmniVoice oficial", "https://github.com/k2-fsa/OmniVoice"),
+                       ("Qwen3-TTS oficial", "https://github.com/QwenLM/Qwen3-TTS"),
                        ("F5-TTS Russian", "https://huggingface.co/hotstone228/F5-TTS-Russian"),
+                       ("F5-TTS PT-BR", "https://huggingface.co/firstpixel/F5-TTS-pt-br"),
+                       ("Microsoft DirectML", "https://github.com/microsoft/DirectML"),
                        ("VoiceStudio (opcional)", "https://github.com/debpalash/VoiceStudio/releases"),
                        ("Driver NVIDIA", "https://www.nvidia.com/Download/index.aspx"),
-                       ('GPU AMD: suporte oficial','https://rocm.docs.amd.com/projects/radeon-ryzen/en/latest/docs/compatibility/compatibility.html')):
-        ttk.Button(links, text=label, command=lambda u=url: webbrowser.open(u)).pack(side="left", padx=3)
-    footer = ttk.Frame(window)
+                       ('AMD ROCm / GPUs compatíveis','https://rocm.docs.amd.com/en/latest/install/rocm.html'),('Audacity oficial','https://github.com/audacity/audacity/releases/tag/Audacity-3.7.3'),('OpenVINO oficial','https://github.com/intel/openvino-plugins-ai-audacity/releases/tag/v3.7.1-R4.2'))):
+        ttk.Button(links,text=label,command=lambda u=url:webbrowser.open(u)).grid(row=link_index//4,column=link_index%4,sticky='ew',padx=2,pady=1)
+        links.columnconfigure(link_index%4,weight=1)
+    footer = ttk.Frame(bottom_actions)
     footer.pack(fill="x", padx=18, pady=(0, 12))
     dont_show = tk.BooleanVar(value=not app.should_show_dependency_assistant())
     ttk.Checkbutton(footer, text="Não mostrar novamente ao iniciar", variable=dont_show).pack(side="left")
@@ -685,6 +1315,21 @@ def show_assistant(app):
         app.dependency_window = None
         window.destroy()
     ttk.Button(footer, text="CONTINUAR", command=close).pack(side="right")
+    def prepare_model(target):
+        if state['busy']:
+            messagebox.showinfo('Requisitos','Aguarde a preparação em andamento terminar.',parent=window);return
+        if target not in choice.cget('values'):
+            messagebox.showerror('Modelo','Este modelo precisa de configuração manual nos requisitos.',parent=window);return
+        model.set(target);model_changed()
+        if target==DML_MODEL:variant.set(variants[4])
+        include_audacity.set(False);include_openvino.set(False);native_emotions.set(False)
+        def begin():
+            if state['closed']:return
+            if variant.get()==variants[0] and state['hardware'] is None:window.after(100,begin);return
+            start('prepare_model',confirmed=True)
+        window.after(100,begin)
+    app.dependency_prepare_model=prepare_model
+    bind_body(body)
     window.protocol("WM_DELETE_WINDOW", close)
     def poll():
         if state["closed"] or not window.winfo_exists():
@@ -699,9 +1344,18 @@ def show_assistant(app):
                 write(payload)
             elif kind=='hardware':
                 state['hardware']=payload
-                detected.set('CPU: '+payload['cpu']+' | GPU: '+payload['gpu']+' | Automático: '+('NVIDIA CUDA' if payload['variant']=='cu128' else 'CPU'))
+                auto={'cu128':'NVIDIA CUDA','rocm721':'AMD ROCm 7.2.1','rocm100-gfx1102':'AMD ROCm 10.0 / RX 7600','directml':'Microsoft DirectML / RX 500','cpu':'CPU'}[payload['variant']]
+                detected.set('CPU: '+payload['cpu']+' | GPU: '+payload['gpu']+' | Automático: '+auto)
+                if payload['variant']=='directml' and variant.get()==variants[0]:
+                    model.set(DML_MODEL)
+                    model_changed()
+                    status.set('RX 500 detectada: F5-TTS PT-BR DirectML selecionado automaticamente. Execute os passos 1, 2, 3 e 4.')
             elif kind=='transfer':
-                if payload.get('kind')=='size':
+                if payload.get('kind')=='watchdog':
+                    idle=float(payload.get('idle',0));limit=float(payload.get('limit',240))
+                    if idle >= 30:
+                        transfer_text.set(f"Monitor anti-travamento: {idle:.0f}s sem atividade útil; retomada automática em {max(0,limit-idle):.0f}s se continuar parado.")
+                elif payload.get('kind')=='size':
                     label=payload['name']+': total '+byte_size(payload['total'])+'; falta baixar '+byte_size(payload['missing'])+'; cache '+byte_size(payload['total']-payload['missing'])
                     if payload.get('unknown'):label+=f" (+ {payload['unknown']} arquivo(s) com tamanho desconhecido)"
                     write(label)
@@ -732,7 +1386,39 @@ def show_assistant(app):
                 hardware.configure(state="readonly")
                 choice.configure(state="readonly")
                 whisper_check.configure(state="normal")
+                audio_analysis_check.configure(state="normal")
                 model_changed()
+            elif kind == "uninstall_ready":
+                progress.stop(); progress.configure(mode="determinate", value=0)
+                from component_uninstall import choose,remove_selected
+                if not payload:
+                    state['busy']=False;set_controls_enabled(True);status.set('Nenhum componente removível encontrado.');continue
+                selected=choose(window,payload,theme=app.current_theme())
+                if not selected:
+                    state['busy']=False;set_controls_enabled(True);status.set('Desinstalação cancelada; nenhum arquivo removido.');continue
+                from warm_inference import review_memory_cache
+                if review_memory_cache.snapshot()['active']:
+                    state['busy']=False;set_controls_enabled(True)
+                    messagebox.showwarning('Motor em uso','Aguarde a dublagem terminar antes de remover componentes.',parent=window);continue
+                review_memory_cache.set_enabled(False)
+                status.set('Removendo somente os componentes selecionados…')
+                progress.configure(mode='indeterminate');progress.start(12)
+                def remove_worker():
+                    removed,failures,notices=remove_selected(selected,lambda text:events.put(('text',text)))
+                    events.put(('uninstall_done',(removed,failures,notices)))
+                threading.Thread(target=remove_worker,daemon=True).start()
+            elif kind == "uninstall_done":
+                progress.stop(); progress.configure(mode="determinate",value=100)
+                removed,failures,notices=payload; state["busy"]=False; set_controls_enabled(True)
+                amount=removed_size(removed)
+                write(f"[DESINSTALAÇÃO] Espaço removido: {amount} ({removed} bytes).")
+                for failure in failures: write("[NÃO REMOVIDO] "+failure)
+                for notice in notices:write("[DESINSTALAÇÃO] "+notice)
+                status.set(f"Desinstalação concluída: {amount} removidos." + (f" {len(failures)} item(ns) permaneceram em uso." if failures else ""))
+                message=f"Foram removidos {amount}.\n\nSomente os componentes selecionados foram considerados. Projetos e chaves preservados."
+                if notices:message+="\n\n"+"\n".join(notices)
+                if failures: message+=f"\n\n{len(failures)} item(ns) não puderam ser removidos; feche processos que estejam usando-os e tente novamente."
+                messagebox.showinfo("Desinstalação concluída",message,parent=window)
         window.after(100, poll)
     window.bind("<Destroy>", lambda event: stop.set() if event.widget is window else None, add="+")
     app.ensure_control_contrast(window)

@@ -28,8 +28,15 @@ with tempfile.TemporaryDirectory() as folder:
             app.converter_app.audio_player,
             app.format_app.audio_player,
             app.voice_clone_app.audio_player,
+            app.transcription_app.audio_player,
         ]
         assert all(player.playback_mode == "ffplay" for player in players)
+
+        app.open_scene_editor()
+        root.update()
+        assert app.review_app.audio_player.window is not None
+        editor_position=app.open_editor_button.place_info();memory_position=app.review_memory_controls.place_info()
+        assert int(editor_position['x'])<int(memory_position['x'])
 
         app.toggle_player_mode()
         root.update_idletasks()
@@ -54,3 +61,4 @@ with tempfile.TemporaryDirectory() as folder:
         root.destroy()
 
 print("global_player_mode_ok")
+

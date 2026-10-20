@@ -9,6 +9,13 @@ LABEL = 'F5-TTS Russian — russo / inglês (uso não comercial)'
 VOCODER = 'charactr/vocos-mel-24khz'
 ASR = 'openai/whisper-large-v3-turbo'
 VERSION = '1.1.22'
+AMD_BASE = 'https://repo.radeon.com/rocm/windows/rocm-rel-7.2.1/'
+AMD_SDK = ('rocm_sdk_core-7.2.1-py3-none-win_amd64.whl',
+           'rocm_sdk_devel-7.2.1-py3-none-win_amd64.whl',
+           'rocm_sdk_libraries_custom-7.2.1-py3-none-win_amd64.whl', 'rocm-7.2.1.tar.gz')
+AMD_TORCH = ('torch-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl',
+             'torchaudio-2.9.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl',
+             'torchvision-0.24.1%2Brocm7.2.1-cp312-cp312-win_amd64.whl')
 FILES = {MODEL: ['model_last.safetensors', 'vocab.txt', 'README.md', 'setting.json'],
          VOCODER: ['config.yaml', 'pytorch_model.bin'],
          ASR: ['*.json', '*.safetensors', '*.txt', '*.model']}
@@ -40,20 +47,17 @@ def inference_command():
         raise RuntimeError('Selecione hotstone228/F5-TTS-Russian em REQUISITOS e use 1. INSTALAR / REPARAR, 2. BAIXAR MODELOS e 3. TESTAR MODELO.')
     from batch_tab import find_ffmpeg_directory
     ffmpeg = find_ffmpeg_directory()
-    # Force UTF-8 so f5_tts print of Russian gen_text never hits cp1252.
-    prelude = "import os,sys;os.environ['HF_HUB_OFFLINE']='1';os.environ['TRANSFORMERS_OFFLINE']='1';"
-    prelude += "os.environ['PYTHONIOENCODING']='utf-8';os.environ['HF_ENDPOINT']='https://huggingface.co';"
-    prelude += "hasattr(sys.stdout,'reconfigure') and sys.stdout.reconfigure(encoding='utf-8',errors='replace');"
-    prelude += "hasattr(sys.stderr,'reconfigure') and sys.stderr.reconfigure(encoding='utf-8',errors='replace');"
+    prelude = "import os;os.environ['HF_HUB_OFFLINE']='1';os.environ['TRANSFORMERS_OFFLINE']='1';"
+    prelude += "os.environ['HF_ENDPOINT']='https://huggingface.co';"
     if ffmpeg:
         prelude += f"os.environ['PATH']={str(ffmpeg)!r}+os.pathsep+os.environ.get('PATH','');"
     return [str(python), '-u', '-c', prelude + '\n' + WORKER,
-            '--device', 'cuda' if data.get('variant') == 'cu128' else 'cpu']
+            '--device', 'cuda' if data.get('variant') in ('cu128','rocm721') else 'cpu']
 
 
 def install(job, variant):
     from dependency_setup import runtime_root
-    if variant not in ('cpu', 'cu128'):
+    if variant not in ('cpu', 'cu128', 'rocm721'):
         raise ValueError('Processamento inválido.')
     if os.name != 'nt':
         raise RuntimeError('A preparação automática do F5-TTS requer Windows x64.')
@@ -66,23 +70,33 @@ def install(job, variant):
         except (OSError, RuntimeError):
             pass
     root = runtime_root()
-    base = job.ensure_base_python()
+    base = job.ensure_amd_python() if variant == 'rocm721' else job.ensure_base_python()
     envdir = root / ('f5-env-' + str(time.time_ns()))
-    job.total_steps = 9
+    job.total_steps = 11 if variant == 'rocm721' else 9
     job.run([base, '-m', 'venv', envdir])
     python = envdir / 'Scripts' / 'python.exe'
     pip = [python, '-m', 'pip', 'install', '--retries', '3', '--timeout', '60']
     job.run([*pip, '--index-url', 'https://pypi.org/simple', '--upgrade', 'pip'])
     pip += ['--progress-bar', 'raw']
-    job.run([*pip, '--index-url', f'https://download.pytorch.org/whl/{variant}',
-             'torch==2.8.0', 'torchaudio==2.8.0'], timeout=7200)
+    if variant == 'rocm721':
+        job.write('Instalando o SDK AMD ROCm 7.2.1 pelos pacotes oficiais da AMD...')
+        job.run([*pip,'--no-cache-dir',*[AMD_BASE+name for name in AMD_SDK]],timeout=7200)
+        job.write('Instalando PyTorch 2.9.1 oficial para AMD ROCm...')
+        job.run([*pip,'--no-cache-dir',*[AMD_BASE+name for name in AMD_TORCH]],timeout=7200)
+    else:
+        job.run([*pip, '--index-url', f'https://download.pytorch.org/whl/{variant}',
+                 'torch==2.8.0', 'torchaudio==2.8.0'], timeout=7200)
     constraints = envdir / 'constraints.txt'
-    constraints.write_text('torch==2.8.0\ntorchaudio==2.8.0\ntorchcodec==0.7.0\ntransformers==4.57.6\nhuggingface-hub==0.36.2\ngradio==6.17.3\n', encoding='utf-8')
+    torch_version='2.9.1+rocm7.2.1' if variant=='rocm721' else '2.8.0'
+    audio_version='2.9.1+rocm7.2.1' if variant=='rocm721' else '2.8.0'
+    codec_version='0.8.0' if variant=='rocm721' else '0.7.0'
+    constraints.write_text(f'torch=={torch_version}\ntorchaudio=={audio_version}\ntorchcodec=={codec_version}\ntransformers==4.57.6\nhuggingface-hub==0.36.2\ngradio==6.17.3\n', encoding='utf-8')
     job.run([*pip, '--index-url', 'https://pypi.org/simple', '-c', constraints,
              'f5-tts==' + VERSION, 'audioop-lts'], timeout=7200)
     job.run([python, '-m', 'pip', 'check'])
     job.run([python, '-c', 'from f5_tts.api import F5TTS;import torch,torchaudio;'
-             + ("assert torch.cuda.is_available();print(torch.zeros(1,device='cuda')+1)" if variant == 'cu128' else 'print(torch.zeros(1)+1)')], timeout=180)
+             + ("assert torch.cuda.is_available();print('GPU:',torch.cuda.get_device_name(0),'HIP:',torch.version.hip);print(torch.zeros(1,device='cuda')+1)" if variant == 'rocm721' else
+                "assert torch.cuda.is_available();print(torch.zeros(1,device='cuda')+1)" if variant == 'cu128' else 'print(torch.zeros(1)+1)')], timeout=180)
     job.checkpoint()
     pending = root / ('f5-active-' + str(time.time_ns()) + '.pending.json')
     pending.write_text(json.dumps({'python': python.relative_to(root).as_posix(),
@@ -151,16 +165,7 @@ if sys.argv[2]!='1':
 
 
 WORKER = r'''
-import argparse,gc,sys,os
-# Windows console (cp1252) cannot print Cyrillic from f5_tts.utils_infer.
-# Force UTF-8 on stdout/stderr before any library print of gen_text.
-os.environ.setdefault("PYTHONIOENCODING","utf-8")
-if hasattr(sys.stdout,"reconfigure"):
-    try:sys.stdout.reconfigure(encoding="utf-8",errors="replace")
-    except Exception:pass
-if hasattr(sys.stderr,"reconfigure"):
-    try:sys.stderr.reconfigure(encoding="utf-8",errors="replace")
-    except Exception:pass
+import argparse,gc
 from pathlib import Path
 p=argparse.ArgumentParser()
 p.add_argument('--model',default='hotstone228/F5-TTS-Russian')
@@ -191,7 +196,7 @@ from f5_tts.infer import utils_infer as utils
 # Select that path in this subprocess, including already installed v64 runtimes.
 from transformers.pipelines import automatic_speech_recognition as asr_module
 asr_module.is_torchcodec_available=lambda:False
-if a.device=='cuda' and not torch.cuda.is_available():raise RuntimeError('NVIDIA indisponível; prepare o ambiente F5-TTS em CPU nos REQUISITOS.')
+if a.device=='cuda' and not torch.cuda.is_available():raise RuntimeError('A GPU NVIDIA/AMD não está disponível no PyTorch; repare o modo correto em REQUISITOS ou use CPU.')
 if not a.test:
     if not Path(a.ref_audio).is_file():raise FileNotFoundError(a.ref_audio)
     print('Transcribing reference audio (CPU; antes de carregar a síntese)',flush=True)

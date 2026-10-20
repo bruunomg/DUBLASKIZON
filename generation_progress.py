@@ -6,6 +6,33 @@ import threading
 from pathlib import Path
 
 
+_process_sink=None
+_process_lock=threading.Lock()
+_process_last={}
+def configure_process_sink(callback):
+    global _process_sink
+    _process_sink=callback
+
+def process_label(command):
+    if '--output' in command:
+        return 'GERAÇÃO — '+Path(command[command.index('--output')+1]).name
+    return 'GERAÇÃO DE ÁUDIO'
+
+def emit_process_line(label,line):
+    text=str(line).strip()
+    if not text or _process_sink is None:return
+    # Thousands of model-loading progress updates must not stall the Tk loop.
+    if re.search(r'\d+%\|',text):
+        import time
+        with _process_lock:
+            now=time.monotonic();last=_process_last.get(label,0)
+            if now-last<.5 and '100%' not in text:return
+            if len(_process_last)>64:_process_last.clear()
+            _process_last[label]=now
+    try:_process_sink(label,text)
+    except Exception:pass
+
+
 class GenerationProgress:
     def __init__(self, emit):
         self.emit = emit
@@ -15,7 +42,9 @@ class GenerationProgress:
     def feed(self, line):
         text = line.lower()
         clone, dub, phase = self.clone, self.dub, self.phase
-        if any(word in text for word in ('generating audio', 'sampling', 'denoising', 'synthesizing', 'generation steps')):
+        if 'conferência:' in text:
+            clone, dub, phase = 100.0, max(dub, 90.0), line.strip()[:180]
+        elif any(word in text for word in ('generating audio', 'sampling', 'denoising', 'synthesizing', 'generation steps')):
             clone, dub, phase = 100.0, max(dub, 1.0), 'Dublando / síntese'
         elif any(word in text for word in ('transcrib', 'asr model', 'encoding prompt', 'reference audio')) and not dub:
             clone, phase = max(clone, 65.0), 'Preparando / transcrevendo referência'
@@ -37,6 +66,8 @@ class GenerationProgress:
 def run_observed(command, emit, runner, **kwargs):
     """Keep subprocess.run compatibility while observing CR-delimited output live."""
     kwargs["env"] = {**os.environ, **kwargs.get("env", {}), "PYTHONUNBUFFERED":"1", "PYTHONIOENCODING":"utf-8"}
+    label=process_label(command)
+    emit_process_line(label,'Iniciando processamento de áudio.')
     done = threading.Event()
     observer = GenerationProgress(emit)
     with tempfile.TemporaryDirectory(prefix='dublaskizon-progress-') as directory:
@@ -51,10 +82,12 @@ def run_observed(command, emit, runner, **kwargs):
                     pending = parts.pop()
                     for line in parts:
                         observer.feed(line)
+                        emit_process_line(label,line)
                     if done.is_set():
                         pending += stream.read()
                         for line in re.split(r'[\r\n]', pending):
                             observer.feed(line)
+                            emit_process_line(label,line)
                         return
                     done.wait(.1)
         with path.open('wb') as output:
@@ -62,9 +95,13 @@ def run_observed(command, emit, runner, **kwargs):
             thread.start()
             try:
                 result = runner(command, stdout=output, **kwargs)
+            except BaseException as exc:
+                emit_process_line(label,'ERRO: '+str(exc))
+                raise
             finally:
                 done.set()
                 thread.join()
         if not getattr(result, 'stdout', None):
             result.stdout = path.read_text(encoding='utf-8', errors='replace')[-16000:]
+        emit_process_line(label,'Processamento finalizado; código '+str(result.returncode)+'.')
         return result

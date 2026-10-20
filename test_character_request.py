@@ -41,6 +41,8 @@ with TemporaryDirectory() as tmp:
   Widget.during_wait=lambda:button('CANCELAR').kw['command']()
   assert custom.choose_personalized_voice(Widget(),{},root) is None
  app=review.ReviewApp.__new__(review.ReviewApp);app.busy=False;app.root=Widget();app.request_character_var=Widget(value='1')
+ import queue
+ app.regen_stage_events=queue.Queue()
  calls=[];app._choose_r_override=lambda parent:'unchanged';app.voice_model_picker=lambda parent:model
  app.regenerate_scene=lambda:calls.append(app.alternate_reference_audio)
  app._redub_with_r_request();assert calls==[model] and app.alternate_reference_audio is None

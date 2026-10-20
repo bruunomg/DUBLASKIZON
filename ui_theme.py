@@ -97,7 +97,7 @@ BUTTON_PALETTES: dict[str, dict[str, dict[str, str]]] = {
         "teal": {"bg": "#2DD4BF", "activebackground": "#14B8A6", "fg": "#042F2E", "activeforeground": "#042F2E"},
         "highlight": {"bg": "#F59E0B", "activebackground": "#D97706", "fg": "#451A03", "activeforeground": "#451A03"},
         "tab_active": {"bg": "#60A5FA", "activebackground": "#3B82F6", "fg": "#0F172A", "activeforeground": "#0F172A"},
-        "tab_inactive": {"bg": "#52627A", "activebackground": "#718096", "fg": "#F8FAFC", "activeforeground": "#0F172A"},
+        "tab_inactive": {"bg": "#2B3442", "activebackground": "#3B4656", "fg": "#F8FAFC", "activeforeground": "#F8FAFC"},
         "tab_primary_active": {"bg": "#60A5FA", "activebackground": "#3B82F6", "fg": "#0F172A", "activeforeground": "#0F172A"},
         "tab_primary_inactive": {"bg": "#35445A", "activebackground": "#52627A", "fg": "#F8FAFC", "activeforeground": "#F8FAFC"},
         "tab_accent_active": {"bg": "#60A5FA", "activebackground": "#3B82F6", "fg": "#0F172A", "activeforeground": "#0F172A"},
@@ -204,3 +204,26 @@ def apply_button_style_to_tree(widget: Any, theme: dict[str, Any] | None) -> Non
             apply_button_style_to_tree(child, theme)
     except Exception:
         pass
+
+
+def theme_dialog(window, theme=None):
+    """Theme a completed settings dialog without changing global ttk styles."""
+    import tkinter as tk
+    from tkinter import ttk
+    theme=theme or {}
+    bg=theme.get('surface','#283445');fg=theme.get('text','#F8FAFC')
+    field=theme.get('input','#172231');field_fg=theme.get('input_text',fg)
+    window.configure(bg=bg)
+    style=ttk.Style(window);prefix='Settings'+str(id(window))
+    for kind in ('TFrame','TLabelframe','TLabel','TCheckbutton','TRadiobutton'):
+        style.configure(prefix+'.'+kind,background=bg,foreground=fg)
+    for kind in ('TEntry','TCombobox'):
+        style.configure(prefix+'.'+kind,fieldbackground=field,foreground=field_fg,insertcolor=field_fg)
+        style.map(prefix+'.'+kind,fieldbackground=[('readonly',field)],foreground=[('readonly',field_fg)])
+    def visit(widget):
+        if isinstance(widget,ttk.Widget):
+            kind=widget.winfo_class()
+            if kind in ('TFrame','TLabelframe','TLabel','TCheckbutton','TRadiobutton','TEntry','TCombobox'):widget.configure(style=prefix+'.'+kind)
+        elif isinstance(widget,tk.Button):apply_button_style(widget,theme,'secondary')
+        for child in widget.winfo_children():visit(child)
+    visit(window)

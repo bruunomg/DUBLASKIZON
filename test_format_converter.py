@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import tempfile
+import threading
+import queue
 from pathlib import Path
 
 import format_converter_tab
@@ -40,14 +42,43 @@ def main() -> None:
         assert dubbed == [dubbed_dir / "cena_001.wav"]
         app = format_converter_tab.FormatConverterApp.__new__(format_converter_tab.FormatConverterApp)
         app.project_root = root
+        app.file_relative_by_path = {}
         nested_target = app.output_target(nested_source, root / "out", "MP3 — 320 kbps — 48 kHz — estéreo")
-        assert nested_target == root / "out" / "CAP01" / "fala.mp3"
+        assert nested_target == root / "out" / "WAV ORIGINAIS" / "CAP01" / "fala.mp3"
         target = app.output_target(source, root / "out", "MP3 — 320 kbps — 48 kHz — estéreo")
-        assert target.name == "voice.mp3"
-        (root / "out").mkdir()
+        assert target == root / "out" / root.name / "voice.mp3"
+        target.parent.mkdir(parents=True)
         target.touch()
         next_target = app.output_target(source, root / "out", "MP3 — 320 kbps — 48 kHz — estéreo")
-        assert next_target.name == "voice_convertido.mp3"
+        assert next_target == target
+        assert "_convertido" not in next_target.name
+
+        dragged = root / "PERSONAGEM" / "CAP02" / "linha.wav"
+        dragged.parent.mkdir(parents=True)
+        dragged.write_bytes(b"RIFF")
+        key = format_converter_tab.os.path.normcase(str(dragged.resolve()))
+        app.file_relative_by_path[key] = Path("PERSONAGEM") / "CAP02" / "linha.wav"
+        dragged_target = app.output_target(dragged, root / "out", "MP3 — 320 kbps — 48 kHz — estéreo")
+        assert dragged_target == root / "out" / "PERSONAGEM" / "CAP02" / "linha.mp3"
+
+        # O lote publica somente os convertidos, preservando cada hierarquia e
+        # substituindo uma conversão anterior sem acrescentar _convertido.
+        other = root / "OUTRO" / "CAP02" / "linha.wav"
+        other.parent.mkdir(parents=True)
+        other.write_bytes(b"RIFF")
+        other_key = format_converter_tab.os.path.normcase(str(other.resolve()))
+        app.file_relative_by_path[other_key] = Path("OUTRO") / "CAP02" / "linha.wav"
+        app.cancel_event = threading.Event()
+        app.queue = queue.Queue()
+        app.append_log = lambda _text: None
+        app._log_central = lambda _text, _level: None
+        app.run_ffmpeg = lambda _source, destination, _format: destination.write_bytes(b"CONVERTED")
+        output = root / format_converter_tab.FORMAT_OUTPUT_FOLDER_NAME
+        app.conversion_worker([dragged, other], "MP3 — 320 kbps — 48 kHz — estéreo", output)
+        assert (output / "PERSONAGEM" / "CAP02" / "linha.mp3").read_bytes() == b"CONVERTED"
+        assert (output / "OUTRO" / "CAP02" / "linha.mp3").read_bytes() == b"CONVERTED"
+        assert not list(output.rglob("*_convertido*"))
+        assert not list(output.rglob("*.wav"))
 
 
 if __name__ == "__main__":

@@ -92,6 +92,12 @@ class F5Tests(unittest.TestCase):
             self.assertFalse((root/'f5-active.json').exists())
             self.assertEqual(old.read_text(),'old omni')
 
+    def test_amd_runtime_routes_through_hip_cuda_api(self):
+        with tempfile.TemporaryDirectory() as temp,patch.object(setup,'runtime_root',return_value=Path(temp)),patch.object(batch_tab,'find_ffmpeg_directory',return_value=None):
+            root=Path(temp);python=root/'amd'/'Scripts'/'python.exe';python.parent.mkdir(parents=True);python.touch()
+            (root/'f5-active.json').write_text(json.dumps({'python':python.relative_to(root).as_posix(),'variant':'rocm721'}))
+            self.assertEqual(f5.inference_command()[-2:],['--device','cuda'])
+
     def test_download_routes_required_models_even_without_optional_whisper(self):
         job=setup.SetupJob.__new__(setup.SetupJob)
         with patch.object(f5,'download') as download:

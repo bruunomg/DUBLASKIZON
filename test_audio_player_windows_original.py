@@ -38,6 +38,10 @@ with tempfile.TemporaryDirectory() as folder:
     try:
         manager.play_one(dubbed, "OUVIR CENA", playlist=[dubbed], index=0)
         root.update_idletasks()
+        assert manager.window is None
+        assert captured == [dubbed.resolve()]
+        manager.play_one(dubbed,'OUVIR CENA — EDITOR',playlist=[dubbed],index=0,force_editor=True)
+        root.update_idletasks()
         assert manager.window is not None
         assert manager.original_button.cget("state") == "normal"
         assert manager.start_button.cget("state") == "normal"
@@ -47,7 +51,7 @@ with tempfile.TemporaryDirectory() as folder:
         while manager.thread is not None and manager.thread.is_alive() and time.monotonic() < deadline:
             root.update()
             time.sleep(0.01)
-        assert captured == [original.resolve()], captured
+        assert captured == [dubbed.resolve(), original.resolve()], captured
         for _ in range(20):
             root.update()
             if manager.start_button.cget("state") == "normal":
@@ -60,7 +64,7 @@ with tempfile.TemporaryDirectory() as folder:
         while manager.thread is not None and manager.thread.is_alive() and time.monotonic() < deadline:
             root.update()
             time.sleep(0.01)
-        assert captured == [original.resolve(), dubbed.resolve()], captured
+        assert captured == [dubbed.resolve(), original.resolve(), dubbed.resolve()], captured
         manager.close_window()
     finally:
         audio_player.sys.platform = old_platform

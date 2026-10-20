@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Dublagem personalizada com voz-modelo e expressão aproximada da cena original.
+"""Dublagem personalizada com voz-modelo e ritmo natural por padrão.
 
 O OmniVoice expõe uma única referência de áudio (``--ref_audio``). Portanto ele
 não separa, de forma nativa, "identidade/timbre" e "prosódia/expressão" em dois
-arquivos independentes. Esta aba usa o áudio-modelo como referência de voz e,
-após a síntese, aproxima ritmo, pausas e dinâmica do WAV original. Isso preserva
-melhor a identidade do modelo sem prometer transferência exata de entonação.
+arquivos independentes. Esta aba preserva a duração gerada. O alinhamento
+ao original é aplicado somente quando habilitado pelo usuário.
 """
 from __future__ import annotations
 
 import json
 from generation_progress import GenerationProgress
+from warm_inference import warm_batch
 import os
 import queue
 import shutil
@@ -170,7 +170,201 @@ def _safe_replace_file(source: Path, target: Path, retries: int = 18, delay: flo
     )
 
 
-def match_original_expression(generated: Path, original: Path, target: Path, progress_callback=None) -> None:
+def _silero_speech_regions(source, dub, rate=24000):
+    """Run both detections in the managed runtime, keeping Torch out of the EXE."""
+    import tempfile
+    import numpy as np
+    from dependency_setup import managed_python
+    python = managed_python()
+    if not python:
+        raise RuntimeError('Prepare Silero VAD pelo botão 1 em REQUISITOS.')
+    code = r'''
+import sys,json,numpy as np,torch
+from silero_vad import load_silero_vad,get_speech_timestamps
+torch.set_num_threads(1)
+model=load_silero_vad()
+rate=int(sys.argv[3]);result=[]
+for path in sys.argv[1:3]:
+    samples=np.load(path).astype(np.float32)/32768
+    length=max(1,round(len(samples)*16000/rate))
+    pcm=np.interp(np.linspace(0,len(samples)-1,length),np.arange(len(samples)),samples).astype(np.float32)
+    with torch.inference_mode():
+        regions=get_speech_timestamps(torch.from_numpy(pcm),model,sampling_rate=16000,
+            threshold=.4,min_speech_duration_ms=100,min_silence_duration_ms=150,speech_pad_ms=40)
+    result.append([(max(0,round(r['start']*rate/16000)),min(len(samples),round(r['end']*rate/16000))) for r in regions])
+print('DUBLASKIZON_VAD '+json.dumps(result))
+'''
+    with tempfile.TemporaryDirectory(prefix='dublaskizon-vad-') as folder:
+        paths = [Path(folder)/'original.npy', Path(folder)/'dub.npy']
+        np.save(paths[0], source); np.save(paths[1], dub)
+        result = subprocess.run([str(python), '-u', '-c', code, *map(str, paths), str(rate)],
+                                capture_output=True, text=True, encoding='utf-8', errors='replace',
+                                timeout=120, **batch_tab.hidden_process_kwargs())
+        for line in result.stdout.splitlines():
+            if not result.returncode and line.startswith('DUBLASKIZON_VAD '):
+                print('ALINHAMENTO: Silero VAD / CPU; fala detectada nos dois áudios.', flush=True)
+                return json.loads(line.split(' ', 1)[1])
+        raise RuntimeError('Silero VAD indisponível. Use botão 1 em REQUISITOS para preparar o modelo.')
+
+
+def _speech_regions(samples, rate=24000):
+    """Detect energy activity, retaining quiet edges and merging short pauses."""
+    import numpy as np
+    hop = max(1, round(rate * .01))
+    levels = np.array([np.sqrt(np.mean(samples[i:i+hop].astype(float)**2))
+                       for i in range(0, len(samples), hop)])
+    if not len(levels) or levels.max() < 32:
+        return []
+    threshold = max(32, float(np.percentile(levels, 90)) * .035)
+    active = np.flatnonzero(levels > threshold)
+    groups = []
+    for index in active:
+        start, end = max(0, index * hop - 2 * hop), min(len(samples), (index + 3) * hop)
+        if groups and start - groups[-1][1] < rate * .15:
+            groups[-1] = (groups[-1][0], end)
+        else:
+            groups.append((start, end))
+    return groups
+
+
+def _merge_speech_regions(regions, count):
+    regions = list(regions)
+    while len(regions) > count:
+        index = min(range(len(regions)-1), key=lambda i: regions[i+1][0]-regions[i][1])
+        regions[index:index+2] = [(regions[index][0], regions[index+1][1])]
+    return regions
+
+
+class AlignmentLimitExceeded(RuntimeError):
+    """A usable dub should remain available when fitting would distort speech."""
+
+
+def _protected_speech_regions(samples, detected, rate=24000):
+    """Keep weak speech; shorten sustained quiet gaps, including low noise.
+
+    VAD can span an entire scene. Energy contrast supplies a second check rather
+    than treating that whole interval as continuous speech. Without contrast,
+    retain the conservative digital-silence policy.
+    """
+    import numpy as np
+    if not len(samples):
+        return []
+    silent = np.asarray(samples == 0, dtype=bool).copy()
+    for a, b in detected:
+        silent[max(0, a):min(len(samples), b)] = False
+    hop = max(1, round(rate*.01))
+    blocks=[samples[i:i+hop].astype(float) for i in range(0,len(samples),hop)]
+    levels=np.array([np.sqrt(np.mean(block**2)) for block in blocks])
+    peaks=np.array([np.max(np.abs(block)) for block in blocks])
+    noise=float(np.percentile(levels,10))
+    threshold=max(1.,min(96.,noise*1.8))
+    # Strong speech/quiet contrast is required. Uniform faint audio is kept.
+    if levels.max() >= threshold*8:
+        quiet=(levels<=threshold) & (peaks<=threshold*4)
+        silent=np.repeat(quiet,hop)[:len(samples)]
+    boundaries = np.flatnonzero(np.diff(np.r_[False, silent, False].astype(np.int8)))
+    margin = round(rate * .04)
+    regions, cursor = [], 0
+    for a, b in zip(boundaries[::2], boundaries[1::2]):
+        if b-a < rate * .15 + 2*margin:
+            continue
+        left, right = int(a+margin), int(b-margin)
+        if left > cursor:
+            regions.append((cursor, left))
+        cursor = right
+    if cursor < len(samples):
+        regions.append((cursor, len(samples)))
+    # Edge padding must not become a separate all-silent "speech" block.
+    # Preserve every nonzero sample, including quiet consonants missed by VAD.
+    protected=[]
+    for a,b in regions:
+        active=np.flatnonzero(samples[a:b] != 0)
+        if not len(active):continue
+        protected.append((max(a,a+int(active[0])-margin),
+                          min(b,a+int(active[-1])+1+margin)))
+    return protected
+
+
+def _compact_speech_block(samples, regions, start, end):
+    """Remove detected gaps, retaining padded edges of each utterance."""
+    import numpy as np
+    pieces = [samples[max(start, a):min(end, b)] for a, b in regions
+              if max(start, a) < min(end, b)]
+    return np.concatenate(pieces) if pieces else np.empty(0, dtype=samples.dtype)
+
+
+def _align_speech_regions(generated, original, target, ffmpeg, max_change=100):
+    """Move speech blocks onto original activity intervals, preserving their order."""
+    import numpy as np
+    from pydub import AudioSegment
+    import tempfile
+    rate = 24000
+    def read(path):
+        audio = AudioSegment.from_file(path).set_frame_rate(rate).set_channels(1).set_sample_width(2)
+        return np.frombuffer(audio.raw_data, dtype=np.int16)
+    source, dub = read(original), read(generated)
+    try:
+        src_regions, dub_regions = _silero_speech_regions(source, dub, rate)
+    except (RuntimeError, OSError, subprocess.TimeoutExpired) as error:
+        print('AVISO: ' + str(error) + ' Usando detecção por energia nesta execução.', flush=True)
+        src_regions, dub_regions = _speech_regions(source), _speech_regions(dub)
+    if not src_regions or not dub_regions:
+        return False
+    # VAD is a detector, not permission to delete the beginning or quiet words.
+    dub_regions = _protected_speech_regions(dub, dub_regions, rate)
+    count = min(len(src_regions), len(dub_regions))
+    detected_dub_regions = list(dub_regions)
+    src_regions = _merge_speech_regions(src_regions, count)
+    dub_regions = _merge_speech_regions(dub_regions, count)
+    # Remove detected silence rather than compressing it along with the speech.
+    # Detection retains a 20 ms margin around quiet consonants and syllable tails.
+    output = np.zeros(len(source), dtype=np.int16)
+    previous_end = 0
+    with tempfile.TemporaryDirectory(prefix='dublaskizon-alinhar-') as folder:
+        for index, ((a, b), (c, d)) in enumerate(zip(src_regions, dub_regions)):
+            # Borrow unused trailing space before accelerating speech. Genuine
+            # onset anchors stay fixed; no artificial leading silence is added.
+            next_start = src_regions[index+1][0] if index+1<count else len(source)
+            length = max(b-a, next_start-a)
+            speech = _compact_speech_block(dub, detected_dub_regions, c, d)
+            # A long dubbed block can use free space BEFORE its anchor too.
+            # Otherwise a large leading pause needlessly forces fast speech.
+            borrow = min(max(0, a-previous_end), max(0, len(speech)-length))
+            a -= borrow
+            length += borrow
+            # Short speech stays at its natural rate; the rest of the slot is silence.
+            speed = max(1.0, len(speech)/length)
+            if abs(speed-1)*100 > max_change:
+                raise AlignmentLimitExceeded(f'Bloco {index+1}/{count}: fala sem silêncios {len(speech)/rate:.2f}s; espaço original {length/rate:.2f}s; aceleração necessária {speed:.2f}x; limite {1+max_change/100:.2f}x. Edição preservada. Remova silêncios do meio ou ajuste o texto/divisões.')
+            if speed <= 1.00001:
+                # No tempo correction is needed: preserve every original PCM sample.
+                block = speech.copy()
+            else:
+                input_path, output_path = Path(folder)/'entrada.wav', Path(folder)/'saida.wav'
+                with input_path.open('wb') as stream:
+                    AudioSegment(data=speech.tobytes(), sample_width=2, frame_rate=rate, channels=1).export(stream, format='wav')
+                command = [ffmpeg, '-y', '-v', 'error', '-i', str(input_path), '-af', _atempo_chain(speed),
+                           '-ar', str(rate), '-ac', '1', '-c:a', 'pcm_s16le', str(output_path)]
+                result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                        **batch_tab.hidden_process_kwargs())
+                if result.returncode or not output_path.is_file():
+                    raise RuntimeError('FFmpeg não conseguiu alinhar um bloco de fala.')
+                block = read(output_path)
+            if not len(block):
+                raise RuntimeError('Bloco alinhado vazio; áudio anterior preservado.')
+            # atempo has frame rounding. Fit its complete output, never cut the tail.
+            expected_length = min(len(speech), length)
+            if abs(len(block)-expected_length)/expected_length > .05:
+                raise RuntimeError('Duração do bloco alinhado imprecisa; áudio anterior preservado.')
+            fitted = np.interp(np.linspace(0, len(block)-1, expected_length), np.arange(len(block)), block)
+            output[a:a+expected_length] = np.clip(fitted, -32768, 32767).astype(np.int16)
+            previous_end = a + expected_length
+    with target.open('wb') as stream:
+        AudioSegment(data=output.tobytes(), sample_width=2, frame_rate=rate, channels=1).export(stream, format='wav')
+    return True
+
+
+def match_original_expression(generated: Path, original: Path, target: Path, progress_callback=None, max_change=100) -> None:
     """Aproxima duração, pausas e envelope de intensidade do original.
 
     A entonação/pitch exata não é transferida, pois o OmniVoice atual não expõe
@@ -182,6 +376,10 @@ def match_original_expression(generated: Path, original: Path, target: Path, pro
     ffmpeg = _ffmpeg_path()
     if not ffmpeg:
         shutil.copy2(generated, target)
+        return
+
+    if _align_speech_regions(generated, original, target, ffmpeg, max_change):
+        report(100)
         return
 
     original_duration = _audio_duration(original)
@@ -211,9 +409,13 @@ def match_original_expression(generated: Path, original: Path, target: Path, pro
 
         src = AudioSegment.from_file(original).set_frame_rate(24000).set_channels(1).set_sample_width(2)
         dub = AudioSegment.from_file(timed).set_frame_rate(24000).set_channels(1).set_sample_width(2)
-        n = min(len(src.raw_data), len(dub.raw_data)) // 2
-        src_arr = np.frombuffer(src.raw_data[: n * 2], dtype=np.int16).astype(np.float32)
-        dub_arr = np.frombuffer(dub.raw_data[: n * 2], dtype=np.int16).astype(np.float32)
+        # Preserve every synthesized sample, including any tail beyond the original.
+        dub_arr = np.frombuffer(dub.raw_data, dtype=np.int16).astype(np.float32)
+        src_arr = np.frombuffer(src.raw_data, dtype=np.int16).astype(np.float32)
+        if len(src_arr) < len(dub_arr):
+            src_arr = np.pad(src_arr, (0, len(dub_arr) - len(src_arr)))
+        else:
+            src_arr = src_arr[:len(dub_arr)]
         if len(src_arr) < 400 or len(dub_arr) < 400:
             _safe_replace_file(timed, target)
             return
@@ -236,9 +438,9 @@ def match_original_expression(generated: Path, original: Path, target: Path, pro
             wanted = sr / src_med
             current = dr / dub_med
             gain = wanted / max(0.10, current)
-            if sr < src_med * 0.08:  # pausa/silêncio do original
-                gain = min(gain, 0.08)
-            gains[i] = float(np.clip(gain, 0.08, 1.8))
+            # Original pauses do not necessarily coincide with translated words.
+            # Never mute a spoken word simply because the original was silent.
+            gains[i] = float(np.clip(gain, 0.55, 1.8))
         if len(gains) >= 5:
             gains = np.convolve(gains, np.ones(5, dtype=np.float32) / 5.0, mode="same")
         out = dub_arr.copy()
@@ -251,7 +453,8 @@ def match_original_expression(generated: Path, original: Path, target: Path, pro
         )
         target.parent.mkdir(parents=True, exist_ok=True)
         report(90)
-        final.export(target, format="wav", parameters=["-acodec", "pcm_s16le"])
+        with target.open('wb') as stream:
+            final.export(stream, format="wav", parameters=["-acodec", "pcm_s16le"])
         timed.unlink(missing_ok=True)
     except Exception:
         _safe_replace_file(timed, target)
@@ -367,7 +570,7 @@ class PersonalizedDubbingApp:
         self.theme = {"mode": "claro", "input": "#FFFFFF", "input_text": "#1F2937", "select": "#DBEAFE"}
         self.audio_by_stem = batch_tab.find_audio_by_stem()
         self.text_by_stem = batch_tab.find_text_by_stem()
-        self.stems = sorted(set(self.audio_by_stem) & set(self.text_by_stem), key=str.casefold)
+        self.stems = sorted(self.audio_by_stem, key=str.casefold)
         self.scope_folders=set();self.scope_names=set()
         self.completed_stems = set(batch_tab.find_audio_by_stem(CUSTOM_DIR))
         self.selected_stems = set(self.stems) - self.completed_stems
@@ -457,8 +660,8 @@ class PersonalizedDubbingApp:
         ttk.Label(header, text="DUBLAGEM PERSONALIZADA", font=("Segoe UI", 16, "bold")).pack(anchor="w")
         ttk.Label(
             header,
-            text=("Usa o ÁUDIO MODELO para a identidade/timbre da voz e o áudio ORIGINAL da cena para aproximar duração, pausas e intensidade. "
-                  "A entonação exata do original não pode ser separada pelo OmniVoice atual."),
+            text=("Usa o ÁUDIO MODELO como referência de voz e preserva o ritmo gerado. "
+                  "Para ajustar ao original, ative ALINHAR RITMO E DURAÇÃO AO ORIGINAL."),
             wraplength=1350,
         ).pack(anchor="w", pady=(2, 0))
 
@@ -495,6 +698,7 @@ class PersonalizedDubbingApp:
         self.scene_list.bind("<Button-4>", self.scroll_scene_list)
         self.scene_list.bind("<Button-5>", self.scroll_scene_list)
         self.scene_list.bind("<Double-Button-1>", self.listen_selected_scene)
+        self.scene_list.bind("<<ListboxSelect>>", self._follow_selected_scene)
         self.scene_list.bind("<Button-3>", self.show_scene_context_menu)
         bar = ttk.Frame(scenes); bar.pack(fill="x", pady=(6, 0))
         self.select_all_button = Button(bar, text="SELECIONAR TODOS", command=lambda: self.scene_list.selection_set(0, END), relief="flat", cursor="hand2")
@@ -517,11 +721,13 @@ class PersonalizedDubbingApp:
             state="readonly", width=18)
         self.r_pronunciation_combo.pack(side="left")
         self.r_pronunciation_combo.bind("<MouseWheel>", lambda _event: "break")
+        from speech_completeness import mount_controls
+        mount_controls(action, ROOT)
         stages = ttk.Frame(action)
         stages.pack(fill="x", pady=(0, 6))
         for index, (label, variable) in enumerate((("Clonagem / voz-modelo", self.clone_stage_var),
                                 ("Dublagem / síntese", self.dub_stage_var),
-                                ("Ritmo / pausas do original", self.original_stage_var))):
+                                ("Ritmo / duração (opcional)", self.original_stage_var))):
             stages.columnconfigure(index, weight=1, uniform="personalized_stages")
             column = ttk.Frame(stages)
             column.grid(row=0, column=index, sticky="ew", padx=(0 if index == 0 else 8, 0))
@@ -590,8 +796,7 @@ class PersonalizedDubbingApp:
         self.reload_scenes()
 
     def _apply_scene_scope(self,select_all=False):
-        enabled = getattr(self, 'auto_translation_var', None)
-        all_stems=sorted(set(self.audio_by_stem) if enabled is not None and enabled.get()=='1' else set(self.audio_by_stem)&set(self.text_by_stem),key=str.casefold)
+        all_stems=sorted(self.audio_by_stem,key=str.casefold)
         self.stems=filter_personalized_scenes(all_stems,getattr(self,'scope_folders',()),getattr(self,'scope_names',()))
         self.populate_scenes()
         if select_all and self.stems:
@@ -601,7 +806,7 @@ class PersonalizedDubbingApp:
         status=getattr(self,'scope_status',None)
         if status is not None:
             choices=[str(p) for p in sorted(getattr(self,'scope_folders',()))]+['Personagem: '+n for n in sorted(getattr(self,'scope_names',()))]
-            status.set((' + '.join(choices) if choices else 'Todas as pastas do projeto')+f' — {len(self.stems)} cenas com áudio + TXT')
+            status.set((' + '.join(choices) if choices else 'Todas as pastas do projeto')+f' — {len(self.stems)} cenas com áudio')
 
     def add_scene_folder(self):
         if self.busy:return
@@ -615,7 +820,7 @@ class PersonalizedDubbingApp:
 
     def add_character_folders(self):
         if self.busy:return
-        all_stems=sorted(set(self.audio_by_stem)&set(self.text_by_stem),key=str.casefold)
+        all_stems=sorted(self.audio_by_stem,key=str.casefold)
         folders=set()
         for stem in self.audio_by_stem:
             parent=Path(stem).parent
@@ -676,7 +881,8 @@ class PersonalizedDubbingApp:
         selected={previous[int(i)] for i in self.scene_list.curselection() if previous and int(i)<len(previous)}
         self.scene_list.delete(0,END)
         finished=getattr(self,'completed_stems',set())
-        if self.stems:self.scene_list.insert(END,*[("[OK] " if stem in finished else "")+stem for stem in self.stems])
+        from speech_completeness import needs_review
+        if self.stems:self.scene_list.insert(END,*[(('[REVISAR] ' if needs_review(CUSTOM_DIR / f'{stem}.wav') else '[OK] ') if stem in finished else '')+stem for stem in self.stems])
         if previous is None and self.stems:
             for i,stem in enumerate(self.stems):
                 if stem not in finished:self.scene_list.selection_set(i)
@@ -783,6 +989,7 @@ class PersonalizedDubbingApp:
         self.audio_player.set_review_snapshot_provider(self.player_progress_snapshot)
         self.audio_player.set_review_preferences({
             "auto_open_var": controller.auto_open_var,
+            "preserve_original_voice_var": getattr(controller,'preserve_original_voice_var',None),
             "auto_open_command": controller.toggle_auto_open,
             "request_character_var": getattr(controller,"request_character_var",None),
             "request_translation_var": getattr(controller,"request_translation_var",None),
@@ -803,6 +1010,12 @@ class PersonalizedDubbingApp:
         return controller
 
     def _sync_personalized_scene(self, stem, index=0):
+        if stem in self.stems:
+            selected_index = self.stems.index(stem)
+            self.scene_list.selection_clear(0, END)
+            self.scene_list.selection_set(selected_index)
+            self.scene_list.activate(selected_index)
+            self.scene_list.see(selected_index)
         controller = self._ensure_scene_review()
         # O worker continua associado à sua cena até finalizar.
         if controller.busy:
@@ -830,7 +1043,8 @@ class PersonalizedDubbingApp:
         if stem in self.stems:
             index=self.stems.index(stem)
             self.scene_list.delete(index)
-            self.scene_list.insert(index, "[OK] " + stem)
+            from speech_completeness import needs_review
+            self.scene_list.insert(index, ('[REVISAR] ' if needs_review(CUSTOM_DIR / f'{stem}.wav') else '[OK] ') + stem)
             self.scene_list.selection_clear(index)
 
     def player_progress_snapshot(self, stem=None):
@@ -917,6 +1131,12 @@ class PersonalizedDubbingApp:
         finally:menu.grab_release()
         return "break"
 
+    def _follow_selected_scene(self, _event=None):
+        selection = self.scene_list.curselection()
+        if selection and int(selection[0]) < len(self.stems):
+            stem = self.stems[int(selection[0])]
+            self.audio_player.follow_scene_selection(stem, [CUSTOM_DIR / f'{key}.wav' for key in self.stems], self.stems)
+
     def listen_selected_scene(self, event=None):
         if event is not None:
             index = self.scene_list.nearest(event.y)
@@ -972,8 +1192,8 @@ class PersonalizedDubbingApp:
         if self.running or (self.review_app is not None and getattr(self.review_app, "busy", False)):
             self.status_var.set("Aguarde a dublagem atual terminar antes de redublar.")
             return
-        if stem not in self.audio_by_stem or stem not in self.text_by_stem:
-            self.status_var.set("Original ou texto da cena não encontrado.")
+        if stem not in self.audio_by_stem:
+            self.status_var.set("Áudio original da cena não encontrado.")
             return
         model = custom_model_for_stem(stem)
         self.start_generation(stems_override=[stem], model_override=model)
@@ -1053,10 +1273,20 @@ class PersonalizedDubbingApp:
         from audio_translation import settings
         self.run_speech_language=settings(self.auto_translation_settings)['tts_language']
         from f5_backend import MODEL as F5_MODEL, validate
+        from directml_backend import MODEL as DML_MODEL, validate as validate_dml
         if self.run_voice_model == F5_MODEL:
             try:validate(self.run_speech_language)
             except ValueError as exc:
                 messagebox.showerror('F5-TTS Russian',str(exc),parent=self.root);return
+        elif self.run_voice_model == DML_MODEL:
+            try:validate_dml(self.run_speech_language)
+            except ValueError as exc:
+                messagebox.showerror('F5-TTS PT-BR DirectML',str(exc),parent=self.root);return
+        from qwen_backend import MODEL as QWEN_MODEL, validate as validate_qwen
+        if self.run_voice_model == QWEN_MODEL:
+            try:validate_qwen(self.run_speech_language)
+            except ValueError as exc:
+                messagebox.showerror('Qwen3-TTS',str(exc),parent=self.root);return
         self.append_log('Gerador: '+self.run_voice_model)
         if self.run_translation_settings is not None:
             from audio_translation import translation_python
@@ -1082,6 +1312,7 @@ class PersonalizedDubbingApp:
             except OSError: pass
         self.status_var.set("Cancelamento solicitado...")
 
+    @warm_batch
     def _worker(self, stems: list[str], model: Path, infer_prefix: list[str], force=False, r_mode="unchanged"):
         manifest = load_custom_manifest()
         total = len(stems)
@@ -1115,13 +1346,19 @@ class PersonalizedDubbingApp:
                 from audio_translation import synthesis_settings
                 voice_model,instruction=synthesis_settings(language,getattr(self,'run_voice_model',batch_tab.MODEL),batch_tab.INSTRUCT)
                 command = [*infer_prefix, "--model", voice_model, "--text", batch_tab.apply_r_pronunciation(text, r_mode if language in ('pt','Portuguese') else 'unchanged'), "--language", language, "--instruct", instruction, "--ref_audio", str(model), "--output", str(temp)]
+                from voice_reference import protect_reference_command
+                command = protect_reference_command(command, voice_model)
+                from speech_completeness import verified_command
+                command = verified_command(command, voice_model, ROOT, personalized_pauses=True)
                 self.queue.put(("status", f"[{number}/{total}] Clonando voz-modelo e dublando: {stem}"))
                 self.queue.put(("log", f"[{number}/{total}] {stem}"))
-                self.current_process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, **batch_tab.hidden_process_kwargs())
+                self.current_process = self._warm_inference.start(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, **batch_tab.hidden_process_kwargs())
                 observer=GenerationProgress(lambda clone,dub,phase:self.queue.put(("stage",clone,dub,0,stem+": "+phase)))
                 lines=[]
                 for line in self.current_process.stdout:
                     observer.feed(line)
+                    if 'Referência completa' in line or 'AVISO:' in line or 'CONFERÊNCIA:' in line:
+                        self.queue.put(('log', line.strip()))
                     lines.append(line)
                     if len(lines)>100:lines.pop(0)
                 self.current_process.wait()
@@ -1131,19 +1368,22 @@ class PersonalizedDubbingApp:
                 if self.cancel_requested: break
                 if rc != 0 or not temp.is_file():
                     raise RuntimeError((stdout or f"OmniVoice terminou com código {rc}")[-1600:])
-                self.queue.put(("status", f"[{number}/{total}] Aplicando ritmo/pausas/intensidade do original: {stem}"))
-                self.queue.put(("stage",100,100,1,"Aplicando ritmo / pausas do original: "+stem))
                 if getattr(self,'run_alignment_settings',None):
+                    self.queue.put(("status", f"[{number}/{total}] Alinhando ritmo e duração ao original: {stem}"))
+                    self.queue.put(("stage",100,100,1,"Alinhando ritmo e duração ao original: "+stem))
                     batch_tab.BatchApp.align_generated_audio(self,temp,original)
                     shutil.copy2(temp,finalized)
                 else:
-                    match_original_expression(temp, original, finalized, progress_callback=lambda value:self.queue.put(("stage",100,100,value,"Aplicando ritmo / pausas do original: "+stem)))
+                    self.queue.put(("stage",100,100,100,"Preservando o ritmo natural da voz-modelo: "+stem))
+                    shutil.copy2(temp,finalized)
                 if self.cancel_requested: break
                 _safe_replace_file(finalized,target)
+                from speech_completeness import publish_review_report
+                publish_review_report(temp,target)
                 temp.unlink(missing_ok=True)
                 try: rel_model = model.relative_to(ROOT).as_posix()
                 except ValueError: rel_model = str(model)
-                manifest[stem] = {"voice_model": rel_model, "original": str(original), "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"), "expression_transfer": "duration_pauses_dynamics_approximation"}
+                manifest[stem] = {"voice_model": rel_model, "original": str(original), "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"), "expression_transfer": "optional_alignment" if getattr(self,'run_alignment_settings',None) else "none", "timing_mode": "aligned_to_original" if getattr(self,'run_alignment_settings',None) else "natural"}
                 _save_json(MANIFEST_FILE, manifest)
                 completed += 1
                 self.queue.put(("stage",100,100,100,"Concluído: "+stem))
